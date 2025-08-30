@@ -1,0 +1,112 @@
+{
+  "services": {
+    "blip": {
+      "host": "localhost",
+      "port": 7777,
+      "endpoint": "/v3/analyze",
+      "queue_prefix": "queue_",
+      "category": "primary",
+      "description": "Image captioning with emoji mapping"
+    },
+    "clip": {
+      "host": "localhost",
+      "port": 7778,
+      "endpoint": "/v3/analyze",
+      "queue_prefix": "queue_",
+      "category": "primary",
+      "description": "Image classification with confidence scoring"
+    },
+    "colors": {
+      "host": "localhost",
+      "port": 7770,
+      "endpoint": "/v3/analyze", 
+      "queue_prefix": "queue_",
+      "category": "primary",
+      "description": "Copic/Prismacolor color analysis",
+      "enable_triggers": true
+    },
+    "detectron2": {
+      "host": "localhost",
+      "port": 7771,
+      "endpoint": "/v3/analyze",
+      "queue_prefix": "queue_",
+      "category": "primary",
+      "description": "Object detection with bounding boxes",
+      "enable_triggers": true
+    },
+    "face": {
+      "host": "localhost",
+      "port": 7772,
+      "endpoint": "/v3/analyze",
+      "queue_prefix": "queue_",
+      "category": "spatial_only",
+      "description": "Face detection and pose estimation"
+    },
+    "inception_v3": {
+      "host": "localhost",
+      "port": 7779,
+      "endpoint": "/v3/analyze",
+      "queue_prefix": "queue_",
+      "category": "primary",
+      "description": "ImageNet classification"
+    },
+    "metadata": {
+      "host": "localhost",
+      "port": 7781,
+      "endpoint": "/v3/analyze",
+      "queue_prefix": "queue_",
+      "category": "primary",
+      "description": "EXIF/technical metadata extraction"
+    },
+    "ocr": {
+      "host": "localhost",
+      "port": 7775,
+      "endpoint": "/v3/analyze",
+      "queue_prefix": "queue_",
+      "category": "primary",
+      "description": "Text extraction with PaddleOCR"
+    },
+    "nsfw2": {
+      "host": "localhost",
+      "port": 7774,
+      "endpoint": "/v3/analyze",
+      "queue_prefix": "queue_",
+      "category": "primary",
+      "description": "Content moderation"
+    },
+    "ollama": {
+      "host": "localhost",
+      "port": 7782,
+      "endpoint": "/v3/analyze",
+      "queue_prefix": "queue_",
+      "category": "primary",
+      "description": "LLM vision analysis"
+    },
+    "pose": {
+      "host": "localhost",
+      "port": 7786,
+      "endpoint": "/v3/analyze",
+      "queue_prefix": "queue_",
+      "category": "spatial_only",
+      "description": "Pose Estimation"
+    },
+    "rtdetr": {
+      "host": "localhost",
+      "port": 7780,
+      "endpoint": "/v3/analyze",
+      "queue_prefix": "queue_",
+      "category": "primary",
+      "description": "Transformer-based object detection",
+      "enable_triggers": true
+    },
+    "yolov8": {
+      "host": "localhost",
+      "port": 7773,
+      "endpoint": "/v3/analyze",
+      "queue_prefix": "queue_",
+      "category": "primary",
+      "description": "Real-time object detection",
+      "enable_triggers": true
+    }
+  }
+}
