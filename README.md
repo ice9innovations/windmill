@@ -1,14 +1,14 @@
-# Windmill - Distributed ML Processing Pipeline
+# Windmill - Distributed ML Processing Pipeline for Animal Farm
 
-"Windmill or no windmill, he said, life would go on as it had always gone on -- that is, badly"
+"Windmill or no windmill, he said, life would go on as it had always gone on — that is, badly."
 
-A complete distributed processing system implementing the **EPIC: Distributed Queue-Based ML Processing Architecture**. This system transforms Animal Farm from monolithic API to continuous processing pipeline capable of infinite-scale image streams across 13 ML services.
+A complete distributed processing system. This system transforms Animal Farm from monolithic API to continuous processing pipeline capable of infinite-scale image streams across the Animal Farm machine learning services.
 
 ## Overview
 
-This system delivers the complete **EPIC vision** of distributed ML processing with three key innovations:
+This system delivers the complete vision of distributed ML processing with three key innovations:
 
-1. **Complete Service Coverage**: All 13 EPIC services (BLIP, CLIP, Colors, Detectron2, Face, Inception_v3, Metadata, OCR, NSFW2, Ollama, Pose, RT-DETR, YOLOv8) 
+1. **Complete Service Coverage**: All services (BLIP, CLIP, Colors, Detectron2, Face, Inception_v3, Metadata, OCR, NSFW2, Ollama, Pose, RT-DETR, YOLOv8) 
 2. **Progressive Harmonization**: Immediate results after ANY service completes, with automatic re-harmonization as more services finish
 3. **True Spatial Enrichment**: In-memory bbox cropping for genuine spatial analysis of detected objects
 
@@ -280,28 +280,3 @@ watch 'psql -c "SELECT COUNT(*) FROM results"'
 # Worker logs
 tail -f /var/log/animal-farm/workers.log
 ```
-
-## Contributing
-
-### Adding New Services
-1. Add service definition to `service_config.json`
-2. Configure service in single `.env` file
-3. Add queue creation to `generic_producer.py`
-4. Start worker: `SERVICE_NAME=newservice python generic_worker.py`
-
-### Adding New Post-Processing Workers
-1. Follow the timestamp-based trigger pattern
-2. Use DELETE+INSERT for single-record tables
-3. Use INSERT-only for multi-record tables  
-4. Include proper error handling and logging
-
-## Architecture Philosophy
-
-This system embodies the **"Jimmy vs James" principle** from CONTRIBUTING.md:
-
-- **Jimmy**: Builds complex coordination systems with locks, semaphores, and explicit messaging
-- **James**: Uses simple timestamp comparison to let workers detect their own work
-
-We chose the **James approach**: workers automatically detect when their results are stale and recompute. No coordination protocols, no deadlocks, no complexity - just elegant data dependencies.
-
-The result is a system that **scales beautifully** because it has **no coordination overhead**.
