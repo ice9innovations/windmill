@@ -142,6 +142,18 @@ class BoundingBoxMergerWorker:
     def connect_to_database(self):
         """Connect to PostgreSQL database"""
         try:
+            # Close existing connections if any
+            if hasattr(self, 'db_conn') and self.db_conn:
+                try:
+                    self.db_conn.close()
+                except:
+                    pass
+            if hasattr(self, 'read_db_conn') and self.read_db_conn:
+                try:
+                    self.read_db_conn.close()
+                except:
+                    pass
+            
             # Main connection for transactions (write operations)
             self.db_conn = psycopg2.connect(
                 host=self.db_host,
@@ -166,6 +178,42 @@ class BoundingBoxMergerWorker:
         except Exception as e:
             self.logger.error(f"Failed to connect to database: {e}")
             return False
+    
+    def ensure_database_connection(self):
+        """Ensure database connections are healthy, reconnect if needed"""
+        reconnect_needed = False
+        
+        # Check main connection
+        try:
+            if not self.db_conn or self.db_conn.closed:
+                reconnect_needed = True
+            else:
+                # Test connection with simple query
+                cursor = self.db_conn.cursor()
+                cursor.execute("SELECT 1")
+                cursor.close()
+        except Exception as e:
+            self.logger.warning(f"Main database connection unhealthy: {e}")
+            reconnect_needed = True
+            
+        # Check read connection  
+        try:
+            if not self.read_db_conn or self.read_db_conn.closed:
+                reconnect_needed = True
+            else:
+                # Test connection with simple query
+                cursor = self.read_db_conn.cursor()
+                cursor.execute("SELECT 1")
+                cursor.close()
+        except Exception as e:
+            self.logger.warning(f"Read database connection unhealthy: {e}")
+            reconnect_needed = True
+            
+        if reconnect_needed:
+            self.logger.info("Reconnecting to database...")
+            return self.connect_to_database()
+            
+        return True
     
     def connect_to_queue(self):
         """Connect to RabbitMQ for queue-based processing"""
@@ -258,9 +306,11 @@ class BoundingBoxMergerWorker:
     def get_bbox_results_for_image(self, image_id):
         """Get all bbox service results for an image"""
         try:
-            if self.read_db_conn.closed:
-                self.logger.error("Read database connection is closed, reconnecting...")
-                self.connect_to_database()
+            # Ensure healthy database connection
+            if not self.ensure_database_connection():
+                self.logger.error("Could not establish database connection")
+                return []
+                
             cursor = self.read_db_conn.cursor()
             
             query = """
@@ -280,6 +330,18 @@ class BoundingBoxMergerWorker:
             
         except Exception as e:
             self.logger.error(f"Error getting bbox results for image {image_id}: {e}")
+            # Try once more after reconnection
+            try:
+                if self.ensure_database_connection():
+                    cursor = self.read_db_conn.cursor()
+                    cursor.execute(query, (image_id, tuple(self.bbox_services)))
+                    results = cursor.fetchall()
+                    cursor.close()
+                    self.logger.info(f"Successfully retried bbox results query for image {image_id}")
+                    return results
+            except Exception as retry_e:
+                self.logger.error(f"Retry failed for image {image_id}: {retry_e}")
+            
             return []
     
     def harmonize_bounding_boxes(self, bbox_results):
@@ -482,84 +544,117 @@ class BoundingBoxMergerWorker:
     
     def update_merged_boxes_for_image(self, image_id, image_filename):
         """Update merged boxes for a single image using safe DELETE+INSERT pattern"""
-        try:
-            # Get bbox results
-            bbox_results = self.get_bbox_results_for_image(image_id)
-            if not bbox_results:
-                self.logger.debug(f"No bbox results for image {image_id}, skipping")
-                return False
-            
-            # Harmonize bounding boxes
-            start_time = time.time()
-            merged_data = self.harmonize_bounding_boxes(bbox_results)
-            processing_time = time.time() - start_time
-            
-            if not merged_data:
-                self.logger.warning(f"Could not harmonize boxes for image {image_id}")
-                return False
-            
-            # Safe atomic DELETE + INSERT with foreign key handling
-            cursor = self.db_conn.cursor()
-            
-            # Step 1: Clear postprocessing references to avoid FK constraint violation
-            cursor.execute("""
-                UPDATE postprocessing 
-                SET merged_box_id = NULL 
-                WHERE merged_box_id IN (
-                    SELECT merged_id FROM merged_boxes WHERE image_id = %s
-                )
-            """, (image_id,))
-            
-            # Step 2: Delete old merged boxes (now safe)
-            cursor.execute("DELETE FROM merged_boxes WHERE image_id = %s", (image_id,))
-            deleted_count = cursor.rowcount
-            
-            # Step 3: Insert new merged boxes - ONE ROW PER MERGED BOX
-            merged_box_count = 0
-            for group_key, group_data in merged_data['grouped_objects'].items():
-                instances = group_data.get('instances', [])
-                for instance in instances:
-                    # Store merged box data directly
-                    merged_box_data = {
-                        'cluster_id': instance.get('cluster_id', ''),
-                        'emoji': instance.get('emoji', ''),
-                        'label': instance.get('label', ''),
-                        'merged_bbox': instance.get('merged_bbox', {}),
-                        'detection_count': instance.get('detection_count', 0),
-                        'avg_confidence': instance.get('avg_confidence', 0.0),
-                        'contributing_services': instance.get('contributing_services', []),
-                        'detections': instance.get('detections', []),
-                        'harmonization_algorithm': merged_data['harmonization_algorithm'],
-                        'source_result_ids': merged_data['source_result_ids']
-                    }
+        max_retries = 2
+        
+        for attempt in range(max_retries):
+            try:
+                # Ensure healthy database connection
+                if not self.ensure_database_connection():
+                    self.logger.error("Could not establish database connection")
+                    if attempt < max_retries - 1:
+                        self.logger.info(f"Retrying database operation (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(2)  # Wait before retry
+                        continue
+                    return False
+                
+                # Get bbox results
+                bbox_results = self.get_bbox_results_for_image(image_id)
+                if not bbox_results:
+                    self.logger.debug(f"No bbox results for image {image_id}, skipping")
+                    return True  # Not an error - just no data to process
+                
+                # Harmonize bounding boxes
+                start_time = time.time()
+                merged_data = self.harmonize_bounding_boxes(bbox_results)
+                processing_time = time.time() - start_time
+                
+                if not merged_data:
+                    self.logger.warning(f"Could not harmonize boxes for image {image_id}")
+                    return False
+                
+                # Safe atomic DELETE + INSERT with foreign key handling
+                cursor = self.db_conn.cursor()
+                
+                # Step 1: Clear postprocessing references to avoid FK constraint violation
+                cursor.execute("""
+                    UPDATE postprocessing 
+                    SET merged_box_id = NULL 
+                    WHERE merged_box_id IN (
+                        SELECT merged_id FROM merged_boxes WHERE image_id = %s
+                    )
+                """, (image_id,))
+                
+                # Step 2: Delete old merged boxes (now safe)
+                cursor.execute("DELETE FROM merged_boxes WHERE image_id = %s", (image_id,))
+                deleted_count = cursor.rowcount
+                
+                # Step 3: Insert new merged boxes - ONE ROW PER MERGED BOX
+                merged_box_count = 0
+                for group_key, group_data in merged_data['grouped_objects'].items():
+                    instances = group_data.get('instances', [])
+                    for instance in instances:
+                        # Store merged box data directly
+                        merged_box_data = {
+                            'cluster_id': instance.get('cluster_id', ''),
+                            'emoji': instance.get('emoji', ''),
+                            'label': instance.get('label', ''),
+                            'merged_bbox': instance.get('merged_bbox', {}),
+                            'detection_count': instance.get('detection_count', 0),
+                            'avg_confidence': instance.get('avg_confidence', 0.0),
+                            'contributing_services': instance.get('contributing_services', []),
+                            'detections': instance.get('detections', []),
+                            'harmonization_algorithm': merged_data['harmonization_algorithm'],
+                            'source_result_ids': merged_data['source_result_ids']
+                        }
+                        
+                        cursor.execute("""
+                            INSERT INTO merged_boxes (image_id, source_result_ids, merged_data, worker_id, status)
+                            VALUES (%s, %s, %s, %s, %s)
+                        """, (
+                            image_id,
+                            merged_data['source_result_ids'],
+                            json.dumps(merged_box_data),
+                            self.worker_id,
+                            'success'
+                        ))
+                        merged_box_count += 1
+                
+                # Commit the transaction
+                self.db_conn.commit()
+                cursor.close()
+                
+                services = merged_data['source_services']
+                detection_count = merged_data['total_detections']
+                
+                if deleted_count > 0:
+                    self.logger.info(f"Reharmonized boxes for {image_filename} ({detection_count} detections → {merged_box_count} merged boxes from {services})")
+                else:
+                    self.logger.info(f"Harmonized boxes for {image_filename} ({detection_count} detections → {merged_box_count} merged boxes from {services})")
+                
+                if attempt > 0:
+                    self.logger.info(f"Successfully processed {image_filename} after {attempt + 1} attempts")
+                
+                return True
+                
+            except Exception as e:
+                self.logger.error(f"Error updating merged boxes for image {image_id} (attempt {attempt + 1}/{max_retries}): {e}")
+                
+                # Rollback transaction on error
+                try:
+                    if self.db_conn:
+                        self.db_conn.rollback()
+                except:
+                    pass
+                
+                # If not the last attempt, wait and retry
+                if attempt < max_retries - 1:
+                    self.logger.info(f"Will retry after 2 seconds...")
+                    time.sleep(2)
+                    continue
                     
-                    cursor.execute("""
-                        INSERT INTO merged_boxes (image_id, source_result_ids, merged_data, worker_id, status)
-                        VALUES (%s, %s, %s, %s, %s)
-                    """, (
-                        image_id,
-                        merged_data['source_result_ids'],
-                        json.dumps(merged_box_data),
-                        self.worker_id,
-                        'success'
-                    ))
-                    merged_box_count += 1
-            
-            cursor.close()
-            
-            services = merged_data['source_services']
-            detection_count = merged_data['total_detections']
-            
-            if deleted_count > 0:
-                self.logger.info(f"Reharmonized boxes for {image_filename} ({detection_count} detections → {merged_box_count} merged boxes from {services})")
-            else:
-                self.logger.info(f"Harmonized boxes for {image_filename} ({detection_count} detections → {merged_box_count} merged boxes from {services})")
-            
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error updating merged boxes for image {image_id}: {e}")
-            return False
+                return False
+        
+        return False
     
     
     

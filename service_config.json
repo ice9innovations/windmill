@@ -6,7 +6,8 @@
       "endpoint": "/v3/analyze",
       "queue_prefix": "queue_",
       "category": "primary",
-      "description": "Image captioning with emoji mapping"
+      "description": "Image captioning with emoji mapping",
+      "enable_triggers": true
     },
     "clip": {
       "host": "localhost",
@@ -80,7 +81,8 @@
       "endpoint": "/v3/analyze",
       "queue_prefix": "queue_",
       "category": "primary",
-      "description": "LLM vision analysis"
+      "description": "LLM vision analysis",
+      "enable_triggers": true
     },
     "pose": {
       "host": "localhost",
@@ -107,6 +109,14 @@
       "category": "primary",
       "description": "Real-time object detection",
       "enable_triggers": true
+    },
+    "caption_score": {
+      "host": "localhost",
+      "port": 7778,
+      "endpoint": "/score",
+      "queue_prefix": "queue_",
+      "category": "postprocessing",
+      "description": "Caption similarity scoring using CLIP"
     }
   }
 }

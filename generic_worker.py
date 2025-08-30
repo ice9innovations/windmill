@@ -238,6 +238,13 @@ class GenericWorker:
     def connect_to_database(self):
         """Connect to PostgreSQL database"""
         try:
+            # Close existing connection if any
+            if hasattr(self, 'db_conn') and self.db_conn:
+                try:
+                    self.db_conn.close()
+                except:
+                    pass
+            
             self.db_conn = psycopg2.connect(
                 host=self.config.db_host,
                 database=self.config.db_name,
@@ -250,6 +257,23 @@ class GenericWorker:
         except Exception as e:
             self.logger.error(f"Failed to connect to database: {e}")
             return False
+    
+    def ensure_database_connection(self):
+        """Ensure database connection is healthy, reconnect if needed"""
+        try:
+            if not self.db_conn or self.db_conn.closed:
+                self.logger.info("Database connection closed, reconnecting...")
+                return self.connect_to_database()
+            else:
+                # Test connection with simple query
+                cursor = self.db_conn.cursor()
+                cursor.execute("SELECT 1")
+                cursor.close()
+                return True
+        except Exception as e:
+            self.logger.warning(f"Database connection unhealthy: {e}")
+            self.logger.info("Reconnecting to database...")
+            return self.connect_to_database()
     
     def process_image(self, image_data):
         """Process image through the configured ML service"""
@@ -316,29 +340,61 @@ class GenericWorker:
                 time.sleep(self.config.retry_delay)
     
     def save_result_to_database(self, image_data, result):
-        """Save processing result to database"""
-        try:
-            cursor = self.db_conn.cursor()
-            
-            cursor.execute("""
-                INSERT INTO results (image_id, service, data, status, processing_time, result_created, worker_id)
-                VALUES (%s, %s, %s, %s, %s, NOW(), %s)
-            """, (
-                image_data['image_id'],
-                self.config.service_name,
-                json.dumps(result),
-                result['status'],
-                result['metadata'].get('processing_time', 0),
-                self.config.worker_id
-            ))
-            
-            self.db_conn.commit()
-            self.logger.debug(f"Saved result for {image_data['image_filename']}")
-            
-        except Exception as e:
-            self.logger.error(f"Database error: {e}")
-            self.db_conn.rollback()
-            raise
+        """Save processing result to database with retry logic"""
+        max_retries = 2
+        
+        for attempt in range(max_retries):
+            try:
+                # Ensure healthy database connection
+                if not self.ensure_database_connection():
+                    self.logger.error("Could not establish database connection")
+                    if attempt < max_retries - 1:
+                        self.logger.info(f"Retrying database save (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(2)
+                        continue
+                    raise Exception("Failed to establish database connection")
+                
+                cursor = self.db_conn.cursor()
+                
+                cursor.execute("""
+                    INSERT INTO results (image_id, service, data, status, processing_time, result_created, worker_id)
+                    VALUES (%s, %s, %s, %s, %s, NOW(), %s)
+                """, (
+                    image_data['image_id'],
+                    self.config.service_name,
+                    json.dumps(result),
+                    result['status'],
+                    result['metadata'].get('processing_time', 0),
+                    self.config.worker_id
+                ))
+                
+                self.db_conn.commit()
+                cursor.close()
+                self.logger.debug(f"Saved result for {image_data['image_filename']}")
+                
+                if attempt > 0:
+                    self.logger.info(f"Successfully saved result after {attempt + 1} attempts")
+                
+                return  # Success, exit retry loop
+                
+            except Exception as e:
+                self.logger.error(f"Database error (attempt {attempt + 1}/{max_retries}): {e}")
+                
+                # Rollback transaction on error
+                try:
+                    if self.db_conn:
+                        self.db_conn.rollback()
+                except:
+                    pass
+                
+                # If not the last attempt, wait and retry
+                if attempt < max_retries - 1:
+                    self.logger.info(f"Will retry database save after 2 seconds...")
+                    time.sleep(2)
+                    continue
+                    
+                # Last attempt failed, re-raise the exception
+                raise
     
     def trigger_post_processing(self, image_data, result):
         """Trigger post-processing via queue messages (proper architecture)"""
@@ -396,6 +452,32 @@ class GenericWorker:
                 
             except Exception as e:
                 self.logger.error(f"Failed to publish consensus completion message: {e}")
+        
+        # Publish to caption score queue if this is BLIP or LLaMa (caption generation services)
+        if self.config.service_name in ['blip', 'ollama']:
+            try:
+                caption_score_message = {
+                    'image_id': image_data['image_id'],
+                    'image_filename': image_data.get('image_filename', f'image_{image_data["image_id"]}'),
+                    'service': self.config.service_name,
+                    'worker_id': self.config.worker_id,
+                    'processed_at': datetime.now().isoformat()
+                }
+                
+                # Publish to caption score queue
+                self.channel.basic_publish(
+                    exchange='',
+                    routing_key='queue_caption_score',
+                    body=json.dumps(caption_score_message),
+                    properties=pika.BasicProperties(
+                        delivery_mode=2  # Make message persistent
+                    )
+                )
+                
+                self.logger.debug(f"Published {self.config.service_name} completion to queue_caption_score: {caption_score_message}")
+                
+            except Exception as e:
+                self.logger.error(f"Failed to publish caption score message: {e}")
     
     def process_message(self, ch, method, properties, body):
         """Process a single queue message"""

@@ -83,6 +83,18 @@ class SpatialEnrichmentWorker:
     def connect_to_database(self):
         """Connect to PostgreSQL database"""
         try:
+            # Close existing connections if any
+            if hasattr(self, 'db_conn') and self.db_conn:
+                try:
+                    self.db_conn.close()
+                except:
+                    pass
+            if hasattr(self, 'read_db_conn') and self.read_db_conn:
+                try:
+                    self.read_db_conn.close()
+                except:
+                    pass
+            
             # Main connection for transactions (write operations)
             self.db_conn = psycopg2.connect(
                 host=self.db_host,
@@ -107,6 +119,40 @@ class SpatialEnrichmentWorker:
         except Exception as e:
             self.logger.error(f"Failed to connect to database: {e}")
             return False
+    
+    def ensure_database_connection(self):
+        """Ensure database connections are healthy, reconnect if needed"""
+        reconnect_needed = False
+        
+        # Check main connection
+        try:
+            if not self.db_conn or self.db_conn.closed:
+                reconnect_needed = True
+            else:
+                cursor = self.db_conn.cursor()
+                cursor.execute("SELECT 1")
+                cursor.close()
+        except Exception as e:
+            self.logger.warning(f"Main database connection unhealthy: {e}")
+            reconnect_needed = True
+            
+        # Check read connection  
+        try:
+            if not self.read_db_conn or self.read_db_conn.closed:
+                reconnect_needed = True
+            else:
+                cursor = self.read_db_conn.cursor()
+                cursor.execute("SELECT 1")
+                cursor.close()
+        except Exception as e:
+            self.logger.warning(f"Read database connection unhealthy: {e}")
+            reconnect_needed = True
+            
+        if reconnect_needed:
+            self.logger.info("Reconnecting to database...")
+            return self.connect_to_database()
+            
+        return True
     
     def connect_to_rabbitmq(self):
         """Connect to RabbitMQ for queue-based processing"""
