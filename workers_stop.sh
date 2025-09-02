@@ -1,7 +1,16 @@
 #!/bin/bash
-# stop_workers.sh - Gracefully stop all windmill workers
+# stop_workers.sh - Gracefully stop windmill workers
+# Usage: ./workers_stop.sh [worker_name]
+#   - No args: Stop all workers
+#   - worker_name: Stop specific worker (e.g. xception, blip, etc.)
 
-echo "🛑 Stopping all windmill workers..."
+WORKER_NAME="$1"
+
+if [ -n "$WORKER_NAME" ]; then
+    echo "🛑 Stopping worker: $WORKER_NAME..."
+else
+    echo "🛑 Stopping all windmill workers..."
+fi
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -16,6 +25,13 @@ for pidfile in pids/*.pid; do
     if [ -f "$pidfile" ]; then
         PID=$(cat "$pidfile")
         worker_name=$(basename "$pidfile" .pid)
+        
+        # Skip if specific worker requested and this isn't it
+        # Strip _worker suffix for comparison (e.g. "ollama_worker" -> "ollama")
+        service_name="${worker_name%_worker}"
+        if [ -n "$WORKER_NAME" ] && [ "$service_name" != "$WORKER_NAME" ]; then
+            continue
+        fi
         
         # Check if process is still running
         if ! kill -0 "$PID" 2>/dev/null; then
@@ -63,6 +79,17 @@ echo "🏁 Shutdown complete:"
 echo -e "  ${GREEN}✅ Stopped: $stopped_count workers${NC}"
 if [ $failed_count -gt 0 ]; then
     echo -e "  ${RED}❌ Failed: $failed_count workers${NC}"
+fi
+
+# Check if specific worker was requested but not found
+if [ -n "$WORKER_NAME" ] && [ $stopped_count -eq 0 ] && [ $failed_count -eq 0 ]; then
+    echo -e "  ${YELLOW}⚠️  Worker '$WORKER_NAME' not found${NC}"
+    echo "Available workers:"
+    for pidfile in pids/*.pid; do
+        if [ -f "$pidfile" ]; then
+            echo "  - $(basename "$pidfile" .pid)"
+        fi
+    done
 fi
 
 # Clean up any orphaned PID files
