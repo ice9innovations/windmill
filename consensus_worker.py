@@ -270,10 +270,23 @@ class ConsensusWorker:
             """
             
             cursor.execute(query, (image_id,))
-            results = cursor.fetchall()
+            raw_results = cursor.fetchall()
             cursor.close()
             
-            return results
+            # Parse JSON data at the source to ensure all downstream code gets proper dicts
+            parsed_results = []
+            for service, data, processing_time, result_created in raw_results:
+                # Ensure data is properly parsed as JSON
+                if isinstance(data, str):
+                    try:
+                        data = json.loads(data)
+                    except json.JSONDecodeError:
+                        self.logger.warning(f"Failed to parse JSON for service {service} on image {image_id}, skipping")
+                        continue
+                
+                parsed_results.append((service, data, processing_time, result_created))
+            
+            return parsed_results
             
         except Exception as e:
             self.logger.error(f"Error getting results for image {image_id}: {e}")
@@ -326,6 +339,11 @@ class ConsensusWorker:
         # Step 2: Group detections by emoji (democratic voting)
         emoji_groups = self.group_detections_by_emoji(all_detections)
         
+        # Debug: Log emoji groups
+        for emoji, detections in emoji_groups.items():
+            services = [d['service'] for d in detections]
+            self.logger.debug(f"Emoji group {emoji}: {len(detections)} votes from {services}")
+        
         # Step 3: Analyze evidence for each emoji
         emoji_analysis = self.analyze_emoji_evidence(emoji_groups, service_results)
         
@@ -358,12 +376,20 @@ class ConsensusWorker:
             seen_emojis = set()  # Deduplicate within service
 
             for prediction in result['predictions']:
-                # Handle emoji_mappings format (BLIP, Ollama v3)
+                # Debug: Check if prediction needs JSON parsing
+                if isinstance(prediction, str):
+                    try:
+                        prediction = json.loads(prediction)
+                    except json.JSONDecodeError:
+                        self.logger.warning(f"Failed to parse prediction JSON for service {service_name}, skipping: {prediction[:100]}")
+                        continue
+                
+                # Handle emoji_mappings format (standardized format for all services)
                 if prediction.get('emoji_mappings') and isinstance(prediction['emoji_mappings'], list):
                     for mapping in prediction['emoji_mappings']:
                         if mapping.get('emoji') and mapping['emoji'] not in seen_emojis:
                             seen_emojis.add(mapping['emoji'])
-                            all_detections.append({
+                            detection = {
                                 'emoji': mapping['emoji'],
                                 'service': service_display_name,
                                 'evidence_type': self.get_evidence_type(service_name),
@@ -373,7 +399,9 @@ class ConsensusWorker:
                                     'source': 'caption_mapping'
                                 },
                                 'shiny': mapping.get('shiny', False)
-                            })
+                            }
+                            all_detections.append(detection)
+                            self.logger.debug(f"Added detection: {detection['emoji']} from {service_name} ({detection['evidence_type']}) for word '{mapping.get('word')}'")
                 
                 # Handle direct emoji format (CLIP, object detection, etc.)
                 elif prediction.get('emoji') and prediction.get('type') != 'color_analysis':
@@ -389,6 +417,8 @@ class ConsensusWorker:
                             'context': self.extract_context(prediction, service_name),
                             'shiny': prediction.get('shiny', False)
                         })
+                        # DEBUG: Log each detection being added
+                        self.logger.info(f"DEBUG: Added detection {emoji} from {service_name} (confidence: {prediction.get('confidence', self.default_confidence)})")
 
         # Extract spatial detections from clustered bounding box data (if available)
         if bounding_box_data and bounding_box_data.get('winning_objects', {}).get('grouped'):
@@ -415,9 +445,9 @@ class ConsensusWorker:
     
     def get_evidence_type(self, service_name):
         """Determine evidence type based on service name (ported from V3VotingService.js)"""
-        spatial_services = ['yolov8', 'detectron2', 'rtdetr']
+        spatial_services = ['yolov8', 'detectron2', 'rtdetr', 'clip', 'xception']
         semantic_services = ['blip', 'ollama']  # Smart captioning services
-        classification_services = ['clip', 'inception_v3']  # Image classification services
+        classification_services = ['inception_v3']  # Image classification services
         specialized_services = ['face', 'nsfw2', 'ocr', 'pose']
 
         if service_name in spatial_services:
@@ -805,7 +835,9 @@ class ConsensusWorker:
             return True
             
         except Exception as e:
+            import traceback
             self.logger.error(f"Error updating consensus for image {image_id}: {e}")
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
             # Rollback transaction on error
             try:
                 if self.db_conn:

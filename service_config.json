@@ -15,7 +15,8 @@
       "endpoint": "/v3/analyze",
       "queue_prefix": "queue_",
       "category": "primary",
-      "description": "Two stage image classification with confidence scoring"
+      "description": "Two stage image classification with confidence scoring",
+      "enable_triggers": true
     },
     "colors": {
       "host": "localhost",
@@ -49,7 +50,8 @@
       "endpoint": "/v3/analyze",
       "queue_prefix": "queue_",
       "category": "primary",
-      "description": "Xception two stage ImageNet classification"
+      "description": "Xception two stage ImageNet classification",
+      "enable_triggers": true
     },
     "metadata": {
       "host": "localhost",

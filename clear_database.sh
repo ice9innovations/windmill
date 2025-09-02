@@ -1,8 +1,8 @@
 #!/bin/bash
-"""
-Clear Database Script - Clears all derived data tables while preserving images
-This script safely clears all ML processing results and derived data while keeping the base images table intact.
-"""
+#
+# Clear Database Script - Clears all derived data tables while preserving images
+# This script safely clears all ML processing results and derived data while keeping the base images table intact.
+#
 
 # Load environment variables
 source .env

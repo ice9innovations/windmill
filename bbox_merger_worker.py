@@ -39,7 +39,7 @@ class BoundingBoxMergerWorker:
         self.downstream_queue = os.getenv('DOWNSTREAM_QUEUE', 'queue_spatial_enrichment')
         
         # Bounding box services to harmonize
-        self.bbox_services = ['yolov8', 'rtdetr', 'detectron2']
+        self.bbox_services = ['yolov8', 'rtdetr', 'detectron2', 'xception', 'clip']
         
         # Monitoring configuration  
         self.enable_monitoring = os.getenv('ENABLE_MONITORING', 'false').lower() == 'true'
