@@ -774,6 +774,11 @@ class ConsensusWorker:
                 self.logger.warning(f"Could not calculate consensus for image {image_id}")
                 return False
             
+            # Ensure healthy database connection before operations
+            if not self.ensure_database_connection():
+                self.logger.error("Could not establish database connection")
+                return False
+            
             # Atomic DELETE + INSERT
             cursor = self.db_conn.cursor()
             
@@ -787,6 +792,9 @@ class ConsensusWorker:
                 VALUES (%s, %s, %s)
             """, (image_id, json.dumps(consensus_data), processing_time))
             
+            # CRITICAL: Commit the transaction!
+            self.db_conn.commit()
+            
             cursor.close()
             
             if deleted_count > 0:
@@ -798,6 +806,12 @@ class ConsensusWorker:
             
         except Exception as e:
             self.logger.error(f"Error updating consensus for image {image_id}: {e}")
+            # Rollback transaction on error
+            try:
+                if self.db_conn:
+                    self.db_conn.rollback()
+            except:
+                pass
             return False
     
     
