@@ -292,7 +292,7 @@ class ConsensusWorker:
             self.logger.error(f"Error getting results for image {image_id}: {e}")
             return []
     
-    def calculate_consensus(self, service_results):
+    def calculate_consensus(self, service_results, image_id):
         """Calculate consensus using full V3 voting algorithm (ported from V3VotingService.js)"""
         if not service_results:
             return None
@@ -305,8 +305,8 @@ class ConsensusWorker:
                 'predictions': data.get('predictions', []) if isinstance(data, dict) else []
             }
         
-        # Get harmonized bounding box data (if available)
-        bounding_box_data = self.get_bounding_box_data_for_image(service_results_dict)
+        # Get harmonized bounding box data from merged_boxes table
+        bounding_box_data = self.get_bounding_box_data_for_image(image_id)
         
         # Implement V3 voting algorithm
         votes_result = self.process_votes(service_results_dict, bounding_box_data)
@@ -325,11 +325,39 @@ class ConsensusWorker:
         
         return consensus
     
-    def get_bounding_box_data_for_image(self, service_results_dict):
-        """Get bounding box data for this image (if available)"""
-        # For now, return None - bounding box integration will be added later
-        # This would query the merged_boxes table for harmonized bbox data
-        return None
+    def get_bounding_box_data_for_image(self, image_id):
+        """Get harmonized bounding box data from merged_boxes table"""
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute("""
+                SELECT merged_id, merged_data, status
+                FROM merged_boxes 
+                WHERE image_id = %s AND status = 'success'
+                ORDER BY created DESC
+            """, (image_id,))
+            
+            merged_boxes = []
+            for row in cursor.fetchall():
+                merged_data = row[1]  # JSONB data
+                
+                # Only include multi-service merged boxes (detection_count >= 2)
+                if merged_data.get('detection_count', 0) >= 2:
+                    merged_boxes.append({
+                        'merged_id': row[0],
+                        'emoji': merged_data.get('emoji'),
+                        'detection_count': merged_data.get('detection_count', 0),
+                        'avg_confidence': merged_data.get('avg_confidence', 0),
+                        'contributing_services': merged_data.get('contributing_services', []),
+                        'merged_bbox': merged_data.get('merged_bbox', {}),
+                        'labels': merged_data.get('labels', [])
+                    })
+            
+            cursor.close()
+            return merged_boxes if merged_boxes else None
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching merged boxes: {e}")
+            return None
     
     def process_votes(self, service_results, bounding_box_data=None):
         """Main V3 voting algorithm entry point (ported from V3VotingService.js)"""
@@ -345,7 +373,7 @@ class ConsensusWorker:
             self.logger.debug(f"Emoji group {emoji}: {len(detections)} votes from {services}")
         
         # Step 3: Analyze evidence for each emoji
-        emoji_analysis = self.analyze_emoji_evidence(emoji_groups, service_results)
+        emoji_analysis = self.analyze_emoji_evidence(emoji_groups, service_results, bounding_box_data)
         
         # Step 4: Calculate evidence weights and final ranking
         ranked_consensus = self.calculate_final_ranking(emoji_analysis)
@@ -417,29 +445,30 @@ class ConsensusWorker:
                             'context': self.extract_context(prediction, service_name),
                             'shiny': prediction.get('shiny', False)
                         })
-                        # DEBUG: Log each detection being added
-                        self.logger.info(f"DEBUG: Added detection {emoji} from {service_name} (confidence: {prediction.get('confidence', self.default_confidence)})")
 
-        # Extract spatial detections from clustered bounding box data (if available)
-        if bounding_box_data and bounding_box_data.get('winning_objects', {}).get('grouped'):
-            for key, group in bounding_box_data['winning_objects']['grouped'].items():
-                if group.get('emoji') and group.get('instances'):
-                    for instance in group['instances']:
-                        all_detections.append({
-                            'emoji': group['emoji'],
-                            'service': 'spatial_clustering',
-                            'evidence_type': 'spatial',
-                            'confidence': instance.get('avg_confidence', 0.75),
-                            'context': {'source': 'clustered_bounding_box'},
-                            'shiny': False,
-                            'spatial_data': {
-                                'cluster_id': instance.get('cluster_id'),
-                                'detection_count': instance.get('detection_count', 1),
-                                'avg_confidence': instance.get('avg_confidence', 0.75),
-                                'bbox': instance.get('merged_bbox', {}),
-                                'individual_detections': instance.get('detections', [])
-                            }
-                        })
+        # Extract spatial detections from merged_boxes data (harmonized bbox data)
+        if bounding_box_data and isinstance(bounding_box_data, list):
+            for merged_box in bounding_box_data:
+                if merged_box.get('emoji') and merged_box.get('detection_count', 0) >= 2:
+                    all_detections.append({
+                        'emoji': merged_box['emoji'],
+                        'service': 'merged_boxes',
+                        'evidence_type': 'spatial',
+                        'confidence': merged_box.get('avg_confidence', 0.75),
+                        'context': {
+                            'source': 'merged_boxes',
+                            'contributing_services': merged_box.get('contributing_services', []),
+                            'detection_count': merged_box.get('detection_count', 0)
+                        },
+                        'shiny': False,
+                        'spatial_data': {
+                            'detection_count': merged_box.get('detection_count', 0),
+                            'avg_confidence': merged_box.get('avg_confidence', 0),
+                            'contributing_services': merged_box.get('contributing_services', []),
+                            'bbox': merged_box.get('merged_bbox', {}),
+                            'labels': merged_box.get('labels', [])
+                        }
+                    })
 
         return all_detections
     
@@ -486,7 +515,7 @@ class ConsensusWorker:
         
         return groups
 
-    def analyze_emoji_evidence(self, emoji_groups, service_results):
+    def analyze_emoji_evidence(self, emoji_groups, service_results, merged_boxes_data=None):
         """Analyze evidence for each emoji group (ported from V3VotingService.js)"""
         analysis = []
         
@@ -499,9 +528,8 @@ class ConsensusWorker:
                 'voting_services': voting_services,
                 'detections': detections,
                 'evidence': {
-                    'spatial': self.analyze_spatial_evidence(detections),
+                    'spatial': self.analyze_spatial_evidence(detections, merged_boxes_data),
                     'semantic': self.analyze_semantic_evidence(detections),
-                    'classification': self.analyze_classification_evidence(detections),
                     'specialized': self.analyze_specialized_evidence(detections)
                 },
                 'instances': self.extract_instance_information(detections),
@@ -512,23 +540,33 @@ class ConsensusWorker:
         
         return analysis
 
-    def analyze_spatial_evidence(self, detections):
-        """Analyze spatial evidence from object detection services (ported from V3VotingService.js)"""
-        spatial_detections = [d for d in detections if d.get('evidence_type') == 'spatial']
-        if not spatial_detections:
+    def analyze_spatial_evidence(self, detections, merged_boxes_data=None):
+        """Analyze spatial evidence from merged_boxes table (harmonized bbox data)"""
+        if not merged_boxes_data:
+            return None
+            
+        # Find merged boxes that match this emoji
+        emoji = detections[0].get('emoji') if detections else None
+        if not emoji:
+            return None
+            
+        matching_boxes = [box for box in merged_boxes_data if box.get('emoji') == emoji]
+        if not matching_boxes:
             return None
         
-        clusters = [d['spatial_data'] for d in spatial_detections if d.get('spatial_data')]
-        
-        if not clusters:
-            return None
-        
+        # Use the harmonized spatial data from merged_boxes
         return {
-            'service_count': len(spatial_detections),
-            'clusters': clusters,
-            'max_detection_count': max(c.get('detection_count', 1) for c in clusters),
-            'avg_confidence': sum(c.get('avg_confidence', 0.75) for c in clusters) / len(clusters),
-            'total_instances': len(clusters)
+            'service_count': sum(box.get('detection_count', 0) for box in matching_boxes),
+            'clusters': [{
+                'detection_count': box.get('detection_count', 0),
+                'avg_confidence': box.get('avg_confidence', 0),
+                'contributing_services': box.get('contributing_services', []),
+                'bbox': box.get('merged_bbox', {}),
+                'labels': box.get('labels', [])
+            } for box in matching_boxes],
+            'max_detection_count': max(box.get('detection_count', 0) for box in matching_boxes),
+            'avg_confidence': sum(box.get('avg_confidence', 0) for box in matching_boxes) / len(matching_boxes),
+            'total_instances': len(matching_boxes)
         }
 
     def analyze_semantic_evidence(self, detections):
@@ -594,11 +632,10 @@ class ConsensusWorker:
             # Consensus = detection_count - 1 (one vote doesn't count as consensus)
             spatial_consensus_bonus = max(0, analysis['evidence']['spatial']['max_detection_count'] - 1)
         
-        # Content consensus bonus: Agreement across semantic + classification services
+        # Content consensus bonus: Agreement across semantic services
         content_consensus_bonus = 0
         semantic_count = analysis['evidence']['semantic']['service_count'] if analysis['evidence']['semantic'] else 0
-        classification_count = analysis['evidence']['classification']['service_count'] if analysis['evidence']['classification'] else 0
-        total_content_services = semantic_count + classification_count
+        total_content_services = semantic_count
         
         if total_content_services >= 2:
             # Consensus = total_content_services - 1 (one vote doesn't count as consensus)
@@ -635,7 +672,6 @@ class ConsensusWorker:
                 'evidence': {
                     'spatial': self.format_spatial_evidence(analysis['evidence']['spatial']) if analysis['evidence']['spatial'] else None,
                     'semantic': analysis['evidence']['semantic'],
-                    'classification': analysis['evidence']['classification'],
                     'specialized': list(analysis['evidence']['specialized'].keys()) if analysis['evidence']['specialized'] else None
                 },
                 'services': analysis['voting_services']
@@ -797,7 +833,7 @@ class ConsensusWorker:
             
             # Calculate consensus
             start_time = time.time()
-            consensus_data = self.calculate_consensus(service_results)
+            consensus_data = self.calculate_consensus(service_results, image_id)
             processing_time = time.time() - start_time
             
             if not consensus_data:

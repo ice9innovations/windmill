@@ -457,9 +457,9 @@ class BoundingBoxMergerWorker:
             avg_confidence = sum(d['confidence'] for d in cleaned_cluster) / len(cleaned_cluster)
             
             instance = {
-                'cluster_id': f"{cleaned_cluster[0]['label']}_{i+1}",
+                'cluster_id': f"{cleaned_cluster[0]['emoji']}_{i+1}",
                 'emoji': emoji,
-                'label': cleaned_cluster[0]['label'],
+                'labels': list(set(d['label'] for d in cleaned_cluster)),
                 'merged_bbox': merged_bbox,
                 'detection_count': len(cleaned_cluster),
                 'avg_confidence': round(avg_confidence, 3),
@@ -597,7 +597,7 @@ class BoundingBoxMergerWorker:
                         merged_box_data = {
                             'cluster_id': instance.get('cluster_id', ''),
                             'emoji': instance.get('emoji', ''),
-                            'label': instance.get('label', ''),
+                            'labels': instance.get('labels', []),
                             'merged_bbox': instance.get('merged_bbox', {}),
                             'detection_count': instance.get('detection_count', 0),
                             'avg_confidence': instance.get('avg_confidence', 0.0),

@@ -102,7 +102,7 @@ class RecordExtractor:
             return results
     
     def get_merged_boxes(self, image_id):
-        """Get harmonized bounding box results"""
+        """Get harmonized bounding box results (filters out single-service boxes)"""
         with self.conn.cursor() as cursor:
             cursor.execute("""
                 SELECT merged_id, source_result_ids, merged_data, status, 
@@ -114,10 +114,17 @@ class RecordExtractor:
             
             merged_boxes = []
             for row in cursor.fetchall():
+                merged_data = row[2]  # Already JSON from JSONB column
+                
+                # Filter out single-service merged boxes (detection_count < 2)
+                detection_count = merged_data.get('detection_count', 0)
+                if detection_count < 2:
+                    continue  # Skip single-service boxes
+                
                 merged_boxes.append({
                     'merged_id': row[0],
                     'source_result_ids': row[1],  # Array of result IDs
-                    'merged_data': row[2],  # Already JSON from JSONB column
+                    'merged_data': merged_data,
                     'status': row[3],
                     'created': row[4].isoformat() if row[4] else None,
                     'worker_id': row[5]
