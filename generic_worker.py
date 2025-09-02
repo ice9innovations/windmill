@@ -205,35 +205,46 @@ class GenericWorker:
         self.logger = logging.getLogger(f'worker.{self.config.service_name}')
     
     def connect_to_rabbitmq(self):
-        """Connect to RabbitMQ"""
-        try:
-            credentials = pika.PlainCredentials(self.config.queue_user, self.config.queue_password)
-            self.connection = pika.BlockingConnection(
-                pika.ConnectionParameters(
-                    host=self.config.queue_host,
-                    credentials=credentials
+        """Connect to RabbitMQ with retry logic"""
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                credentials = pika.PlainCredentials(self.config.queue_user, self.config.queue_password)
+                self.connection = pika.BlockingConnection(
+                    pika.ConnectionParameters(
+                        host=self.config.queue_host,
+                        credentials=credentials,
+                        heartbeat=600,  # 10 minutes
+                        blocked_connection_timeout=300,  # 5 minutes
+                        socket_timeout=30,
+                        retry_delay=2,
+                        connection_attempts=3
+                    )
                 )
-            )
-            self.channel = self.connection.channel()
-            
-            # Declare the queue (create if it doesn't exist)
-            self.channel.queue_declare(queue=self.config.queue_name, durable=True)
-            
-            # Declare post-processing queues if triggers are enabled
-            if self.config.enable_triggers:
-                self.channel.queue_declare(queue='queue_bbox_merge', durable=True)
-                self.channel.queue_declare(queue='queue_spatial_enrichment', durable=True)
-                self.channel.queue_declare(queue='queue_consensus', durable=True)
-            
-            # Set prefetch count for fair distribution
-            self.channel.basic_qos(prefetch_count=self.config.worker_prefetch_count)
-            
-            self.logger.info(f"Connected to RabbitMQ at {self.config.queue_host}, queue: {self.config.queue_name}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to connect to RabbitMQ: {e}")
-            return False
+                self.channel = self.connection.channel()
+                
+                # Declare the queue (create if it doesn't exist)
+                self.channel.queue_declare(queue=self.config.queue_name, durable=True)
+                
+                # Declare post-processing queues if triggers are enabled
+                if self.config.enable_triggers:
+                    self.channel.queue_declare(queue='queue_bbox_merge', durable=True)
+                    self.channel.queue_declare(queue='queue_spatial_enrichment', durable=True)
+                    self.channel.queue_declare(queue='queue_consensus', durable=True)
+                
+                # Set prefetch count for fair distribution
+                self.channel.basic_qos(prefetch_count=self.config.worker_prefetch_count)
+                
+                self.logger.info(f"Connected to RabbitMQ at {self.config.queue_host}, queue: {self.config.queue_name}")
+                return True
+                
+            except Exception as e:
+                self.logger.error(f"Failed to connect to RabbitMQ (attempt {attempt + 1}/{max_attempts}): {e}")
+                if attempt < max_attempts - 1:
+                    import time
+                    time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                    continue
+                return False
     
     def connect_to_database(self):
         """Connect to PostgreSQL database"""
@@ -515,33 +526,55 @@ class GenericWorker:
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
     
     def start_consuming(self):
-        """Start consuming messages from the queue"""
+        """Start consuming messages from the queue with reconnection logic"""
         self.logger.info(f"Starting {self.config.service_name.upper()} worker")
         self.logger.info(f"Queue: {self.config.queue_name}")
         self.logger.info(f"Service URL: http://{self.config.service_host}:{self.config.service_port}{self.config.service_endpoint}")
         
-        # Setup message consumer
-        self.channel.basic_consume(
-            queue=self.config.queue_name,
-            on_message_callback=self.process_message
-        )
+        while True:
+            try:
+                # Setup message consumer
+                self.channel.basic_consume(
+                    queue=self.config.queue_name,
+                    on_message_callback=self.process_message
+                )
+                
+                self.logger.info("Waiting for messages. Press CTRL+C to exit")
+                self.channel.start_consuming()
+                
+            except KeyboardInterrupt:
+                self.logger.info("Stopping worker...")
+                if self.channel:
+                    self.channel.stop_consuming()
+                break
+                
+            except Exception as e:
+                self.logger.error(f"Connection lost during consuming: {e}")
+                self.logger.info("Attempting to reconnect...")
+                
+                # Close existing connections
+                try:
+                    if self.connection and not self.connection.is_closed:
+                        self.connection.close()
+                except:
+                    pass
+                
+                # Try to reconnect
+                if self.connect_to_rabbitmq():
+                    self.logger.info("Reconnected successfully, resuming...")
+                    continue
+                else:
+                    self.logger.error("Failed to reconnect, stopping worker")
+                    break
         
-        self.logger.info("Waiting for messages. Press CTRL+C to exit")
+        # Clean shutdown
+        self.monitoring.worker_stopping()
         
-        try:
-            self.channel.start_consuming()
-        except KeyboardInterrupt:
-            self.logger.info("Stopping worker...")
-            self.channel.stop_consuming()
-        finally:
-            # Clean shutdown monitoring
-            self.monitoring.worker_stopping()
-            
-            if self.connection and not self.connection.is_closed:
-                self.connection.close()
-            if self.db_conn:
-                self.db_conn.close()
-            self.logger.info("Worker stopped")
+        if self.connection and not self.connection.is_closed:
+            self.connection.close()
+        if self.db_conn:
+            self.db_conn.close()
+        self.logger.info("Worker stopped")
     
     def run(self):
         """Main worker entry point"""

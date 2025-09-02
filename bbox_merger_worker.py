@@ -399,7 +399,7 @@ class BoundingBoxMergerWorker:
         
         # Step 1: Group by label/emoji
         for detection in detections:
-            key = detection['type'] if detection['type'] == 'face_detection' else detection['label']
+            key = detection['type'] if detection['type'] == 'face_detection' else detection['emoji']
             if key not in groups:
                 groups[key] = {
                     'label': detection['label'],
