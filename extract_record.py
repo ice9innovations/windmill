@@ -162,8 +162,9 @@ class RecordExtractor:
                        status, result_created, error_message, processing_time
                 FROM postprocessing 
                 WHERE image_id = %s
+                AND service NOT LIKE %s
                 ORDER BY merged_box_id, service, result_created
-            """, (image_id,))
+            """, (image_id, 'caption_score_%'))
             
             enrichments = []
             for row in cursor.fetchall():
@@ -179,6 +180,32 @@ class RecordExtractor:
                 })
             
             return enrichments
+    
+    def get_caption_scores(self, image_id):
+        """Get individual caption scoring results for each service"""
+        with self.conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT post_id, service, data, status, result_created, 
+                       error_message, processing_time
+                FROM postprocessing 
+                WHERE image_id = %s
+                AND service LIKE %s
+                ORDER BY service, result_created
+            """, (image_id, 'caption_score_%'))
+            
+            caption_scores = []
+            for row in cursor.fetchall():
+                caption_scores.append({
+                    'post_id': row[0],
+                    'service': row[1],  # e.g. "caption_score_blip"
+                    'data': row[2],  # Already JSON from JSONB column
+                    'status': row[3],
+                    'result_created': row[4].isoformat() if row[4] else None,
+                    'error_message': row[5],
+                    'processing_time': float(row[6]) if row[6] else None
+                })
+            
+            return caption_scores
     
     def get_processing_summary(self, image_id):
         """Get processing summary statistics"""
@@ -252,6 +279,7 @@ class RecordExtractor:
             'merged_boxes': self.get_merged_boxes(image_id),
             'consensus': self.get_consensus(image_id),
             'spatial_enrichments': self.get_spatial_enrichments(image_id),
+            'caption_scores': self.get_caption_scores(image_id),
             'processing_summary': self.get_processing_summary(image_id)
         }
         
@@ -264,6 +292,7 @@ class RecordExtractor:
         print(f"   • Merged boxes: {len(record['merged_boxes'])}")
         print(f"   • Consensus results: {len(record['consensus'])}")
         print(f"   • Spatial enrichments: {len(record['spatial_enrichments'])}")
+        print(f"   • Caption scores: {len(record['caption_scores'])}")
         
         return record
     
