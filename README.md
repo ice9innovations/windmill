@@ -33,10 +33,10 @@ This approach is **fault-tolerant** (works if services fail) and **performance-o
 
 ### 2. Core Workers
 
-#### Generic ML Worker (`generic_worker.py`)
-- Configurable via `.env` files for any of 13 services
-- Processes images through ML services and stores results
-- Supports both URL and file-based image processing
+#### Service-Specific ML Workers
+- **Dedicated workers** for each service (blip_worker.py, clip_worker.py, colors_worker.py, etc.)
+- **Base worker class** (`base_worker.py`) provides shared functionality
+- **Service-specific logic** handles unique requirements per ML service
 
 #### Bounding Box Merger (`bbox_merger_worker.py`) 
 - **Purpose**: Harmonize bbox results from yolov8, rtdetr, detectron2
@@ -287,7 +287,7 @@ SELECT COUNT(*) as total_enrichments FROM postprocessing;
 # k2.local (Pi with SSD): RabbitMQ + bbox_merger_worker
 # k3.local (Pi with GPU): yolov8/rtdetr services + workers
 # k4.local (Pi with NPU): face/pose services + postprocessing workers
-# Main box: Primary ML services + workers + monitoring
+# Main box: Primary ML services + workers
 ```
 
 ### Cloud Scaling
