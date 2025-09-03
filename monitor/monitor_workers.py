@@ -3,7 +3,7 @@
 Worker Monitoring Script - Check health and status of distributed workers
 """
 import os
-import mysql.connector
+import psycopg2
 import argparse
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -21,7 +21,7 @@ class WorkerMonitor:
                 raise ValueError(f"Required environment variable {key} not set")
             return value
         
-        self.mysql_conn = mysql.connector.connect(
+        self.db_conn = psycopg2.connect(
             host=get_required('MONITORING_DB_HOST'),
             user=get_required('MONITORING_DB_USER'),
             password=get_required('MONITORING_DB_PASSWORD'),
@@ -30,17 +30,17 @@ class WorkerMonitor:
     
     def find_dead_workers(self, minutes_silent=5):
         """Find workers that haven't sent heartbeat in X minutes"""
-        cursor = self.mysql_conn.cursor()
+        cursor = self.db_conn.cursor()
         
         query = """
             SELECT worker_id, service_name, node_hostname, 
                    MAX(timestamp) as last_seen,
-                   TIMESTAMPDIFF(MINUTE, MAX(timestamp), NOW()) as minutes_silent,
+                   EXTRACT(EPOCH FROM (NOW() - MAX(timestamp)))/60 as minutes_silent,
                    MAX(jobs_completed) as total_jobs
             FROM worker_heartbeats 
-            WHERE timestamp > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+            WHERE timestamp > NOW() - INTERVAL '1 hour'
             GROUP BY worker_id, service_name, node_hostname
-            HAVING minutes_silent > %s
+            HAVING EXTRACT(EPOCH FROM (NOW() - MAX(timestamp)))/60 > %s
             ORDER BY minutes_silent DESC
         """
         
@@ -52,7 +52,7 @@ class WorkerMonitor:
     
     def get_service_performance(self, minutes_ago=10):
         """Get processing performance by service"""
-        cursor = self.mysql_conn.cursor()
+        cursor = self.db_conn.cursor()
         
         query = """
             SELECT service_name, 
@@ -61,7 +61,7 @@ class WorkerMonitor:
                    SUM(jobs_completed) as total_jobs,
                    MAX(timestamp) as last_update
             FROM worker_heartbeats 
-            WHERE timestamp > DATE_SUB(NOW(), INTERVAL %s MINUTE)
+            WHERE timestamp > NOW() - INTERVAL '%s minutes'
             AND status = 'alive'
             GROUP BY service_name
             ORDER BY avg_rate DESC
@@ -75,15 +75,15 @@ class WorkerMonitor:
     
     def get_node_distribution(self):
         """Get worker distribution across nodes"""
-        cursor = self.mysql_conn.cursor()
+        cursor = self.db_conn.cursor()
         
         query = """
             SELECT node_hostname,
                    COUNT(DISTINCT worker_id) as worker_count,
-                   GROUP_CONCAT(DISTINCT service_name ORDER BY service_name) as services,
+                   STRING_AGG(DISTINCT service_name, ',' ORDER BY service_name) as services,
                    MAX(timestamp) as last_update
             FROM worker_heartbeats 
-            WHERE timestamp > DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+            WHERE timestamp > NOW() - INTERVAL '10 minutes'
             AND status = 'alive'
             GROUP BY node_hostname
             ORDER BY worker_count DESC
@@ -97,13 +97,13 @@ class WorkerMonitor:
     
     def get_recent_errors(self, minutes_ago=60):
         """Get recent worker errors"""
-        cursor = self.mysql_conn.cursor()
+        cursor = self.db_conn.cursor()
         
         query = """
             SELECT timestamp, worker_id, service_name, node_hostname, error_message
             FROM worker_heartbeats 
             WHERE status = 'error'
-            AND timestamp > DATE_SUB(NOW(), INTERVAL %s MINUTE)
+            AND timestamp > NOW() - INTERVAL '%s minutes'
             ORDER BY timestamp DESC
             LIMIT 20
         """
