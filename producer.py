@@ -10,6 +10,7 @@ import time
 import pika
 import psycopg2
 import argparse
+import base64
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -158,13 +159,30 @@ class GenericProducer:
             
             images = []
             for row in cursor.fetchall():
-                images.append({
+                image_data = {
                     "image_id": row[0],
                     "image_filename": row[1],
                     "image_path": row[2],
                     "image_url": row[3],
                     "submitted_at": datetime.now().isoformat()
-                })
+                }
+                
+                # Read and encode image file
+                image_path = row[2] if row[2] else None
+                if image_path and os.path.exists(image_path):
+                    try:
+                        with open(image_path, 'rb') as f:
+                            image_bytes = f.read()
+                            image_data["image_data"] = base64.b64encode(image_bytes).decode('utf-8')
+                        print(f"📷 Encoded image: {row[1]} ({len(image_bytes)} bytes)")
+                    except Exception as e:
+                        print(f"⚠️  Failed to read image {image_path}: {e}")
+                        continue
+                else:
+                    print(f"⚠️  Image path not found: {image_path}")
+                    continue
+                
+                images.append(image_data)
             
             group_info = f" from group '{image_group}'" if image_group else ""
             print(f"📋 Retrieved {len(images)} images{group_info} from database")
