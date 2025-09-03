@@ -9,6 +9,7 @@ import json
 import time
 import logging
 import socket
+import base64
 import pika
 import psycopg2
 import requests
@@ -109,9 +110,26 @@ class BaseWorker:
         self.jobs_failed += 1
         self.logger.debug(f"Job failed (total failures: {self.jobs_failed})")
     
-    def get_service_url(self, image_url):
+    def get_service_url(self):
         """Build the complete service URL for processing"""
-        return f"http://{self.service_host}:{self.service_port}{self.service_endpoint}?url={image_url}"
+        return f"http://{self.service_host}:{self.service_port}{self.service_endpoint}"
+    
+    def post_image_data(self, image_data_b64):
+        """POST base64 encoded image data to service"""
+        service_url = self.get_service_url()
+        
+        # Decode base64 to bytes for posting
+        image_bytes = base64.b64decode(image_data_b64)
+        
+        # POST raw image bytes
+        response = requests.post(
+            service_url,
+            data=image_bytes,
+            headers={'Content-Type': 'application/octet-stream'},
+            timeout=self.request_timeout
+        )
+        response.raise_for_status()
+        return response.json()
     
     def trigger_consensus(self, image_id):
         """Trigger consensus processing"""
@@ -201,8 +219,62 @@ class BaseWorker:
             return False
     
     def process_message(self, ch, method, properties, body):
-        """Process a queue message - override in subclasses"""
-        raise NotImplementedError("Subclasses must implement process_message")
+        """Process a queue message - common logic for all workers"""
+        try:
+            # Parse message
+            message = json.loads(body)
+            image_id = message['image_id']
+            
+            self.logger.debug(f"Processing {self.service_name} request for image {image_id}")
+            
+            # Call ML service
+            result = self.post_image_data(message['image_data'])
+            
+            # Store result in database
+            cursor = self.db_conn.cursor()
+            cursor.execute("""
+                INSERT INTO results (image_id, service, data, status, result_created, worker_id)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (image_id, self.service_name, json.dumps(result), 'success', datetime.now(), self.worker_id))
+            cursor.close()
+            
+            # Trigger post-processing for bbox services
+            if self.service_name in self.bbox_services and self.enable_triggers:
+                bbox_message = {
+                    'image_id': image_id,
+                    'image_filename': message.get('image_filename', f'image_{image_id}'),
+                    'service': self.service_name,
+                    'worker_id': self.worker_id,
+                    'processed_at': datetime.now().isoformat()
+                }
+                
+                self.channel.basic_publish(
+                    exchange='',
+                    routing_key='queue_bbox_merge',
+                    body=json.dumps(bbox_message),
+                    properties=pika.BasicProperties(delivery_mode=2)
+                )
+                
+                self.logger.debug(f"Published bbox completion to queue_bbox_merge")
+            
+            # Trigger caption scoring
+            if self.enable_caption_scoring:
+                self.trigger_caption_scoring(image_id)
+            
+            # Trigger consensus processing
+            self.trigger_consensus(image_id)
+
+            # Acknowledge message
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            self.job_completed_successfully()
+            
+            self.logger.info(f"Successfully processed {self.service_name} request for image {image_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Error processing {self.service_name} message: {e}")
+            # Reject and requeue
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            self.job_failed(str(e))
     
     def start(self):
         """Start the worker"""
