@@ -338,11 +338,18 @@ class SpatialEnrichmentWorker:
                 timeout=self.request_timeout
             )
             
+            self.logger.debug(f"Colors service response status: {colors_response.status_code}")
+            
             if colors_response.status_code == 200:
                 colors_data = colors_response.json()
+                self.logger.debug(f"Colors service response: {colors_data.get('status')}, predictions: {len(colors_data.get('predictions', []))}")
                 if colors_data.get('status') == 'success' and colors_data.get('predictions'):
                     enrichment_data['color_data'] = colors_data
                     self.logger.debug(f"Added color data for {instance['cluster_id']}")
+                else:
+                    self.logger.warning(f"Colors service returned: {colors_data}")
+            else:
+                self.logger.warning(f"Colors service HTTP {colors_response.status_code}: {colors_response.text[:200]}")
             
         except Exception as e:
             self.logger.warning(f"Failed to get color data for {instance['cluster_id']}: {e}")
@@ -395,38 +402,52 @@ class SpatialEnrichmentWorker:
             return False
     
     def save_enrichment_results(self, image_id, merged_box_id, enrichment_results):
-        """Save spatial enrichment results to postprocessing table"""
+        """Save spatial enrichment results as separate records per enrichment type"""
         try:
             cursor = self.db_conn.cursor()
             
-            # Delete old enrichment for this merged box (atomic replacement)
-            cursor.execute("""
-                DELETE FROM postprocessing 
-                WHERE merged_box_id = %s AND service = 'spatial_enrichment'
-            """, (merged_box_id,))
-            
-            # Insert new enrichment results
-            enrichment_data = {
-                'enrichment_results': enrichment_results,
-                'total_instances': len(enrichment_results),
-                'processing_algorithm': 'spatial_enrichment_v1'
-            }
-            
-            cursor.execute("""
-                INSERT INTO postprocessing (image_id, merged_box_id, service, data, status)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (
-                image_id,
-                merged_box_id,
-                'spatial_enrichment',
-                json.dumps(enrichment_data),
-                'success'
-            ))
+            # Process each enrichment result as a separate service record
+            for enrichment in enrichment_results:
+                enrichment_type = enrichment.get('enrichment_type', 'unknown')
+                service_name = f'spatial_enrichment_{enrichment_type.replace("_analysis", "")}'
+                
+                # DELETE+INSERT pattern per enrichment type
+                cursor.execute("""
+                    DELETE FROM postprocessing 
+                    WHERE merged_box_id = %s AND service = %s
+                """, (merged_box_id, service_name))
+                
+                # Create individual enrichment record
+                enrichment_data = {
+                    'bbox': enrichment.get('bbox', {}),
+                    'cluster_id': enrichment.get('cluster_id', ''),
+                    'processing_algorithm': 'spatial_enrichment_v1'
+                }
+                
+                # Add type-specific data
+                if enrichment_type == 'color_analysis':
+                    enrichment_data['color_data'] = enrichment.get('color_data')
+                elif enrichment_type == 'person_analysis':
+                    enrichment_data['face_data'] = enrichment.get('face_data')
+                    enrichment_data['pose_data'] = enrichment.get('pose_data')
+                
+                cursor.execute("""
+                    INSERT INTO postprocessing (image_id, merged_box_id, service, data, status)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (
+                    image_id,
+                    merged_box_id,
+                    service_name,
+                    json.dumps(enrichment_data),
+                    'success'
+                ))
             
             cursor.close()
+            self.db_conn.commit()  # Commit the transaction
             
         except Exception as e:
             self.logger.error(f"Error saving enrichment results: {e}")
+            self.db_conn.rollback()  # Rollback on error
             raise
     
     def process_queue_message(self, ch, method, properties, body):
@@ -467,7 +488,6 @@ class SpatialEnrichmentWorker:
                 FROM merged_boxes mb
                 JOIN images i ON mb.image_id = i.image_id
                 WHERE mb.image_id = %s
-                AND (mb.enrichment_processed IS NULL OR mb.enrichment_processed = false)
                 ORDER BY mb.created DESC
             """
             

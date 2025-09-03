@@ -272,25 +272,28 @@ class BoundingBoxMergerWorker:
             image_filename = message.get('image_filename', f'image_{image_id}')
             
             # Process the bbox merge for this image
-            success = self.update_merged_boxes_for_image(image_id, image_filename)
+            result = self.update_merged_boxes_for_image(image_id, image_filename)
             
-            if success:
+            if result['success']:
                 # Send heartbeat update
                 self.jobs_completed += 1
                 
-                # Publish completion message to downstream queue
-                completion_message = {
-                    'image_id': image_id,
-                    'image_filename': image_filename,
-                    'service': 'bbox_merger',
-                    'worker_id': self.worker_id,
-                    'processed_at': datetime.now().isoformat()
-                }
-                self.publish_to_downstream(completion_message)
+                # Only send spatial enrichment message if merged boxes were actually created
+                if result['merged_boxes_created']:
+                    completion_message = {
+                        'image_id': image_id,
+                        'image_filename': image_filename,
+                        'service': 'bbox_merger',
+                        'worker_id': self.worker_id,
+                        'processed_at': datetime.now().isoformat()
+                    }
+                    self.publish_to_downstream(completion_message)
+                    self.logger.info(f"Successfully processed bbox merge for {image_filename}, sent to spatial enrichment")
+                else:
+                    self.logger.info(f"Successfully processed bbox merge for {image_filename}, no merged boxes to enrich")
                 
                 # Acknowledge the message
                 ch.basic_ack(delivery_tag=method.delivery_tag)
-                self.logger.info(f"Successfully processed bbox merge for {image_filename}")
                 
             else:
                 # Reject and requeue for retry
@@ -555,13 +558,13 @@ class BoundingBoxMergerWorker:
                         self.logger.info(f"Retrying database operation (attempt {attempt + 1}/{max_retries})")
                         time.sleep(2)  # Wait before retry
                         continue
-                    return False
+                    return {'success': False, 'merged_boxes_created': False}
                 
                 # Get bbox results
                 bbox_results = self.get_bbox_results_for_image(image_id)
                 if not bbox_results:
                     self.logger.debug(f"No bbox results for image {image_id}, skipping")
-                    return True  # Not an error - just no data to process
+                    return {'success': True, 'merged_boxes_created': False}  # Not an error - just no data to process
                 
                 # Harmonize bounding boxes
                 start_time = time.time()
@@ -570,7 +573,7 @@ class BoundingBoxMergerWorker:
                 
                 if not merged_data:
                     self.logger.warning(f"Could not harmonize boxes for image {image_id}")
-                    return False
+                    return {'success': False, 'merged_boxes_created': False}
                 
                 # Safe atomic DELETE + INSERT with foreign key handling
                 cursor = self.db_conn.cursor()
@@ -634,7 +637,7 @@ class BoundingBoxMergerWorker:
                 if attempt > 0:
                     self.logger.info(f"Successfully processed {image_filename} after {attempt + 1} attempts")
                 
-                return True
+                return {'success': True, 'merged_boxes_created': merged_box_count > 0}
                 
             except Exception as e:
                 self.logger.error(f"Error updating merged boxes for image {image_id} (attempt {attempt + 1}/{max_retries}): {e}")
@@ -652,9 +655,9 @@ class BoundingBoxMergerWorker:
                     time.sleep(2)
                     continue
                     
-                return False
+                return {'success': False, 'merged_boxes_created': False}
         
-        return False
+        return {'success': False, 'merged_boxes_created': False}
     
     
     
