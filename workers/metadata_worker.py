@@ -66,7 +66,7 @@ class MetadataWorker(BaseWorker):
             
             # Acknowledge message
             ch.basic_ack(delivery_tag=method.delivery_tag)
-            self.jobs_completed += 1
+            self.job_completed_successfully()
             
             self.logger.info(f"Successfully processed metadata request for image {image_id}")
             
@@ -74,7 +74,7 @@ class MetadataWorker(BaseWorker):
             self.logger.error(f"Error processing metadata message: {e}")
             # Reject and requeue
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-            self.jobs_failed += 1
+            self.job_failed(str(e))
 
 if __name__ == "__main__":
     worker = MetadataWorker()

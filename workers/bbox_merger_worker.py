@@ -11,7 +11,6 @@ import socket
 import base64
 import io
 import psycopg2
-import mysql.connector
 import pika
 from datetime import datetime
 from dotenv import load_dotenv
@@ -44,18 +43,6 @@ class BoundingBoxMergerWorker:
         # Bounding box services to harmonize
         self.bbox_services = ['yolov8', 'rtdetr', 'detectron2', 'xception', 'clip']
         
-        # Monitoring configuration  
-        self.enable_monitoring = os.getenv('ENABLE_MONITORING', 'false').lower() == 'true'
-        if self.enable_monitoring:
-            self.monitoring_db_host = self._get_required('MONITORING_DB_HOST')
-            self.monitoring_db_user = self._get_required('MONITORING_DB_USER') 
-            self.monitoring_db_password = self._get_required('MONITORING_DB_PASSWORD')
-            self.monitoring_db_name = self._get_required('MONITORING_DB_NAME')
-        else:
-            self.monitoring_db_host = None
-            self.monitoring_db_user = None
-            self.monitoring_db_password = None
-            self.monitoring_db_name = None
         
         # Logging
         self.setup_logging()
@@ -66,8 +53,6 @@ class BoundingBoxMergerWorker:
         self.queue_connection = None
         self.queue_channel = None
         
-        # Initialize monitoring and connections
-        self.setup_monitoring()
     
     def _get_required(self, key):
         """Get required environment variable or raise error"""
@@ -85,62 +70,8 @@ class BoundingBoxMergerWorker:
         )
         self.logger = logging.getLogger('bbox_merger')
     
-    def setup_monitoring(self):
-        """Initialize monitoring connection"""
-        self.mysql_conn = None
-        self.last_heartbeat = 0
-        self.jobs_completed = 0
-        self.start_time = time.time()
-        self.hostname = socket.gethostname()
-        
-        if self.enable_monitoring and self.monitoring_db_password:
-            try:
-                self.mysql_conn = mysql.connector.connect(
-                    host=self.monitoring_db_host,
-                    user=self.monitoring_db_user,
-                    password=self.monitoring_db_password,
-                    database=self.monitoring_db_name,
-                    autocommit=True
-                )
-                self.send_heartbeat('starting')
-            except Exception as e:
-                self.logger.warning(f"Could not connect to monitoring database: {e}")
     
-    def send_heartbeat(self, status, error_msg=None):
-        """Send heartbeat to monitoring database"""
-        if not self.enable_monitoring or not self.mysql_conn:
-            return
-        
-        try:
-            runtime_minutes = max((time.time() - self.start_time) / 60, 0.1)
-            jobs_per_minute = self.jobs_completed / runtime_minutes
-            
-            cursor = self.mysql_conn.cursor()
-            cursor.execute("""
-                INSERT INTO worker_heartbeats 
-                (worker_id, service_name, node_hostname, status, jobs_completed, 
-                 jobs_per_minute, last_job_time, error_message)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                self.worker_id,
-                'bbox_merger',
-                self.hostname,
-                status,
-                self.jobs_completed,
-                round(jobs_per_minute, 2),
-                datetime.now() if self.jobs_completed > 0 else None,
-                error_msg
-            ))
-            
-            self.last_heartbeat = time.time()
-            
-        except Exception as e:
-            self.logger.warning(f"Failed to send heartbeat: {e}")
     
-    def maybe_send_heartbeat(self):
-        """Send heartbeat if enough time has passed"""
-        if time.time() - self.last_heartbeat > 120:  # 2 minutes
-            self.send_heartbeat('alive')
     
     def connect_to_database(self):
         """Connect to PostgreSQL database"""
@@ -384,8 +315,6 @@ class BoundingBoxMergerWorker:
             result = self.update_merged_boxes_for_image(image_id, image_filename)
             
             if result['success']:
-                # Send heartbeat update
-                self.jobs_completed += 1
                 
                 # Only send spatial enrichment message if merged boxes were actually created
                 if result['merged_boxes_created']:
@@ -809,12 +738,7 @@ class BoundingBoxMergerWorker:
     
     def cleanup_connections(self):
         """Clean up all connections"""
-        try:
-            if self.enable_monitoring and self.mysql_conn:
-                self.send_heartbeat('stopping')
-                self.mysql_conn.close()
-        except Exception:
-            pass  # Don't fail shutdown due to heartbeat issues
+        pass  # No connections to clean up
         
         if self.db_conn:
             self.db_conn.close()

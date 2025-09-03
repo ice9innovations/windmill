@@ -9,7 +9,6 @@ import time
 import logging
 import socket
 import psycopg2
-import mysql.connector
 import pika
 from datetime import datetime
 from dotenv import load_dotenv
@@ -37,18 +36,6 @@ class ConsensusWorker:
         self.queue_user = self._get_required('QUEUE_USER')
         self.queue_password = self._get_required('QUEUE_PASSWORD')
         
-        # Monitoring configuration  
-        self.enable_monitoring = os.getenv('ENABLE_MONITORING', 'false').lower() == 'true'
-        if self.enable_monitoring:
-            self.monitoring_db_host = self._get_required('MONITORING_DB_HOST')
-            self.monitoring_db_user = self._get_required('MONITORING_DB_USER') 
-            self.monitoring_db_password = self._get_required('MONITORING_DB_PASSWORD')
-            self.monitoring_db_name = self._get_required('MONITORING_DB_NAME')
-        else:
-            self.monitoring_db_host = None
-            self.monitoring_db_user = None
-            self.monitoring_db_password = None
-            self.monitoring_db_name = None
         
         # V3 Voting configuration
         self.service_names = {
@@ -82,9 +69,6 @@ class ConsensusWorker:
         # Load service configuration (after logger is set up)
         self.service_config = self.load_service_config()
         
-        # Initialize monitoring
-        self.setup_monitoring()
-        
     def setup_logging(self):
         """Configure logging"""
         log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
@@ -94,61 +78,6 @@ class ConsensusWorker:
         )
         self.logger = logging.getLogger('consensus_worker')
     
-    def setup_monitoring(self):
-        """Initialize monitoring connection"""
-        self.mysql_conn = None
-        self.last_heartbeat = 0
-        self.jobs_completed = 0
-        self.start_time = time.time()
-        self.hostname = socket.gethostname()
-        
-        if self.enable_monitoring and self.monitoring_db_password:
-            try:
-                self.mysql_conn = mysql.connector.connect(
-                    host=self.monitoring_db_host,
-                    user=self.monitoring_db_user,
-                    password=self.monitoring_db_password,
-                    database=self.monitoring_db_name,
-                    autocommit=True
-                )
-                self.send_heartbeat('starting')
-            except Exception as e:
-                self.logger.warning(f"Could not connect to monitoring database: {e}")
-    
-    def send_heartbeat(self, status, error_msg=None):
-        """Send heartbeat to monitoring database"""
-        if not self.enable_monitoring or not self.mysql_conn:
-            return
-        
-        try:
-            cursor = self.mysql_conn.cursor()
-            cursor.execute("""
-                INSERT INTO worker_heartbeats 
-                (worker_id, service_name, node_hostname, status, jobs_completed, error_message, last_job_time)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                status = VALUES(status), 
-                jobs_completed = VALUES(jobs_completed),
-                error_message = VALUES(error_message),
-                last_job_time = VALUES(last_job_time)
-            """, (
-                self.worker_id, 
-                'consensus_worker',
-                self.hostname,
-                status,
-                self.jobs_completed,
-                error_msg,
-                datetime.now() if self.jobs_completed > 0 else None
-            ))
-            cursor.close()
-            self.last_heartbeat = time.time()
-        except Exception as e:
-            self.logger.warning(f"Failed to send heartbeat: {e}")
-    
-    def maybe_send_heartbeat(self):
-        """Send heartbeat if enough time has passed"""
-        if time.time() - self.last_heartbeat > 120:  # 2 minutes
-            self.send_heartbeat('alive')
     
     def _get_required(self, key):
         """Get required environment variable with no fallback"""
@@ -972,7 +901,6 @@ class ConsensusWorker:
             self.logger.info("Stopping consensus worker...")
             self.channel.stop_consuming()
         finally:
-            self.send_heartbeat('stopping')
             if self.connection and not self.connection.is_closed:
                 self.connection.close()
             if self.db_conn:

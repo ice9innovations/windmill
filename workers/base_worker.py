@@ -11,7 +11,6 @@ import logging
 import socket
 import pika
 import psycopg2
-import mysql.connector
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
@@ -24,11 +23,9 @@ class BaseWorker:
         self.load_config(env_file)
         self.setup_logging()
         self.db_conn = None
-        self.monitoring_conn = None
         self.channel = None
         self.jobs_completed = 0
         self.jobs_failed = 0
-        self.start_time = time.time()
         
     def load_config(self, env_file):
         """Load configuration from .env and service_config.json"""
@@ -81,15 +78,6 @@ class BaseWorker:
         
         # Performance configuration
         self.processing_delay = float(os.getenv('PROCESSING_DELAY', '0.0'))
-        self.heartbeat_interval = int(os.getenv('HEARTBEAT_INTERVAL', '60'))
-        
-        # Monitoring configuration  
-        self.enable_monitoring = os.getenv('ENABLE_MONITORING', 'false').lower() == 'true'
-        if self.enable_monitoring:
-            self.monitoring_db_host = self._get_required('MONITORING_DB_HOST')
-            self.monitoring_db_user = self._get_required('MONITORING_DB_USER') 
-            self.monitoring_db_password = self._get_required('MONITORING_DB_PASSWORD')
-            self.monitoring_db_name = self._get_required('MONITORING_DB_NAME')
 
     def _get_required(self, key):
         """Get required environment variable or raise error"""
@@ -110,6 +98,16 @@ class BaseWorker:
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
         self.logger.addHandler(console_handler)
+    
+    def job_completed_successfully(self):
+        """Call this after successfully completing a job"""
+        self.jobs_completed += 1
+        self.logger.debug(f"Job completed successfully (total: {self.jobs_completed})")
+    
+    def job_failed(self, error_msg=None):
+        """Call this after a job fails"""
+        self.jobs_failed += 1
+        self.logger.debug(f"Job failed (total failures: {self.jobs_failed})")
     
     def get_service_url(self, image_url):
         """Build the complete service URL for processing"""
@@ -229,3 +227,7 @@ class BaseWorker:
             self.logger.info("Stopping worker...")
             self.channel.stop_consuming()
             self.connection.close()
+        finally:
+            if self.db_conn:
+                self.db_conn.close()
+            self.logger.info(f"{self.service_name} worker stopped")
