@@ -79,6 +79,9 @@ class ConsensusWorker:
         self.db_conn = None
         self.read_db_conn = None
         
+        # Load service configuration (after logger is set up)
+        self.service_config = self.load_service_config()
+        
         # Initialize monitoring
         self.setup_monitoring()
         
@@ -153,6 +156,17 @@ class ConsensusWorker:
         if not value:
             raise ValueError(f"Required environment variable {key} not set")
         return value
+    
+    def load_service_config(self):
+        """Load service configuration from service_config.json"""
+        try:
+            config_path = os.path.join(os.path.dirname(__file__), '..', 'service_config.json')
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            return config.get('services', {})
+        except Exception as e:
+            self.logger.error(f"Failed to load service_config.json: {e}")
+            return {}
     
     def connect_to_database(self):
         """Connect to PostgreSQL database"""
@@ -302,7 +316,8 @@ class ConsensusWorker:
         for service, data, proc_time, created in service_results:
             service_results_dict[service] = {
                 'success': True,
-                'predictions': data.get('predictions', []) if isinstance(data, dict) else []
+                'predictions': data.get('predictions', []) if isinstance(data, dict) else [],
+                'full_image': data.get('full_image', []) if isinstance(data, dict) else []
             }
         
         # Get harmonized bounding box data from merged_boxes table
@@ -446,6 +461,23 @@ class ConsensusWorker:
                             'shiny': prediction.get('shiny', False)
                         })
 
+            # Handle full_image predictions as classification evidence (CLIP/Xception services)
+            if 'full_image' in result and isinstance(result['full_image'], list):
+                for prediction in result['full_image']:
+                    if prediction.get('emoji') and prediction['emoji'] not in seen_emojis:
+                        seen_emojis.add(prediction['emoji'])
+                        all_detections.append({
+                            'emoji': prediction['emoji'],
+                            'service': service_display_name,
+                            'evidence_type': 'classification',  # Force classification type for full image predictions
+                            'confidence': prediction.get('confidence', self.default_confidence),
+                            'context': {
+                                'source': 'full_image_classification',
+                                'label': prediction.get('label', '')
+                            },
+                            'shiny': prediction.get('shiny', False)
+                        })
+
         # Extract spatial detections from merged_boxes data (harmonized bbox data)
         if bounding_box_data and isinstance(bounding_box_data, list):
             for merged_box in bounding_box_data:
@@ -473,21 +505,16 @@ class ConsensusWorker:
         return all_detections
     
     def get_evidence_type(self, service_name):
-        """Determine evidence type based on service name (ported from V3VotingService.js)"""
-        spatial_services = ['yolov8', 'detectron2', 'rtdetr', 'clip', 'xception']
-        semantic_services = ['blip', 'ollama']  # Smart captioning services
-        classification_services = ['inception_v3']  # Image classification services
-        specialized_services = ['face', 'nsfw2', 'ocr', 'pose']
-
-        if service_name in spatial_services:
-            return 'spatial'
-        if service_name in semantic_services:
-            return 'semantic'
-        if service_name in classification_services:
-            return 'classification'
-        if service_name in specialized_services:
-            return 'specialized'
-        return 'other'
+        """Determine evidence type based on service configuration"""
+        service_config = self.service_config.get(service_name, {})
+        service_type = service_config.get('service_type', 'other')
+        
+        # Handle comma-separated service types - for bbox predictions, use the first type
+        # (full_image predictions get forced to 'classification' in extract_all_detections)
+        if ',' in service_type:
+            return service_type.split(',')[0].strip()
+        
+        return service_type
 
     def extract_context(self, prediction, service_name):
         """Extract context information from prediction (ported from V3VotingService.js)"""
@@ -530,6 +557,7 @@ class ConsensusWorker:
                 'evidence': {
                     'spatial': self.analyze_spatial_evidence(detections, merged_boxes_data),
                     'semantic': self.analyze_semantic_evidence(detections),
+                    'classification': self.analyze_classification_evidence(detections),
                     'specialized': self.analyze_specialized_evidence(detections)
                 },
                 'instances': self.extract_instance_information(detections),
@@ -641,8 +669,16 @@ class ConsensusWorker:
             # Consensus = total_content_services - 1 (one vote doesn't count as consensus)
             content_consensus_bonus = total_content_services - 1
         
+        # Classification consensus bonus: Agreement across classification services (CLIP/Xception full image)
+        classification_consensus_bonus = 0
+        classification_count = analysis['evidence']['classification']['service_count'] if analysis['evidence']['classification'] else 0
+        
+        if classification_count >= 2:
+            # Consensus = classification_count - 1 (one vote doesn't count as consensus)
+            classification_consensus_bonus = classification_count - 1
+        
         # Total weight = democratic votes + consensus bonuses
-        weight = base_votes + spatial_consensus_bonus + content_consensus_bonus
+        weight = base_votes + spatial_consensus_bonus + content_consensus_bonus + classification_consensus_bonus
         
         return max(0, weight)  # Don't go negative
 
@@ -672,6 +708,7 @@ class ConsensusWorker:
                 'evidence': {
                     'spatial': self.format_spatial_evidence(analysis['evidence']['spatial']) if analysis['evidence']['spatial'] else None,
                     'semantic': analysis['evidence']['semantic'],
+                    'classification': analysis['evidence']['classification'],
                     'specialized': list(analysis['evidence']['specialized'].keys()) if analysis['evidence']['specialized'] else None
                 },
                 'services': analysis['voting_services']

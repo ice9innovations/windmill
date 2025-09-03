@@ -229,7 +229,6 @@ class GenericWorker:
                 # Declare post-processing queues if triggers are enabled
                 if self.config.enable_triggers:
                     self.channel.queue_declare(queue='queue_bbox_merge', durable=True)
-                    self.channel.queue_declare(queue='queue_spatial_enrichment', durable=True)
                     self.channel.queue_declare(queue='queue_consensus', durable=True)
                 
                 # Set prefetch count for fair distribution

@@ -8,9 +8,9 @@ A complete distributed processing system. This system transforms Animal Farm fro
 
 This system delivers the complete vision of distributed ML processing with three key innovations:
 
-1. **Complete Service Coverage**: All services (BLIP, CLIP, Colors, Detectron2, Face, Inception_v3, Metadata, OCR, NSFW2, Ollama, Pose, RT-DETR, YOLOv8) 
+1. **Complete Service Coverage**: All services (BLIP, CLIP, Colors, Detectron2, Face, Xception, Metadata, OCR, NSFW2, Ollama, Pose, RT-DETR, YOLOv8, Caption Scoring) 
 2. **Progressive Harmonization**: Immediate results after ANY service completes, with automatic re-harmonization as more services finish
-3. **True Spatial Enrichment**: In-memory bbox cropping for genuine spatial analysis of detected objects
+3. **Distributed Spatial Processing**: Specialized postprocessing workers for bbox-level face detection, pose estimation, and color analysis
 
 The system processes images through the full ML pipeline while solving the specialized challenge of **bounding box harmonization** from detection services.
 
@@ -50,45 +50,75 @@ This approach is **fault-tolerant** (works if services fail) and **performance-o
 - **Algorithm**: Democratic voting with evidence weighting
 - **Output**: Consensus results stored in `consensus` table
 
-#### Spatial Enrichment Worker (`spatial_enrichment_worker.py`)
-- **Purpose**: Add face/pose data for person boxes, colors for all boxes
-- **Method**: Crops bbox regions in memory, POSTs to face/pose/colors services
-- **Innovation**: True spatial analysis (not whole-image analysis)
-- **Output**: Enrichment data stored in `postprocessing` table
+#### Postprocessing Workers (Distributed Spatial Analysis)
+- **Bbox Colors Worker** (`bbox_colors_worker.py`): Color analysis on ALL cropped bounding boxes
+- **Bbox Face Worker** (`bbox_face_worker.py`): Face detection on person bounding boxes only  
+- **Bbox Pose Worker** (`bbox_pose_worker.py`): Pose estimation on person bounding boxes only
+- **Method**: bbox_merger_worker crops regions and dispatches to specialized queues
+- **Innovation**: Parallel spatial processing instead of sequential bottleneck
+- **Output**: Results stored in `postprocessing` table with service-specific naming
 
 ### 3. Database Schema
 
 ```sql
 -- Core ML service results
-results(image_id, service, data, status, processing_time)
+results(image_id, service, data, status, processing_time, result_created, worker_id)
 
 -- Harmonized bounding boxes (DELETE+INSERT pattern)
-merged_boxes(image_id, source_result_ids, merged_data, status) 
+merged_boxes(image_id, source_result_ids, merged_data, status, created, worker_id) 
 
 -- Voting consensus (DELETE+INSERT pattern)  
-consensus(image_id, consensus_data, processing_time)
+consensus(image_id, consensus_data, processing_time, consensus_created, worker_id)
 
--- Spatial enrichment results (INSERT-only pattern)
-postprocessing(image_id, merged_box_id, service, data)
+-- Spatial analysis results (INSERT-only pattern)
+postprocessing(image_id, merged_box_id, service, data, status, result_created, worker_id)
+
+-- Source images
+images(image_id, image_filename, image_path, image_url, image_created)
+```
+
+**Database Setup:**
+```bash
+# Create database and tables
+psql -h $DB_HOST -U $DB_USER -d $DB_NAME -f schema.sql
 ```
 
 **Key Design Decisions:**
-- **DELETE+INSERT** for merged_boxes/consensus (clean JOINs, no history)
-- **INSERT-only** for postprocessing (no update conflicts, parallel workers)
-- **Timestamp-based triggers** (no explicit coordination needed)
+- **DELETE+INSERT** for merged_boxes/consensus (clean JOINs, atomic re-harmonization)
+- **INSERT-only** for postprocessing (no update conflicts, parallel worker safety)
+- **Foreign key constraints** ensure referential integrity across the pipeline
+- **Monitoring views** provide real-time processing status
+- **Performance indexes** optimize worker query patterns
 
 ## Configuration
 
 ### Service Configuration (`service_config.json`)
-Maps service names to ports and endpoints:
+Maps service names to ports, endpoints, and categorization:
 ```json
 {
   "services": {
-    "colors": {"port": 7770, "endpoint": "/analyze"},
-    "yolov8": {"port": 7773, "endpoint": "/analyze"}
+    "blip": {
+      "port": 7777,
+      "endpoint": "/v3/analyze", 
+      "category": "primary",
+      "description": "Image captioning with emoji mapping",
+      "enable_consensus_triggers": true
+    },
+    "face": {
+      "port": 7772,
+      "endpoint": "/v3/analyze",
+      "category": "spatial_only", 
+      "description": "Face detection",
+      "enable_consensus_triggers": true
+    }
   }
 }
 ```
+
+**Service Categories:**
+- **`primary`**: Whole-image ML services, included in default job submission
+- **`spatial_only`**: Bbox-region services (face/pose), handled by postprocessing workers
+- **`postprocessing`**: Caption scoring and other post-ML analysis services
 
 ### Worker Configuration (`.env` files)
 Each worker loads configuration from `.env`:
@@ -115,38 +145,60 @@ LOG_LEVEL=INFO
 
 ### 1. Submit Jobs - Complete ML Pipeline
 ```bash
-# Process 100K images through ALL 13 ML services (1.3M total jobs)
-python generic_producer.py --services all --limit 100000
+# Process 100K images through all PRIMARY services (excludes face/pose - they run via postprocessing)
+python producer.py --services all --limit 100000
 
-# Or specific services for testing
-python generic_producer.py --services blip,clip,colors,yolov8 --limit 1000
+# Process through all services including spatial_only (face/pose)
+python producer.py --services full_catalog --limit 100000
 
-# List all available services
-python generic_producer.py --list-services
+# Submit jobs to specific services for testing
+python producer.py --services blip,clip,colors,yolov8 --limit 1000
+
+# Process specific image group
+python producer.py --services all --group coco2017 --limit 10000
+
+# List all available services and categories
+python producer.py --list-services
 ```
 
-### 2. Run Workers - Distributed Across Infrastructure
+**Service Categories:**
+- **`all`/`primary`**: Main ML services that process whole images (excludes face/pose)
+- **`spatial_only`**: Face/pose services (handled by postprocessing workers, not for direct submission)
+- **`full_catalog`**: All services including spatial_only (use with caution)
+- **Custom list**: Comma-separated service names for targeted testing
+
+### 2. Worker Management
 ```bash
-# Complete ML service workers (13 services available)
-SERVICE_NAME=blip python generic_worker.py       # Image captioning
-SERVICE_NAME=clip python generic_worker.py       # Image classification
-SERVICE_NAME=colors python generic_worker.py     # Color analysis
-SERVICE_NAME=detectron2 python generic_worker.py # Object detection
-SERVICE_NAME=face python generic_worker.py       # Face detection
-SERVICE_NAME=inception_v3 python generic_worker.py # ImageNet classification
-SERVICE_NAME=metadata python generic_worker.py   # EXIF extraction
-SERVICE_NAME=ocr python generic_worker.py        # Text extraction
-SERVICE_NAME=nsfw2 python generic_worker.py      # Content moderation
-SERVICE_NAME=ollama python generic_worker.py     # LLM vision analysis
-SERVICE_NAME=pose python generic_worker.py       # Pose estimation
-SERVICE_NAME=rtdetr python generic_worker.py     # Transformer object detection
-SERVICE_NAME=yolov8 python generic_worker.py     # Real-time object detection
+# Start all workers
+./workers.sh start
 
-# Post-processing workers (specialized)
-python bbox_merger_worker.py         # Harmonizes object detection results
-python consensus_worker.py           # V3 voting algorithm across ALL services
-python spatial_enrichment_worker.py  # Spatial analysis on detected objects
+# Start specific workers  
+./workers.sh start bbox_merger
+./workers.sh start blip
+./workers.sh start consensus
+
+# Stop all workers
+./workers.sh stop
+
+# Stop specific worker
+./workers.sh stop ollama
+
+# Restart all workers (useful after code changes)
+./workers.sh restart
+
+# Restart specific worker
+./workers.sh restart blip
+
+# Check worker status
+./workers.sh status
 ```
+
+**Available Workers (Dynamically Detected):**
+- **ML Service Workers**: blip, clip, colors, detectron2, xception, metadata, nsfw2, ocr, ollama, rtdetr, yolov8
+- **Processing Workers**: bbox_merger (harmonization), consensus (voting), caption_score
+- **Postprocessing Workers**: bbox_colors, bbox_face, bbox_pose (spatial analysis)
+
+**Note**: The `workers.sh` script automatically detects all available worker files and can start/stop/restart individual workers or all workers. ML service workers will only start successfully if the corresponding services are running on their configured ports.
 
 ### 3. Monitor Progress
 ```sql
@@ -188,26 +240,29 @@ SELECT COUNT(*) as total_enrichments FROM postprocessing;
 ## Complete Processing Pipeline Flow
 
 ```
-1. Images → 13 Service Queues → Distributed ML Workers
-    ↓        ↓         ↓            ↓
-  BLIP   CLIP   Colors  Detectron2  Face  Inception_v3  Metadata  
-  OCR    NSFW2  Ollama  RT-DETR     YOLOv8     Pose
+1. Images → Primary Service Queues → Distributed ML Workers
+    ↓        ↓         ↓            ↓            ↓
+  BLIP   CLIP   Colors  Detectron2  Xception  Metadata  
+  OCR    NSFW2  Ollama  RT-DETR     YOLOv8    Caption_Score
                      ↓
-2. All ML Results → PostgreSQL results table
+2. All Primary Results → PostgreSQL results table
                      ↓  
 3. Bbox Services → bbox_merger_worker → merged_boxes table
-                     ↓
+                     ↓ (Crops bboxes and dispatches to postprocessing queues)
 4. ALL Services → consensus_worker → consensus table (V3 Voting Algorithm)
                      ↓
-5. Merged Boxes → spatial_enrichment_worker → postprocessing table
+5. Cropped Bboxes → Distributed Postprocessing Workers:
+   • All boxes → bbox_colors_worker → Colors Service (port 7770) → postprocessing table  
+   • Person boxes → bbox_face_worker → Face Service (port 7772) → postprocessing table
+   • Person boxes → bbox_pose_worker → Pose Service (port 7786) → postprocessing table
 ```
 
 **Complete Pipeline Example:**
 - T+0s: Colors, CLIP complete → Consensus worker runs V3 voting on 2 services
-- T+3s: YOLOv8 completes → Bbox merger harmonizes YOLOv8 alone, consensus re-runs on 3 services
-- T+5s: RT-DETR, BLIP complete → Bbox merger re-harmonizes YOLOv8+RT-DETR, consensus on 5 services
-- T+8s: All 13 services complete → Final bbox harmonization, final consensus across all services
-- T+10s: Spatial enrichment crops person boxes → Face analysis + color analysis
+- T+3s: YOLOv8 completes → Bbox merger harmonizes YOLOv8 alone, crops boxes, dispatches to postprocessing queues
+- T+5s: RT-DETR, BLIP complete → Bbox merger re-harmonizes YOLOv8+RT-DETR, dispatches new boxes
+- T+8s: All primary services complete → Final bbox harmonization, final consensus across all services
+- T+10s: Postprocessing workers process cropped regions in parallel → Face/pose/color analysis
 
 ## Performance Characteristics
 
@@ -220,19 +275,19 @@ SELECT COUNT(*) as total_enrichments FROM postprocessing;
 
 ### Single Machine Development
 ```bash
-# Terminal 1: Start services (colors, yolov8, face, etc.)
-# Terminal 2: python generic_worker.py  
-# Terminal 3: python bbox_merger_worker.py
-# Terminal 4: python spatial_enrichment_worker.py
+# Terminal 1: Start ML services (blip:7777, clip:7788, yolov8:7773, face:7772, etc.)
+# Terminal 2: ./workers.sh start bbox_merger consensus
+# Terminal 3: ./workers.sh start blip clip colors yolov8
+# Terminal 4: ./workers.sh start bbox_colors bbox_face bbox_pose
 ```
 
 ### Pi Cluster Production
 ```bash
-# k1.local (Pi with storage): PostgreSQL + consensus_worker
-# k2.local (Pi with SSD): RabbitMQ + spatial_enrichment_worker  
-# k3.local (Pi with GPU): yolov8 service + worker
-# k4.local (Pi with NPU): rtdetr service + worker
-# Main box: All other services + workers + bbox_merger_worker
+# k1.local (Pi with storage): PostgreSQL + consensus_worker  
+# k2.local (Pi with SSD): RabbitMQ + bbox_merger_worker
+# k3.local (Pi with GPU): yolov8/rtdetr services + workers
+# k4.local (Pi with NPU): face/pose services + postprocessing workers
+# Main box: Primary ML services + workers + monitoring
 ```
 
 ### Cloud Scaling

@@ -7,7 +7,10 @@
       "queue_prefix": "queue_",
       "category": "primary",
       "description": "Image captioning with emoji mapping",
-      "enable_triggers": true
+      "service_type": "semantic",
+      "enable_triggers": true,
+      "enable_caption_scoring": true,
+      "enable_consensus_triggers": true
     },
     "clip": {
       "host": "localhost",
@@ -16,7 +19,9 @@
       "queue_prefix": "queue_",
       "category": "primary",
       "description": "Two stage image classification with confidence scoring",
-      "enable_triggers": true
+      "service_type": "spatial,classification",
+      "enable_triggers": true,
+      "enable_consensus_triggers": true
     },
     "colors": {
       "host": "localhost",
@@ -25,7 +30,9 @@
       "queue_prefix": "queue_",
       "category": "primary",
       "description": "Copic/Prismacolor color analysis",
-      "enable_triggers": true
+      "service_type": "other",
+      "enable_triggers": true,
+      "enable_consensus_triggers": false
     },
     "detectron2": {
       "host": "localhost",
@@ -34,7 +41,9 @@
       "queue_prefix": "queue_",
       "category": "primary",
       "description": "Object detection with bounding boxes",
-      "enable_triggers": true
+      "service_type": "spatial",
+      "enable_triggers": true,
+      "enable_consensus_triggers": true
     },
     "face": {
       "host": "localhost",
@@ -42,7 +51,9 @@
       "endpoint": "/v3/analyze",
       "queue_prefix": "queue_",
       "category": "spatial_only",
-      "description": "Face detection and pose estimation"
+      "description": "Face detection",
+      "service_type": "specialized",
+      "enable_consensus_triggers": true
     },
     "xception": {
       "host": "localhost",
@@ -51,7 +62,9 @@
       "queue_prefix": "queue_",
       "category": "primary",
       "description": "Xception two stage ImageNet classification",
-      "enable_triggers": true
+      "service_type": "spatial,classification",
+      "enable_triggers": true,
+      "enable_consensus_triggers": true
     },
     "metadata": {
       "host": "localhost",
@@ -59,7 +72,9 @@
       "endpoint": "/v3/analyze",
       "queue_prefix": "queue_",
       "category": "primary",
-      "description": "EXIF/technical metadata extraction"
+      "description": "EXIF/technical metadata extraction",
+      "service_type": "other",
+      "enable_consensus_triggers": false
     },
     "ocr": {
       "host": "localhost",
@@ -67,7 +82,10 @@
       "endpoint": "/v3/analyze",
       "queue_prefix": "queue_",
       "category": "primary",
-      "description": "Text extraction with PaddleOCR"
+      "description": "Text extraction with PaddleOCR",
+      "service_type": "specialized",
+      "enable_triggers": true,
+      "enable_consensus_triggers": true
     },
     "nsfw2": {
       "host": "localhost",
@@ -75,7 +93,10 @@
       "endpoint": "/v3/analyze",
       "queue_prefix": "queue_",
       "category": "primary",
-      "description": "Content moderation"
+      "description": "Content moderation",
+      "service_type": "specialized",
+      "enable_triggers": true,
+      "enable_consensus_triggers": true
     },
     "ollama": {
       "host": "localhost",
@@ -84,7 +105,10 @@
       "queue_prefix": "queue_",
       "category": "primary",
       "description": "LLM vision analysis",
-      "enable_triggers": true
+      "service_type": "semantic",
+      "enable_triggers": true,
+      "enable_caption_scoring": true,
+      "enable_consensus_triggers": true
     },
     "pose": {
       "host": "localhost",
@@ -92,7 +116,9 @@
       "endpoint": "/v3/analyze",
       "queue_prefix": "queue_",
       "category": "spatial_only",
-      "description": "Pose Estimation"
+      "description": "Pose Estimation",
+      "service_type": "specialized",
+      "enable_consensus_triggers": false
     },
     "rtdetr": {
       "host": "localhost",
@@ -101,7 +127,9 @@
       "queue_prefix": "queue_",
       "category": "primary",
       "description": "Transformer-based object detection",
-      "enable_triggers": true
+      "service_type": "spatial",
+      "enable_triggers": true,
+      "enable_consensus_triggers": true
     },
     "yolov8": {
       "host": "localhost",
@@ -110,7 +138,9 @@
       "queue_prefix": "queue_",
       "category": "primary",
       "description": "Real-time object detection",
-      "enable_triggers": true
+      "service_type": "spatial",
+      "enable_triggers": true,
+      "enable_consensus_triggers": true
     },
     "caption_score": {
       "host": "localhost",
@@ -118,7 +148,9 @@
       "endpoint": "/score",
       "queue_prefix": "queue_",
       "category": "postprocessing",
-      "description": "Caption similarity scoring using CLIP"
+      "description": "Caption similarity scoring using CLIP",
+      "service_type": "other",
+      "enable_consensus_triggers": false
     }
   }
 }

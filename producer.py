@@ -54,7 +54,7 @@ class ProducerConfig:
         ]
     
     def get_primary_services(self):
-        """Get services that run on whole images (excludes spatial_only)"""
+        """Get services that run on whole images (excludes spatial_only which are handled by postprocessing workers)"""
         return self.get_services_by_category('primary')
     
     def get_queue_name(self, service_name):
@@ -280,7 +280,7 @@ def main():
             
             # Spatial-only services (bbox region processing)
             spatial_services = producer.config.get_services_by_category('spatial_only')
-            print("🔍 SPATIAL_ONLY (bbox region processing via spatial_enrichment_worker):")
+            print("🔍 SPATIAL_ONLY (bbox region processing via postprocessing workers):")
             for service in sorted(spatial_services):
                 desc = producer.config.service_definitions[service]['description']
                 port = producer.config.service_definitions[service]['port']
@@ -290,7 +290,7 @@ def main():
             print("Service sets:")
             print("  all          = primary services (recommended for whole image processing)")
             print("  primary      = primary services (same as 'all')")  
-            print("  spatial_only = face + pose services (not recommended for direct use)")
+            print("  spatial_only = face + pose services (handled by postprocessing workers, not for direct use)")
             print("  full_catalog = all services including spatial_only")
             
             return 0

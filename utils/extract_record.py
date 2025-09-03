@@ -154,8 +154,8 @@ class RecordExtractor:
             
             return consensus_results
     
-    def get_spatial_enrichments(self, image_id):
-        """Get spatial enrichment results (face/pose/colors on bounding boxes)"""
+    def get_postprocessing_results(self, image_id):
+        """Get postprocessing results (face/pose/colors on bounding boxes)"""
         with self.conn.cursor() as cursor:
             cursor.execute("""
                 SELECT post_id, merged_box_id, service, data, 
@@ -166,9 +166,9 @@ class RecordExtractor:
                 ORDER BY merged_box_id, service, result_created
             """, (image_id, 'caption_score_%'))
             
-            enrichments = []
+            postprocessing_results = []
             for row in cursor.fetchall():
-                enrichments.append({
+                postprocessing_results.append({
                     'post_id': row[0],
                     'merged_box_id': row[1],
                     'service': row[2],
@@ -179,7 +179,7 @@ class RecordExtractor:
                     'processing_time': float(row[7]) if row[7] else None
                 })
             
-            return enrichments
+            return postprocessing_results
     
     def get_caption_scores(self, image_id):
         """Get individual caption scoring results for each service"""
@@ -278,7 +278,7 @@ class RecordExtractor:
             'ml_results': self.get_ml_results(image_id),
             'merged_boxes': self.get_merged_boxes(image_id),
             'consensus': self.get_consensus(image_id),
-            'spatial_enrichments': self.get_spatial_enrichments(image_id),
+            'postprocessing_results': self.get_postprocessing_results(image_id),
             'caption_scores': self.get_caption_scores(image_id),
             'processing_summary': self.get_processing_summary(image_id)
         }
@@ -291,7 +291,7 @@ class RecordExtractor:
         print(f"   • Failed results: {summary.get('failed_results', 0)}")
         print(f"   • Merged boxes: {len(record['merged_boxes'])}")
         print(f"   • Consensus results: {len(record['consensus'])}")
-        print(f"   • Spatial enrichments: {len(record['spatial_enrichments'])}")
+        print(f"   • Postprocessing results: {len(record['postprocessing_results'])}")
         print(f"   • Caption scores: {len(record['caption_scores'])}")
         
         return record

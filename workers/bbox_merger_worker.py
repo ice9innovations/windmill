@@ -8,11 +8,14 @@ import json
 import time
 import logging
 import socket
+import base64
+import io
 import psycopg2
 import mysql.connector
 import pika
 from datetime import datetime
 from dotenv import load_dotenv
+from PIL import Image
 
 class BoundingBoxMergerWorker:
     """Continuous bounding box harmonization worker"""
@@ -36,7 +39,7 @@ class BoundingBoxMergerWorker:
         self.queue_host = self._get_required('QUEUE_HOST')
         self.queue_user = self._get_required('QUEUE_USER')
         self.queue_password = self._get_required('QUEUE_PASSWORD')
-        self.downstream_queue = os.getenv('DOWNSTREAM_QUEUE', 'queue_spatial_enrichment')
+        # Removed downstream_queue - using new postprocessing dispatch instead
         
         # Bounding box services to harmonize
         self.bbox_services = ['yolov8', 'rtdetr', 'detectron2', 'xception', 'clip']
@@ -229,35 +232,141 @@ class BoundingBoxMergerWorker:
             
             # Declare queues (create if they don't exist)
             self.queue_channel.queue_declare(queue=self.queue_name, durable=True)
-            self.queue_channel.queue_declare(queue=self.downstream_queue, durable=True)
+            # Removed old downstream queue
+            
+            # Declare bbox postprocessing queues
+            self.queue_channel.queue_declare(queue='queue_bbox_colors', durable=True)
+            self.queue_channel.queue_declare(queue='queue_bbox_face', durable=True)
+            self.queue_channel.queue_declare(queue='queue_bbox_pose', durable=True)
             
             # Set prefetch count for fair distribution
             self.queue_channel.basic_qos(prefetch_count=1)
             
             self.logger.info(f"Connected to RabbitMQ at {self.queue_host}")
             self.logger.info(f"Consuming from: {self.queue_name}")
-            self.logger.info(f"Publishing to: {self.downstream_queue}")
+            self.logger.info(f"Publishing to postprocessing queues: bbox_colors, bbox_face, bbox_pose")
             return True
             
         except Exception as e:
             self.logger.error(f"Failed to connect to RabbitMQ: {e}")
             return False
     
-    def publish_to_downstream(self, message):
-        """Publish message to downstream queue"""
+    # Removed publish_to_downstream - using new dispatch_bbox_postprocessing instead
+    
+    def dispatch_bbox_postprocessing(self, image_id, image_filename, merged_data):
+        """Dispatch bbox postprocessing jobs for each merged box"""
+        try:
+            # Get image path from database (use main connection to stay in transaction)
+            cursor = self.db_conn.cursor()
+            cursor.execute("SELECT image_path FROM images WHERE image_id = %s", (image_id,))
+            result = cursor.fetchone()
+            cursor.close()
+            
+            if not result:
+                self.logger.warning(f"No image path found for image_id {image_id}")
+                return
+                
+            image_path = result[0]
+            
+            # Process each merged box
+            for group_key, group_data in merged_data['grouped_objects'].items():
+                instances = group_data.get('instances', [])
+                for instance in instances:
+                    merged_bbox = instance.get('merged_bbox', {})
+                    cluster_id = instance.get('cluster_id', '')
+                    
+                    # Get merged_box_id from database for this instance (use main connection to see uncommitted data)
+                    cursor = self.db_conn.cursor()
+                    cursor.execute("""
+                        SELECT merged_id FROM merged_boxes 
+                        WHERE image_id = %s AND merged_data->>'cluster_id' = %s
+                        ORDER BY created DESC LIMIT 1
+                    """, (image_id, cluster_id))
+                    box_result = cursor.fetchone()
+                    cursor.close()
+                    
+                    if not box_result:
+                        continue
+                        
+                    merged_box_id = box_result[0]
+                    
+                    # Crop the bounding box
+                    cropped_image_data = self.crop_bbox_from_image(image_path, merged_bbox)
+                    if not cropped_image_data:
+                        continue
+                    
+                    # Create postprocessing message
+                    base_message = {
+                        'merged_box_id': merged_box_id,
+                        'image_id': image_id,
+                        'cluster_id': cluster_id,
+                        'bbox': merged_bbox,
+                        'cropped_image_data': cropped_image_data.decode('latin-1')  # Encode bytes for JSON
+                    }
+                    
+                    # Always dispatch colors
+                    self.publish_bbox_message('queue_bbox_colors', base_message)
+                    
+                    # Dispatch face/pose for person boxes
+                    if self.is_person_box(instance):
+                        self.publish_bbox_message('queue_bbox_face', base_message)
+                        self.publish_bbox_message('queue_bbox_pose', base_message)
+                    
+        except Exception as e:
+            self.logger.error(f"Error in dispatch_bbox_postprocessing: {e}")
+            raise
+    
+    def crop_bbox_from_image(self, image_path, bbox):
+        """Crop bbox region from image and return as base64 encoded bytes"""
+        try:
+            
+            # Load image
+            with Image.open(image_path) as img:
+                # Extract bbox coordinates
+                x = bbox['x']
+                y = bbox['y'] 
+                width = bbox['width']
+                height = bbox['height']
+                
+                # Crop the bbox region
+                crop_box = (x, y, x + width, y + height)
+                cropped_img = img.crop(crop_box)
+                
+                # Convert to base64 encoded bytes for JSON transport
+                img_buffer = io.BytesIO()
+                cropped_img.save(img_buffer, format='JPEG', quality=90)
+                img_buffer.seek(0)
+                
+                return base64.b64encode(img_buffer.getvalue())
+                
+        except Exception as e:
+            self.logger.error(f"Failed to crop bbox from {image_path}: {e}")
+            return None
+    
+    def is_person_box(self, instance):
+        """Check if a bounding box should trigger face/pose processing"""
+        emoji = instance.get('emoji', '')
+        
+        # Only trigger face/pose for specific person emojis
+        face_pose_emojis = ['🧑', '🙂', '👩', '🧒']
+        
+        return emoji in face_pose_emojis
+    
+    def publish_bbox_message(self, queue_name, message):
+        """Publish message to bbox postprocessing queue"""
         try:
             self.queue_channel.basic_publish(
                 exchange='',
-                routing_key=self.downstream_queue,
+                routing_key=queue_name,
                 body=json.dumps(message),
                 properties=pika.BasicProperties(
                     delivery_mode=2  # Make message persistent
                 )
             )
-            self.logger.debug(f"Published message to {self.downstream_queue}: {message}")
+            self.logger.debug(f"Published bbox message to {queue_name}")
             
         except Exception as e:
-            self.logger.error(f"Failed to publish to {self.downstream_queue}: {e}")
+            self.logger.error(f"Failed to publish to {queue_name}: {e}")
             raise
     
     def process_queue_message(self, ch, method, properties, body):
@@ -287,8 +396,8 @@ class BoundingBoxMergerWorker:
                         'worker_id': self.worker_id,
                         'processed_at': datetime.now().isoformat()
                     }
-                    self.publish_to_downstream(completion_message)
-                    self.logger.info(f"Successfully processed bbox merge for {image_filename}, sent to spatial enrichment")
+                    # Old downstream publishing removed - using new postprocessing dispatch
+                    self.logger.info(f"Successfully processed bbox merge for {image_filename}, postprocessing dispatched")
                 else:
                     self.logger.info(f"Successfully processed bbox merge for {image_filename}, no merged boxes to enrich")
                 
@@ -634,6 +743,14 @@ class BoundingBoxMergerWorker:
                 else:
                     self.logger.info(f"Harmonized boxes for {image_filename} ({detection_count} detections → {merged_box_count} merged boxes from {services})")
                 
+                # Dispatch bbox postprocessing jobs for each merged box
+                if merged_box_count > 0:
+                    try:
+                        self.dispatch_bbox_postprocessing(image_id, image_filename, merged_data)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to dispatch postprocessing for {image_filename}: {e}")
+                        # Don't fail the whole operation if postprocessing dispatch fails
+                
                 if attempt > 0:
                     self.logger.info(f"Successfully processed {image_filename} after {attempt + 1} attempts")
                 
@@ -664,7 +781,7 @@ class BoundingBoxMergerWorker:
     def run(self):
         """Main entry point - pure queue-based processing"""
         self.logger.info(f"Starting bbox merger worker in QUEUE MODE ({self.worker_id})")
-        self.logger.info(f"Queue: {self.queue_name} → {self.downstream_queue}")
+        self.logger.info(f"Queue: {self.queue_name} → postprocessing queues")
         
         if not self.connect_to_database():
             return 1
