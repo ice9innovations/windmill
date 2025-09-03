@@ -90,6 +90,13 @@ stop_worker() {
 
 start_worker() {
     local worker="$1"
+    
+    # Check if worker file exists
+    if [ ! -f "workers/${worker}_worker.py" ]; then
+        echo "❌ ERROR: workers/${worker}_worker.py does not exist"
+        return 1
+    fi
+    
     echo "  Starting $worker..."
     nohup python workers/${worker}_worker.py > logs/${worker}_worker.log 2>&1 &
     echo "✅ Started $worker"
