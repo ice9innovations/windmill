@@ -610,11 +610,24 @@ class BoundingBoxMergerWorker:
                 processing_time = time.time() - start_time
                 
                 if not merged_data:
-                    self.logger.warning(f"Could not harmonize boxes for image {image_id}")
-                    return {'success': False, 'merged_boxes_created': False}
+                    self.logger.info(f"No bounding boxes to harmonize for image {image_id} - all detection services returned empty predictions")
+                    return {'success': True, 'merged_boxes_created': False}
                 
                 # Safe atomic DELETE + INSERT with foreign key handling
                 cursor = self.db_conn.cursor()
+                
+                # Step 0: Check for active postprocessing references
+                cursor.execute("""
+                    SELECT COUNT(*) FROM postprocessing 
+                    WHERE merged_box_id IN (
+                        SELECT merged_id FROM merged_boxes WHERE image_id = %s
+                    )
+                """, (image_id,))
+                active_refs = cursor.fetchone()[0]
+                
+                if active_refs > 0:
+                    self.logger.debug(f"Skipping reharmonization for image {image_id} - {active_refs} active postprocessing references")
+                    return {'success': True, 'merged_boxes_created': False}  # Skip, don't fail
                 
                 # Step 1: Clear postprocessing references to avoid FK constraint violation
                 cursor.execute("""
