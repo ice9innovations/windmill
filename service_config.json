@@ -142,6 +142,28 @@
       "enable_triggers": true,
       "enable_consensus_triggers": true
     },
+    "yolo_365": {
+      "host": "localhost",
+      "port": 7790,
+      "endpoint": "/v3/analyze",
+      "queue_prefix": "queue_",
+      "category": "primary",
+      "description": "YOLOv11 object detection with Object365 training",
+      "service_type": "spatial",
+      "enable_triggers": true,
+      "enable_consensus_triggers": true
+    },
+    "yolo_oi7": {
+      "host": "localhost",
+      "port": 7791,
+      "endpoint": "/v3/analyze",
+      "queue_prefix": "queue_",
+      "category": "primary",
+      "description": "YOLOv8 object detection with Open Images v7 training",
+      "service_type": "spatial",
+      "enable_triggers": true,
+      "enable_consensus_triggers": true
+    },
     "caption_score": {
       "host": "localhost",
       "port": 7778,
