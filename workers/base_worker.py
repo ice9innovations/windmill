@@ -10,6 +10,7 @@ import time
 import logging
 import socket
 import base64
+import io
 import pika
 import psycopg2
 import requests
@@ -121,11 +122,11 @@ class BaseWorker:
         # Decode base64 to bytes for posting
         image_bytes = base64.b64decode(image_data_b64)
         
-        # POST raw image bytes
+        # POST as multipart file upload
+        files = {'file': ('image.jpg', io.BytesIO(image_bytes), 'image/jpeg')}
         response = requests.post(
             service_url,
-            data=image_bytes,
-            headers={'Content-Type': 'application/octet-stream'},
+            files=files,
             timeout=self.request_timeout
         )
         response.raise_for_status()

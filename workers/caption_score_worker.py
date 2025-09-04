@@ -229,15 +229,15 @@ class CaptionScoreWorker:
     def score_caption_against_image(self, image_path, caption):
         """Score a caption against an image using CLIP"""
         try:
-            # Call CLIP score endpoint
-            params = {
+            # Call CLIP score endpoint using POST with JSON
+            data = {
                 'file': image_path,
                 'caption': caption
             }
             
-            response = requests.get(
+            response = requests.post(
                 self.clip_score_url,
-                params=params,
+                json=data,
                 timeout=self.request_timeout
             )
             
