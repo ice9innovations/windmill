@@ -128,12 +128,12 @@ class GenericProducer:
         
         return created_queues
     
-    def get_images_from_database(self, limit=None, image_group=None):
-        """Get images from database, optionally filtered by group"""
+    def get_images_from_database(self, limit=None, image_group=None, resume=False):
+        """Get image cursor from database, optionally filtered by group and resuming from last processed"""
         try:
             cursor = self.db_conn.cursor()
             
-            # Build query with optional group filter
+            # Build query with optional group filter and resume functionality
             base_query = """
                 SELECT image_id, image_filename, image_path, image_url 
                 FROM images 
@@ -146,6 +146,27 @@ class GenericProducer:
                 conditions.append("image_group = %s")
                 params.append(image_group)
             
+            # Resume functionality: skip images that already have results
+            if resume:
+                # Find the highest image_id that already has results
+                resume_cursor = self.db_conn.cursor()
+                resume_query = "SELECT MAX(image_id) FROM results"
+                if image_group:
+                    resume_query += " WHERE image_id IN (SELECT image_id FROM images WHERE image_group = %s)"
+                    resume_cursor.execute(resume_query, (image_group,))
+                else:
+                    resume_cursor.execute(resume_query)
+                
+                max_processed_id = resume_cursor.fetchone()[0]
+                resume_cursor.close()
+                
+                if max_processed_id:
+                    conditions.append("image_id > %s")
+                    params.append(max_processed_id)
+                    print(f"🔄 Resuming from image_id > {max_processed_id} (last processed)")
+                else:
+                    print(f"🔄 No previous results found, starting from beginning")
+            
             if conditions:
                 base_query += "WHERE " + " AND ".join(conditions) + " "
             
@@ -157,40 +178,41 @@ class GenericProducer:
             
             cursor.execute(base_query, params)
             
-            images = []
-            for row in cursor.fetchall():
-                image_data = {
-                    "image_id": row[0],
-                    "image_filename": row[1],
-                    "image_path": row[2],
-                    "image_url": row[3],
-                    "submitted_at": datetime.now().isoformat()
-                }
-                
-                # Read and encode image file
-                image_path = row[2] if row[2] else None
-                if image_path and os.path.exists(image_path):
-                    try:
-                        with open(image_path, 'rb') as f:
-                            image_bytes = f.read()
-                            image_data["image_data"] = base64.b64encode(image_bytes).decode('utf-8')
-                        print(f"📷 Encoded image: {row[1]} ({len(image_bytes)} bytes)")
-                    except Exception as e:
-                        print(f"⚠️  Failed to read image {image_path}: {e}")
-                        continue
-                else:
-                    print(f"⚠️  Image path not found: {image_path}")
-                    continue
-                
-                images.append(image_data)
-            
+            # Return count and cursor for streaming
+            row_count = cursor.rowcount if cursor.rowcount > 0 else "unknown"
             group_info = f" from group '{image_group}'" if image_group else ""
-            print(f"📋 Retrieved {len(images)} images{group_info} from database")
-            return images
+            resume_info = " (resuming)" if resume else ""
+            print(f"📋 Found {row_count} images{group_info}{resume_info} in database")
+            return cursor
             
         except Exception as e:
             print(f"❌ Database error: {e}")
-            return []
+            return None
+    
+    def process_image_row(self, row):
+        """Process a single database row into image data"""
+        image_data = {
+            "image_id": row[0],
+            "image_filename": row[1],
+            "image_path": row[2],
+            "image_url": row[3],
+            "submitted_at": datetime.now().isoformat()
+        }
+        
+        # Read and encode image file
+        image_path = row[2] if row[2] else None
+        if image_path and os.path.exists(image_path):
+            try:
+                with open(image_path, 'rb') as f:
+                    image_bytes = f.read()
+                    image_data["image_data"] = base64.b64encode(image_bytes).decode('utf-8')
+                return image_data
+            except Exception as e:
+                print(f"⚠️  Failed to read image {image_path}: {e}")
+                return None
+        else:
+            print(f"⚠️  Image path not found: {image_path}")
+            return None
     
     def submit_job(self, queue_name, image_data):
         """Submit a single job to a queue"""
@@ -211,28 +233,41 @@ class GenericProducer:
             print(f"❌ Error submitting to {queue_name}: {e}")
             return False
     
-    def submit_jobs(self, service_names, images, delay=0.01):
-        """Submit jobs for multiple services and images"""
-        total_jobs = len(service_names) * len(images)
+    def submit_jobs(self, service_names, cursor, delay=0.01):
+        """Submit jobs for multiple services and images using streaming cursor"""
         submitted_jobs = 0
+        processed_images = 0
         
-        print(f"📤 Submitting {total_jobs} jobs ({len(images)} images × {len(service_names)} services)")
+        print(f"📤 Starting streaming job submission ({len(service_names)} services)")
         
-        # Submit jobs for each image to each service
-        for image in images:
+        # Stream through images one at a time
+        for row in cursor:
+            # Process single image into memory
+            image_data = self.process_image_row(row)
+            if not image_data:
+                print(f"⚠️  Skipping image {row[0]} - failed to process")
+                continue
+                
+            processed_images += 1
+            jobs_this_image = 0
+            
+            # Submit jobs for this image to all services
             for service_name in service_names:
                 try:
                     queue_name = self.config.get_queue_name(service_name)
                     
                     # Add service-specific metadata to job
-                    job_data = image.copy()
+                    job_data = image_data.copy()
                     job_data['service_name'] = service_name
                     job_data['queue_name'] = queue_name
                     
                     if self.submit_job(queue_name, job_data):
                         submitted_jobs += 1
+                        jobs_this_image += 1
                         if submitted_jobs % 100 == 0:
-                            print(f"📤 Submitted {submitted_jobs}/{total_jobs} jobs...")
+                            print(f"📤 Submitted {submitted_jobs} jobs (processed {processed_images} images, avg {submitted_jobs/processed_images:.1f} jobs/image)...")
+                    else:
+                        print(f"❌ Failed to submit job for image {image_data['image_id']} to service {service_name}")
                     
                     # Small delay to prevent overwhelming the queue
                     if delay > 0:
@@ -241,8 +276,15 @@ class GenericProducer:
                 except ValueError as e:
                     print(f"❌ Skipping {service_name}: {e}")
                     continue
+            
+            # Debug if jobs per image isn't exactly the number of services
+            if jobs_this_image != len(service_names):
+                print(f"⚠️  Image {image_data['image_id']}: submitted {jobs_this_image}/{len(service_names)} jobs")
+            
+            # Clear image data from memory after processing
+            image_data = None
         
-        print(f"✅ Submitted {submitted_jobs}/{total_jobs} jobs successfully")
+        print(f"✅ Submitted {submitted_jobs} jobs from {processed_images} images successfully")
         return submitted_jobs
     
     def close_connections(self):
@@ -275,6 +317,10 @@ def main():
     
     parser.add_argument('--group', '-g',
                        help='Process only images from specific group (e.g., coco2017)')
+    
+    parser.add_argument('--resume', '-r',
+                       action='store_true',
+                       help='Resume from the last processed image (skip images that already have results)')
     
     args = parser.parse_args()
     
@@ -342,14 +388,14 @@ def main():
             print("❌ No queues could be created")
             return 1
         
-        # Get images
-        images = producer.get_images_from_database(args.limit, args.group)
-        if not images:
+        # Get images cursor for streaming
+        cursor = producer.get_images_from_database(args.limit, args.group, args.resume)
+        if not cursor:
             print("❌ No images found in database")
             return 1
         
-        # Submit jobs
-        submitted = producer.submit_jobs(service_names, images, args.delay)
+        # Submit jobs using streaming
+        submitted = producer.submit_jobs(service_names, cursor, args.delay)
         
         print(f"🎉 Processing complete! {submitted} jobs submitted.")
         
