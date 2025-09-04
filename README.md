@@ -8,7 +8,7 @@ A complete distributed processing system. This system transforms Animal Farm fro
 
 This system delivers the complete vision of distributed ML processing with three key innovations:
 
-1. **Complete Service Coverage**: All services (BLIP, CLIP, Colors, Detectron2, Face, Xception, Metadata, OCR, NSFW2, Ollama, Pose, RT-DETR, YOLOv8, Caption Scoring) 
+1. **Complete Service Coverage**: All services (BLIP, CLIP, Colors, Detectron2, Face, Xception, Metadata, OCR, NSFW2, Ollama, Pose, RT-DETR, YOLOv8, YOLO_365, YOLO_OI7, Caption Scoring) 
 2. **Progressive Harmonization**: Immediate results after ANY service completes, with automatic re-harmonization as more services finish
 3. **Distributed Spatial Processing**: Specialized postprocessing workers for bbox-level face detection, pose estimation, and color analysis
 
@@ -35,27 +35,28 @@ This approach is **fault-tolerant** (works if services fail) and **performance-o
 
 #### Service-Specific ML Workers
 - **Dedicated workers** for each service (blip_worker.py, clip_worker.py, colors_worker.py, etc.)
-- **Base worker class** (`base_worker.py`) provides shared functionality
-- **Service-specific logic** handles unique requirements per ML service
+- **BaseWorker inheritance** (`base_worker.py`) provides shared database, queue, and HTTP functionality
+- **Service-specific classes** extend BaseWorker with minimal service-specific logic
 
 #### Bounding Box Merger (`bbox_merger_worker.py`) 
 - **Purpose**: Harmonize bbox results from yolov8, rtdetr, detectron2
-- **Trigger**: Runs after ANY bbox service completes (timestamp-based detection)
-- **Algorithm**: Cross-service IoU clustering with democratic filtering
+- **Trigger**: Queue-based processing via `queue_bbox_merge`
+- **Algorithm**: Cross-service IoU clustering with democratic filtering  
 - **Output**: Harmonized bounding boxes stored in `merged_boxes` table
+- **Dispatch**: Crops bounding boxes and dispatches to postprocessing queues
 
 #### Consensus Worker (`consensus_worker.py`)
 - **Purpose**: Calculate voting consensus using V3 voting algorithm
-- **Trigger**: Runs after any successful service completion
-- **Algorithm**: Democratic voting with evidence weighting
+- **Trigger**: Queue-based processing via `queue_consensus`
+- **Algorithm**: Democratic voting with evidence weighting from spatial and semantic services
 - **Output**: Consensus results stored in `consensus` table
 
-#### Postprocessing Workers (Distributed Spatial Analysis)
-- **Bbox Colors Worker** (`bbox_colors_worker.py`): Color analysis on ALL cropped bounding boxes
-- **Bbox Face Worker** (`bbox_face_worker.py`): Face detection on person bounding boxes only  
-- **Bbox Pose Worker** (`bbox_pose_worker.py`): Pose estimation on person bounding boxes only
-- **Method**: bbox_merger_worker crops regions and dispatches to specialized queues
-- **Innovation**: Parallel spatial processing instead of sequential bottleneck
+#### Postprocessing Workers (Queue-Based Spatial Analysis)
+- **Bbox Colors Worker** (`bbox_colors_worker.py`): Processes `queue_bbox_colors` for cropped bounding box color analysis
+- **Bbox Face Worker** (`bbox_face_worker.py`): Processes `queue_bbox_face` for person bounding boxes only  
+- **Bbox Pose Worker** (`bbox_pose_worker.py`): Processes `queue_bbox_pose` for person bounding boxes only
+- **Architecture**: Pure queue-based workers consuming from dedicated postprocessing queues
+- **Processing**: POST cropped images to existing ML services (colors:7770, face:7772, pose:7786)
 - **Output**: Results stored in `postprocessing` table with service-specific naming
 
 ### 3. Database Schema
@@ -120,13 +121,28 @@ Maps service names to ports, endpoints, and categorization:
 - **`spatial_only`**: Bbox-region services (face/pose), handled by postprocessing workers
 - **`postprocessing`**: Caption scoring and other post-ML analysis services
 
-### Worker Configuration (`.env` files)
-Each worker loads configuration from `.env`:
-```bash
-# Which service to run
-SERVICE_NAME=yolov8
+### Worker Configuration
+Workers load configuration from `service_config.json` for service definitions and `.env` files for credentials:
 
-# Infrastructure  
+**Service Configuration (`service_config.json`):**
+```json
+{
+  "services": {
+    "yolov8": {
+      "host": "localhost", 
+      "port": 7773,
+      "endpoint": "/v3/analyze",
+      "category": "primary",
+      "service_type": "spatial",
+      "enable_triggers": true
+    }
+  }
+}
+```
+
+**Infrastructure Configuration (`.env`):**
+```bash
+# Infrastructure endpoints
 QUEUE_HOST=192.168.0.122
 DB_HOST=192.168.0.121
 
@@ -135,10 +151,6 @@ QUEUE_USER=animal_farm
 QUEUE_PASSWORD=your_secure_queue_password
 DB_USER=animal_farm_user
 DB_PASSWORD=your_secure_db_password
-
-# Worker settings
-WORKER_ID=worker_yolov8_box1
-LOG_LEVEL=INFO
 ```
 
 ## Usage
@@ -194,7 +206,7 @@ python producer.py --list-services
 ```
 
 **Available Workers (Dynamically Detected):**
-- **ML Service Workers**: blip, clip, colors, detectron2, xception, metadata, nsfw2, ocr, ollama, rtdetr, yolov8
+- **ML Service Workers**: blip, clip, colors, detectron2, xception, metadata, nsfw2, ocr, ollama, rtdetr, yolov8, yolo_365, yolo_oi7
 - **Processing Workers**: bbox_merger (harmonization), consensus (voting), caption_score
 - **Postprocessing Workers**: bbox_colors, bbox_face, bbox_pose (spatial analysis)
 
@@ -243,26 +255,26 @@ SELECT COUNT(*) as total_enrichments FROM postprocessing;
 1. Images → Primary Service Queues → Distributed ML Workers
     ↓        ↓         ↓            ↓            ↓
   BLIP   CLIP   Colors  Detectron2  Xception  Metadata  
-  OCR    NSFW2  Ollama  RT-DETR     YOLOv8    Caption_Score
+  OCR    NSFW2  Ollama  RT-DETR     YOLOv8    YOLO_365  YOLO_OI7
                      ↓
 2. All Primary Results → PostgreSQL results table
                      ↓  
-3. Bbox Services → bbox_merger_worker → merged_boxes table
+3. Bbox Services → queue_bbox_merge → bbox_merger_worker → merged_boxes table
                      ↓ (Crops bboxes and dispatches to postprocessing queues)
-4. ALL Services → consensus_worker → consensus table (V3 Voting Algorithm)
+4. ALL Services → queue_consensus → consensus_worker → consensus table (V3 Voting Algorithm)
                      ↓
-5. Cropped Bboxes → Distributed Postprocessing Workers:
-   • All boxes → bbox_colors_worker → Colors Service (port 7770) → postprocessing table  
-   • Person boxes → bbox_face_worker → Face Service (port 7772) → postprocessing table
-   • Person boxes → bbox_pose_worker → Pose Service (port 7786) → postprocessing table
+5. Cropped Bboxes → Distributed Postprocessing Queues → Postprocessing Workers:
+   • queue_bbox_colors → bbox_colors_worker → Colors Service (port 7770) → postprocessing table  
+   • queue_bbox_face → bbox_face_worker → Face Service (port 7772) → postprocessing table
+   • queue_bbox_pose → bbox_pose_worker → Pose Service (port 7786) → postprocessing table
 ```
 
 **Complete Pipeline Example:**
-- T+0s: Colors, CLIP complete → Consensus worker runs V3 voting on 2 services
-- T+3s: YOLOv8 completes → Bbox merger harmonizes YOLOv8 alone, crops boxes, dispatches to postprocessing queues
-- T+5s: RT-DETR, BLIP complete → Bbox merger re-harmonizes YOLOv8+RT-DETR, dispatches new boxes
-- T+8s: All primary services complete → Final bbox harmonization, final consensus across all services
-- T+10s: Postprocessing workers process cropped regions in parallel → Face/pose/color analysis
+- T+0s: Colors, CLIP complete → queue_consensus → Consensus worker runs V3 voting on 2 services
+- T+3s: YOLOv8 completes → queue_bbox_merge → Bbox merger harmonizes YOLOv8 alone, dispatches to postprocessing queues
+- T+5s: RT-DETR, BLIP complete → queue_bbox_merge → Bbox merger re-harmonizes YOLOv8+RT-DETR
+- T+8s: All primary services complete → Final bbox harmonization and consensus across all services
+- T+10s: Postprocessing queues → Workers process cropped regions in parallel → Face/pose/color analysis
 
 ## Performance Characteristics
 
