@@ -45,7 +45,7 @@ stop_all() {
     
     # Stop each worker individually - now they can all be targeted precisely!
     for worker in $(get_all_workers); do
-        if pkill -f "python workers/${worker}_worker.py" 2>/dev/null; then
+        if pkill -f "workers/${worker}_worker.py" 2>/dev/null; then
             echo "  ✅ Stopped $worker"
         fi
     done
@@ -68,8 +68,8 @@ status_all() {
     
     # Check all workers - unified clean approach
     for worker in $(get_all_workers); do
-        if pgrep -f "python workers/${worker}_worker.py" >/dev/null 2>&1; then
-            local pid=$(pgrep -f "python workers/${worker}_worker.py")
+        if pgrep -f "workers/${worker}_worker.py" >/dev/null 2>&1; then
+            local pid=$(pgrep -f "workers/${worker}_worker.py")
             echo -e "${GREEN}✅ $worker${NC} (PID: $pid)"
         else
             echo -e "${RED}❌ $worker${NC} (not running)"
@@ -79,7 +79,7 @@ status_all() {
 
 stop_worker() {
     local worker="$1"
-    if pkill -f "python workers/${worker}_worker.py" 2>/dev/null; then
+    if pkill -f "workers/${worker}_worker.py" 2>/dev/null; then
         echo "✅ Stopped $worker"
         return 0
     else
