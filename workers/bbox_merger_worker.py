@@ -397,6 +397,7 @@ class BoundingBoxMergerWorker:
     def harmonize_bounding_boxes(self, bbox_results):
         """Harmonize bounding boxes using BoundingBoxService logic"""
         if not bbox_results:
+            self.logger.debug("No bbox_results provided")
             return None
         
         # Convert database results to service format
@@ -407,11 +408,13 @@ class BoundingBoxMergerWorker:
             source_result_ids.append(result_id)
             
             if not isinstance(data, dict) or 'predictions' not in data:
+                self.logger.debug(f"Skipping {service} - invalid data format")
                 continue
             
             predictions = data['predictions']
             for prediction in predictions:
                 if not prediction.get('bbox'):
+                    self.logger.debug(f"Skipping {service} prediction - no bbox")
                     continue
                 
                 # Extract detection with harmonized format
@@ -424,12 +427,18 @@ class BoundingBoxMergerWorker:
                     'type': prediction.get('type', 'object_detection')
                 }
                 all_detections.append(detection)
+                self.logger.debug(f"Added detection: {service} {detection['emoji']} {detection['label']}")
         
         if not all_detections:
+            self.logger.debug("No valid detections found after processing")
             return None
+        
+        self.logger.debug(f"Processing {len(all_detections)} detections from {len(bbox_results)} services")
         
         # Apply BoundingBoxService harmonization logic
         grouped_objects = self.group_by_label_with_cross_service_clustering(all_detections)
+        
+        self.logger.debug(f"Grouped into {len(grouped_objects)} object groups")
         
         # Package harmonized results
         harmonized_data = {
@@ -556,7 +565,7 @@ class BoundingBoxMergerWorker:
         return clusters
     
     def clean_cluster(self, cluster):
-        """Remove same-service duplicates and filter weak single detections"""
+        """Remove same-service duplicates"""
         if not cluster:
             return None
         
@@ -576,10 +585,6 @@ class BoundingBoxMergerWorker:
                 cleaned.append(best)
             else:
                 cleaned.append(detections[0])
-        
-        # Filter single weak detections
-        if len(cleaned) == 1 and cleaned[0]['confidence'] < 0.85:
-            return None
         
         return cleaned
     
