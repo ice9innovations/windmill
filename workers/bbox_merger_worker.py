@@ -13,6 +13,7 @@ import io
 import psycopg2
 import pika
 import re
+import requests
 from datetime import datetime
 from dotenv import load_dotenv
 from PIL import Image
@@ -260,8 +261,15 @@ class BoundingBoxMergerWorker:
         """Crop bbox region from image and return as base64 encoded bytes"""
         try:
             
-            # Load image
-            with Image.open(image_path) as img:
+            # Load image - handle both URLs and file paths
+            if image_path.startswith(('http://', 'https://')):
+                response = requests.get(image_path, timeout=30)
+                response.raise_for_status()
+                img = Image.open(io.BytesIO(response.content))
+            else:
+                img = Image.open(image_path)
+            
+            with img:
                 # Extract bbox coordinates
                 x = bbox['x']
                 y = bbox['y'] 
@@ -532,37 +540,44 @@ class BoundingBoxMergerWorker:
         return instances
     
     def find_cross_service_clusters(self, detections):
-        """Find clusters using IoU overlap with proper transitive clustering"""
-        clusters = []
-        used = set()
+        """Find clusters using IoU overlap with proper transitive clustering via Union-Find"""
+        if not detections:
+            return []
         
-        for i, detection in enumerate(detections):
-            if i in used:
-                continue
-            
-            cluster = [detection]
-            used.add(i)
-            
-            # Find overlapping detections (check against ANY cluster member)
-            for j in range(i + 1, len(detections)):
-                if j in used:
-                    continue
-                
-                # Check if detections[j] overlaps with ANY detection in current cluster
-                overlaps_with_cluster = False
-                for cluster_member in cluster:
-                    overlap = self.calculate_overlap_ratio(cluster_member['bbox'], detections[j]['bbox'])
-                    if overlap > 0.3:  # 30% overlap threshold
-                        overlaps_with_cluster = True
-                        break
-                
-                if overlaps_with_cluster:
-                    cluster.append(detections[j])
-                    used.add(j)
-            
-            clusters.append(cluster)
+        n = len(detections)
+        parent = list(range(n))  # Union-Find parent array
         
-        return clusters
+        def find(x):
+            if parent[x] != x:
+                parent[x] = find(parent[x])  # Path compression
+            return parent[x]
+        
+        def union(x, y):
+            px, py = find(x), find(y)
+            if px != py:
+                parent[px] = py
+                self.logger.debug(f"Clustering: Union {detections[x]['service']} {detections[x]['emoji']} with {detections[y]['service']} {detections[y]['emoji']}")
+        
+        # Build overlap graph using Union-Find
+        unions_made = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Hybrid approach: IoU for similar sizes, containment for different sizes
+                should_merge = self.should_merge_boxes(detections[i]['bbox'], detections[j]['bbox'])
+                if should_merge:
+                    union(i, j)
+                    unions_made += 1
+        
+        # Group detections by their root parent
+        cluster_map = {}
+        for i in range(n):
+            root = find(i)
+            if root not in cluster_map:
+                cluster_map[root] = []
+            cluster_map[root].append(detections[i])
+        
+        self.logger.debug(f"Clustering: {n} detections → {len(cluster_map)} clusters ({unions_made} unions made)")
+        return list(cluster_map.values())
     
     def clean_cluster(self, cluster):
         """Remove same-service duplicates"""
@@ -588,8 +603,38 @@ class BoundingBoxMergerWorker:
         
         return cleaned
     
+    def should_merge_boxes(self, box1, box2):
+        """Hybrid approach: IoU for similar sizes, containment for different scales"""
+        # Calculate basic metrics
+        area1 = box1['width'] * box1['height']
+        area2 = box2['width'] * box2['height']
+        
+        # Calculate intersection
+        x1 = max(box1['x'], box2['x'])
+        y1 = max(box1['y'], box2['y'])
+        x2 = min(box1['x'] + box1['width'], box2['x'] + box2['width'])
+        y2 = min(box1['y'] + box1['height'], box2['y'] + box2['height'])
+        
+        if x1 >= x2 or y1 >= y2:
+            return False  # No intersection
+        
+        intersection = (x2 - x1) * (y2 - y1)
+        
+        # Containment check: if one box is mostly contained within the other
+        containment_threshold = 0.8  # 80% containment
+        smaller_area = min(area1, area2)
+        containment_ratio = intersection / smaller_area
+        
+        if containment_ratio >= containment_threshold:
+            return True  # One box is mostly contained in the other
+        
+        # Fall back to standard IoU for similar-sized boxes
+        union = area1 + area2 - intersection
+        iou = intersection / union if union > 0 else 0
+        return iou > 0.3  # 30% IoU threshold
+    
     def calculate_overlap_ratio(self, box1, box2):
-        """Calculate IoU overlap ratio"""
+        """Calculate IoU overlap ratio (kept for backward compatibility)"""
         x1 = max(box1['x'], box2['x'])
         y1 = max(box1['y'], box2['y'])
         x2 = min(box1['x'] + box1['width'], box2['x'] + box2['width'])
@@ -712,8 +757,14 @@ class BoundingBoxMergerWorker:
                     try:
                         self.dispatch_bbox_postprocessing(image_id, image_filename, merged_data)
                     except Exception as e:
-                        self.logger.warning(f"Failed to dispatch postprocessing for {image_filename}: {e}")
-                        # Don't fail the whole operation if postprocessing dispatch fails
+                        self.logger.error(f"Failed to dispatch postprocessing for {image_filename}: {e}")
+                        # Rollback transaction and fail - postprocessing dispatch is critical
+                        try:
+                            if self.db_conn:
+                                self.db_conn.rollback()
+                        except:
+                            pass
+                        return {'success': False, 'merged_boxes_created': False}
                 
                 if attempt > 0:
                     self.logger.info(f"Successfully processed {image_filename} after {attempt + 1} attempts")
