@@ -916,8 +916,6 @@ class ConsensusWorker:
                 self.db_conn.close()
             if self.read_db_conn:
                 self.read_db_conn.close()
-            if self.mysql_conn:
-                self.mysql_conn.close()
             self.logger.info("Consensus worker stopped")
         
         return 0

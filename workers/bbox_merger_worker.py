@@ -768,7 +768,6 @@ class BoundingBoxMergerWorker:
     
     def cleanup_connections(self):
         """Clean up all connections"""
-        pass  # No connections to clean up
         
         if self.db_conn:
             self.db_conn.close()
