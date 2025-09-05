@@ -12,9 +12,18 @@ import base64
 import io
 import psycopg2
 import pika
+import re
 from datetime import datetime
 from dotenv import load_dotenv
 from PIL import Image
+
+def normalize_emoji(emoji):
+    """Remove variation selectors and other invisible modifiers from emoji"""
+    if not emoji:
+        return emoji
+    # Remove variation selectors (U+FE00-U+FE0F), Mongolian selectors (U+180B-U+180D),
+    # and zero-width joiner (U+200D) for consistent grouping
+    return re.sub(r'[\uFE00-\uFE0F\u180B-\u180D\u200D]', '', emoji)
 
 class BoundingBoxMergerWorker:
     """Continuous bounding box harmonization worker"""
@@ -438,9 +447,10 @@ class BoundingBoxMergerWorker:
         """Simplified version of BoundingBoxService clustering logic"""
         groups = {}
         
-        # Step 1: Group by label/emoji
+        # Step 1: Group by emoji (the canonical identifier)
         for detection in detections:
-            key = detection['type'] if detection['type'] == 'face_detection' else detection['emoji']
+            # Normalize emoji by removing all variation selectors  
+            key = normalize_emoji(detection['emoji'])
             if key not in groups:
                 groups[key] = {
                     'label': detection['label'],

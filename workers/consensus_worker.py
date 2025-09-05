@@ -10,8 +10,17 @@ import logging
 import socket
 import psycopg2
 import pika
+import re
 from datetime import datetime
 from dotenv import load_dotenv
+
+def normalize_emoji(emoji):
+    """Remove variation selectors and other invisible modifiers from emoji"""
+    if not emoji:
+        return emoji
+    # Remove variation selectors (U+FE00-U+FE0F), Mongolian selectors (U+180B-U+180D),
+    # and zero-width joiner (U+200D) for consistent grouping
+    return re.sub(r'[\uFE00-\uFE0F\u180B-\u180D\u200D]', '', emoji)
 
 class ConsensusWorker:
     """Continuous consensus/voting worker"""
@@ -464,7 +473,7 @@ class ConsensusWorker:
         groups = {}
         
         for detection in all_detections:
-            emoji = detection['emoji']
+            emoji = normalize_emoji(detection['emoji'])
             if emoji not in groups:
                 groups[emoji] = []
             groups[emoji].append(detection)
