@@ -523,7 +523,7 @@ class BoundingBoxMergerWorker:
         return instances
     
     def find_cross_service_clusters(self, detections):
-        """Find clusters using IoU overlap"""
+        """Find clusters using IoU overlap with proper transitive clustering"""
         clusters = []
         used = set()
         
@@ -534,13 +534,20 @@ class BoundingBoxMergerWorker:
             cluster = [detection]
             used.add(i)
             
-            # Find overlapping detections
+            # Find overlapping detections (check against ANY cluster member)
             for j in range(i + 1, len(detections)):
                 if j in used:
                     continue
                 
-                overlap = self.calculate_overlap_ratio(detection['bbox'], detections[j]['bbox'])
-                if overlap > 0.3:  # 30% overlap threshold
+                # Check if detections[j] overlaps with ANY detection in current cluster
+                overlaps_with_cluster = False
+                for cluster_member in cluster:
+                    overlap = self.calculate_overlap_ratio(cluster_member['bbox'], detections[j]['bbox'])
+                    if overlap > 0.3:  # 30% overlap threshold
+                        overlaps_with_cluster = True
+                        break
+                
+                if overlaps_with_cluster:
                     cluster.append(detections[j])
                     used.add(j)
             
