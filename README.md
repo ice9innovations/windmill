@@ -8,7 +8,7 @@ A complete distributed processing system. This system transforms Animal Farm fro
 
 This system delivers the complete vision of distributed ML processing with three key innovations:
 
-1. **Complete Service Coverage**: All services (BLIP, CLIP, Colors, Detectron2, Face, Xception, Metadata, OCR, NSFW2, Ollama, Pose, RT-DETR, YOLOv8, YOLO_365, YOLO_OI7, Caption Scoring) 
+1. **Complete Service Coverage**: 15 ML services (BLIP, CLIP, Colors, Detectron2, Face, Xception, Metadata, OCR, NSFW2, Ollama, Pose, RT-DETR, YOLOv8, YOLO_365, YOLO_OI7) plus Caption Scoring postprocessing
 2. **Progressive Harmonization**: Immediate results after ANY service completes, with automatic re-harmonization as more services finish
 3. **Distributed Spatial Processing**: Specialized postprocessing workers for bbox-level face detection, pose estimation, and color analysis
 
@@ -61,28 +61,14 @@ This approach is **fault-tolerant** (works if services fail) and **performance-o
 
 ### 3. Database Schema
 
-```sql
--- Core ML service results
-results(image_id, service, data, status, processing_time, result_created, worker_id)
+**Complete schema documentation:** See `database_schema.sql` for detailed table definitions, indexes, and foreign key relationships.
 
--- Harmonized bounding boxes (DELETE+INSERT pattern)
-merged_boxes(image_id, source_result_ids, merged_data, status, created, worker_id) 
-
--- Voting consensus (DELETE+INSERT pattern)  
-consensus(image_id, consensus_data, processing_time, consensus_created, worker_id)
-
--- Spatial analysis results (INSERT-only pattern)
-postprocessing(image_id, merged_box_id, service, data, status, result_created, worker_id)
-
--- Source images
-images(image_id, image_filename, image_path, image_url, image_created)
-```
-
-**Database Setup:**
-```bash
-# Create database and tables
-psql -h $DB_HOST -U $DB_USER -d $DB_NAME -f schema.sql
-```
+**Key Tables:**
+- `results` - Core ML service results (INSERT-only pattern)
+- `merged_boxes` - Harmonized bounding boxes (DELETE+INSERT pattern) 
+- `consensus` - Voting consensus results (DELETE+INSERT pattern)
+- `postprocessing` - Spatial analysis results (INSERT-only pattern)
+- `images` - Source images with URLs/paths for recovery operations
 
 **Key Design Decisions:**
 - **DELETE+INSERT** for merged_boxes/consensus (clean JOINs, atomic re-harmonization)
@@ -182,27 +168,24 @@ python producer.py --list-services
 ### 2. Worker Management
 ```bash
 # Start all workers
-./workers.sh start
+./windmill.sh start
 
 # Start specific workers  
-./workers.sh start bbox_merger
-./workers.sh start blip
-./workers.sh start consensus
+./windmill.sh start bbox_merger
+./windmill.sh start blip
+./windmill.sh start consensus
 
 # Stop all workers
-./workers.sh stop
+./windmill.sh stop
 
 # Stop specific worker
-./workers.sh stop ollama
+./windmill.sh stop ollama
 
-# Restart all workers (useful after code changes)
-./workers.sh restart
-
-# Restart specific worker
-./workers.sh restart blip
+# Reset all workers (stop and start)
+./windmill.sh reset
 
 # Check worker status
-./workers.sh status
+./windmill.sh status
 ```
 
 **Available Workers (Dynamically Detected):**
@@ -210,7 +193,7 @@ python producer.py --list-services
 - **Processing Workers**: bbox_merger (harmonization), consensus (voting), caption_score
 - **Postprocessing Workers**: bbox_colors, bbox_face, bbox_pose (spatial analysis)
 
-**Note**: The `workers.sh` script automatically detects all available worker files and can start/stop/restart individual workers or all workers. ML service workers will only start successfully if the corresponding services are running on their configured ports.
+**Note**: The `windmill.sh` script automatically detects all available worker files and can start/stop/reset individual workers or all workers. ML service workers will only start successfully if the corresponding services are running on their configured ports.
 
 ### 3. Monitor Progress
 ```sql
@@ -288,9 +271,9 @@ SELECT COUNT(*) as total_enrichments FROM postprocessing;
 ### Single Machine Development
 ```bash
 # Terminal 1: Start ML services (blip:7777, clip:7788, yolov8:7773, face:7772, etc.)
-# Terminal 2: ./workers.sh start bbox_merger consensus
-# Terminal 3: ./workers.sh start blip clip colors yolov8
-# Terminal 4: ./workers.sh start bbox_colors bbox_face bbox_pose
+# Terminal 2: ./windmill.sh start bbox_merger consensus
+# Terminal 3: ./windmill.sh start blip clip colors yolov8
+# Terminal 4: ./windmill.sh start bbox_colors bbox_face bbox_pose
 ```
 
 ### Pi Cluster Production
