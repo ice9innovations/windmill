@@ -139,6 +139,7 @@ class BaseWorker:
                 consensus_message = {
                     'image_id': image_id,
                     'image_filename': f'image_{image_id}',
+                    'image_data': message['image_data'],  # Pass through base64 image data
                     'service': self.service_name,
                     'worker_id': self.worker_id,
                     'processed_at': datetime.now().isoformat()
@@ -163,6 +164,7 @@ class BaseWorker:
                 caption_score_message = {
                     'image_id': image_id,
                     'image_filename': f'image_{image_id}',
+                    'image_data': message['image_data'],  # Pass through base64 image data
                     'service': self.service_name,
                     'worker_id': self.worker_id,
                     'processed_at': datetime.now().isoformat()
@@ -244,6 +246,7 @@ class BaseWorker:
                 bbox_message = {
                     'image_id': image_id,
                     'image_filename': message.get('image_filename', f'image_{image_id}'),
+                    'image_data': message['image_data'],  # Pass through base64 image data
                     'service': self.service_name,
                     'worker_id': self.worker_id,
                     'processed_at': datetime.now().isoformat()

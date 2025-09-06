@@ -226,18 +226,23 @@ class CaptionScoreWorker:
             self.logger.error(f"Error getting caption from {service_name} for image {image_id}: {e}")
             return None
 
-    def score_caption_against_image(self, image_path, caption):
+    def score_caption_against_image(self, image_data, caption):
         """Score a caption against an image using CLIP"""
         try:
-            # Call CLIP score endpoint using POST with JSON
-            data = {
-                'file': image_path,
-                'caption': caption
-            }
+            import base64
+            import io
+            
+            # Decode base64 image data to bytes
+            image_bytes = base64.b64decode(image_data)
+            
+            # Call CLIP score endpoint using multipart file upload + form data
+            files = {'file': ('image.jpg', io.BytesIO(image_bytes), 'image/jpeg')}
+            data = {'caption': caption}
             
             response = requests.post(
                 self.clip_score_url,
-                json=data,
+                files=files,
+                data=data,
                 timeout=self.request_timeout
             )
             
@@ -325,21 +330,15 @@ class CaptionScoreWorker:
             image_id = message_data['image_id']
             service_name = message_data['service']
             image_filename = message_data.get('image_filename', f'image_{image_id}')
+            image_data = message_data.get('image_data')  # Base64 encoded image data
             
             self.logger.info(f"Processing caption scoring for {service_name}: {image_filename}")
             
-            # Get image path
-            cursor = self.read_db_conn.cursor()
-            cursor.execute("SELECT image_path FROM images WHERE image_id = %s", (image_id,))
-            result = cursor.fetchone()
-            cursor.close()
-            
-            if not result:
-                self.logger.error(f"Image not found: {image_id}")
+            # Validate image data is present
+            if not image_data:
+                self.logger.error(f"No image_data in message for image {image_id}")
                 ch.basic_ack(delivery_tag=method.delivery_tag)
                 return
-            
-            image_path = result[0]
             
             # Get caption from the specific service that triggered this
             caption_data = self.get_service_caption(image_id, service_name)
@@ -353,7 +352,7 @@ class CaptionScoreWorker:
             caption = caption_data['caption']
             service = caption_data['service']
             
-            similarity_score = self.score_caption_against_image(image_path, caption)
+            similarity_score = self.score_caption_against_image(image_data, caption)
             
             if similarity_score is not None:
                 caption_score = {

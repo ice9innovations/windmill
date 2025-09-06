@@ -194,20 +194,9 @@ class BoundingBoxMergerWorker:
     
     # Removed publish_to_downstream - using new dispatch_bbox_postprocessing instead
     
-    def dispatch_bbox_postprocessing(self, image_id, image_filename, merged_data):
+    def dispatch_bbox_postprocessing(self, image_id, image_filename, merged_data, image_data):
         """Dispatch bbox postprocessing jobs for each merged box"""
         try:
-            # Get image path from database (use main connection to stay in transaction)
-            cursor = self.db_conn.cursor()
-            cursor.execute("SELECT image_path FROM images WHERE image_id = %s", (image_id,))
-            result = cursor.fetchone()
-            cursor.close()
-            
-            if not result:
-                self.logger.warning(f"No image path found for image_id {image_id}")
-                return
-                
-            image_path = result[0]
             
             # Process each merged box
             for group_key, group_data in merged_data['grouped_objects'].items():
@@ -232,7 +221,7 @@ class BoundingBoxMergerWorker:
                     merged_box_id = box_result[0]
                     
                     # Crop the bounding box
-                    cropped_image_data = self.crop_bbox_from_image(image_path, merged_bbox)
+                    cropped_image_data = self.crop_bbox_from_data(image_data, merged_bbox)
                     if not cropped_image_data:
                         continue
                     
@@ -257,17 +246,12 @@ class BoundingBoxMergerWorker:
             self.logger.error(f"Error in dispatch_bbox_postprocessing: {e}")
             raise
     
-    def crop_bbox_from_image(self, image_path, bbox):
-        """Crop bbox region from image and return as base64 encoded bytes"""
+    def crop_bbox_from_data(self, image_data, bbox):
+        """Crop bbox region from image data and return as base64 encoded bytes"""
         try:
-            
-            # Load image - handle both URLs and file paths
-            if image_path.startswith(('http://', 'https://')):
-                response = requests.get(image_path, timeout=30)
-                response.raise_for_status()
-                img = Image.open(io.BytesIO(response.content))
-            else:
-                img = Image.open(image_path)
+            # Decode base64 image data
+            image_bytes = base64.b64decode(image_data)
+            img = Image.open(io.BytesIO(image_bytes))
             
             with img:
                 # Extract bbox coordinates
@@ -288,7 +272,7 @@ class BoundingBoxMergerWorker:
                 return base64.b64encode(img_buffer.getvalue())
                 
         except Exception as e:
-            self.logger.error(f"Failed to crop bbox from {image_path}: {e}")
+            self.logger.error(f"Failed to crop bbox from image data: {e}")
             return None
     
     def is_person_box(self, instance):
@@ -327,9 +311,10 @@ class BoundingBoxMergerWorker:
             # Extract image info
             image_id = message['image_id']
             image_filename = message.get('image_filename', f'image_{image_id}')
+            image_data = message.get('image_data')  # Base64 encoded image data
             
             # Process the bbox merge for this image
-            result = self.update_merged_boxes_for_image(image_id, image_filename)
+            result = self.update_merged_boxes_for_image(image_id, image_filename, image_data)
             
             if result['success']:
                 
@@ -650,7 +635,7 @@ class BoundingBoxMergerWorker:
         
         return intersection / union if union > 0 else 0
     
-    def update_merged_boxes_for_image(self, image_id, image_filename):
+    def update_merged_boxes_for_image(self, image_id, image_filename, image_data=None):
         """Update merged boxes for a single image using safe DELETE+INSERT pattern"""
         max_retries = 2
         
@@ -753,9 +738,9 @@ class BoundingBoxMergerWorker:
                     self.logger.info(f"Harmonized boxes for {image_filename} ({detection_count} detections → {merged_box_count} merged boxes from {services})")
                 
                 # Dispatch bbox postprocessing jobs for each merged box
-                if merged_box_count > 0:
+                if merged_box_count > 0 and image_data:
                     try:
-                        self.dispatch_bbox_postprocessing(image_id, image_filename, merged_data)
+                        self.dispatch_bbox_postprocessing(image_id, image_filename, merged_data, image_data)
                     except Exception as e:
                         self.logger.error(f"Failed to dispatch postprocessing for {image_filename}: {e}")
                         # Rollback transaction and fail - postprocessing dispatch is critical
