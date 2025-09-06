@@ -132,13 +132,13 @@ class BaseWorker:
         response.raise_for_status()
         return response.json()
     
-    def trigger_consensus(self, image_id):
+    def trigger_consensus(self, image_id, message):
         """Trigger consensus processing"""
         if self.enable_consensus_triggers:
             try:
                 consensus_message = {
                     'image_id': image_id,
-                    'image_filename': f'image_{image_id}',
+                    'image_filename': message.get('image_filename', f'image_{image_id}'),
                     'image_data': message['image_data'],  # Pass through base64 image data
                     'service': self.service_name,
                     'worker_id': self.worker_id,
@@ -157,13 +157,13 @@ class BaseWorker:
             except Exception as e:
                 self.logger.error(f"Failed to publish consensus message: {e}")
     
-    def trigger_caption_scoring(self, image_id):
+    def trigger_caption_scoring(self, image_id, message):
         """Trigger caption scoring for caption generation services"""
         if self.enable_triggers and self.enable_caption_scoring:
             try:
                 caption_score_message = {
                     'image_id': image_id,
-                    'image_filename': f'image_{image_id}',
+                    'image_filename': message.get('image_filename', f'image_{image_id}'),
                     'image_data': message['image_data'],  # Pass through base64 image data
                     'service': self.service_name,
                     'worker_id': self.worker_id,
@@ -263,10 +263,10 @@ class BaseWorker:
             
             # Trigger caption scoring
             if self.enable_caption_scoring:
-                self.trigger_caption_scoring(image_id)
+                self.trigger_caption_scoring(image_id, message)
             
             # Trigger consensus processing
-            self.trigger_consensus(image_id)
+            self.trigger_consensus(image_id, message)
 
             # Acknowledge message
             ch.basic_ack(delivery_tag=method.delivery_tag)
