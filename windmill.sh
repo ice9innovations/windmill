@@ -1,6 +1,6 @@
 #!/bin/bash
 # Simple, reliable worker management (no wrapper scripts)
-# Usage: ./workers.sh {start|stop|restart|status}
+# Usage: ./windmill.sh {start|stop|restart|status}
 
 ACTION="$1"
 
@@ -105,7 +105,7 @@ start_worker() {
 case "$ACTION" in
     start)
         if [ -n "$2" ]; then
-            # Start individual worker: ./workers.sh start blip
+            # Start individual worker: ./windmill.sh start blip
             echo "🚀 Starting $2..."
             mkdir -p logs
             start_worker "$2"
@@ -116,7 +116,7 @@ case "$ACTION" in
         ;;
     stop)
         if [ -n "$2" ]; then
-            # Stop individual worker: ./workers.sh stop blip
+            # Stop individual worker: ./windmill.sh stop blip
             echo "🛑 Stopping $2..."
             stop_worker "$2"
         else
@@ -126,7 +126,7 @@ case "$ACTION" in
         ;;
     restart)
         if [ -n "$2" ]; then
-            # Restart individual worker: ./workers.sh restart ollama
+            # Restart individual worker: ./windmill.sh restart ollama
             echo "🔄 Restarting $2..."
             stop_worker "$2"
             sleep 1
