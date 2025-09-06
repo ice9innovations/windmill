@@ -26,6 +26,13 @@ def normalize_emoji(emoji):
     # and zero-width joiner (U+200D) for consistent grouping
     return re.sub(r'[\uFE00-\uFE0F\u180B-\u180D\u200D]', '', emoji)
 
+def normalize_person_emoji(emoji):
+    """Group person emojis together using 'person' as the canonical grouping key"""
+    normalized = normalize_emoji(emoji)
+    if normalized in ['🧑', '👩']:
+        return 'person'  # Group all person types under neutral 'person' key
+    return normalized
+
 class BoundingBoxMergerWorker:
     """Continuous bounding box harmonization worker"""
     
@@ -451,8 +458,8 @@ class BoundingBoxMergerWorker:
         
         # Step 1: Group by emoji (the canonical identifier)
         for detection in detections:
-            # Normalize emoji by removing all variation selectors  
-            key = normalize_emoji(detection['emoji'])
+            # Normalize emoji and treat 🧑/👩 as the same group
+            key = normalize_person_emoji(detection['emoji'])
             if key not in groups:
                 groups[key] = {
                     'label': detection['label'],
