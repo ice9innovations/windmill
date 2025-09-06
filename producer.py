@@ -208,8 +208,6 @@ class GenericProducer:
         image_data = {
             "image_id": row[0],
             "image_filename": row[1],
-            "image_path": row[2],
-            "image_url": row[3],
             "submitted_at": datetime.now().isoformat()
         }
         
@@ -344,9 +342,9 @@ def main():
     parser.add_argument('--group', '-g',
                        help='Process only images from specific group (e.g., coco2017)')
     
-    parser.add_argument('--resume', '-r',
+    parser.add_argument('--no-resume', 
                        action='store_true',
-                       help='Resume from the last processed image (skip images that already have results)')
+                       help='Process all images including those with existing results (dangerous - can create duplicates)')
     
     parser.add_argument('--image-ids-file',
                        help='File containing image IDs to reprocess (one per line)')
@@ -406,8 +404,9 @@ def main():
             print("❌ No queues could be created")
             return 1
         
-        # Get images cursor for streaming
-        cursor = producer.get_images_from_database(args.limit, args.group, args.resume, args.image_ids_file)
+        # Get images cursor for streaming (resume by default, unless --no-resume specified)
+        resume = not args.no_resume  
+        cursor = producer.get_images_from_database(args.limit, args.group, resume, args.image_ids_file)
         if not cursor:
             print("❌ No images found in database")
             return 1
