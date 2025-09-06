@@ -129,8 +129,8 @@ class GenericProducer:
         
         return created_queues
     
-    def get_images_from_database(self, limit=None, image_group=None, resume=False):
-        """Get image cursor from database, optionally filtered by group and resuming from last processed"""
+    def get_images_from_database(self, limit=None, image_group=None, resume=False, image_ids_file=None):
+        """Get image cursor from database, optionally filtered by group, resuming, or specific image IDs"""
         try:
             cursor = self.db_conn.cursor()
             
@@ -143,7 +143,20 @@ class GenericProducer:
             conditions = []
             params = []
             
-            if image_group:
+            # Handle specific image IDs from file
+            if image_ids_file:
+                with open(image_ids_file, 'r') as f:
+                    image_ids = [int(line.strip()) for line in f if line.strip().isdigit()]
+                if image_ids:
+                    placeholders = ','.join(['%s'] * len(image_ids))
+                    conditions.append(f"image_id IN ({placeholders})")
+                    params.extend(image_ids)
+                    print(f"📋 Processing {len(image_ids)} specific image IDs from {image_ids_file}")
+                else:
+                    print(f"❌ No valid image IDs found in {image_ids_file}")
+                    return None
+            
+            elif image_group:
                 conditions.append("image_group = %s")
                 params.append(image_group)
             
@@ -212,8 +225,6 @@ class GenericProducer:
                 response.raise_for_status()
                 image_bytes = response.content
                 image_data["image_data"] = base64.b64encode(image_bytes).decode('utf-8')
-                print(f"✅ Successfully loaded image_data ({len(image_bytes)} bytes)")
-                print(f"🔍 Image data keys: {list(image_data.keys())}")
                 return image_data
             except Exception as e:
                 print(f"⚠️  Failed to fetch image from URL {image_url}: {e}")
@@ -337,6 +348,9 @@ def main():
                        action='store_true',
                        help='Resume from the last processed image (skip images that already have results)')
     
+    parser.add_argument('--image-ids-file',
+                       help='File containing image IDs to reprocess (one per line)')
+    
     args = parser.parse_args()
     
     try:
@@ -393,7 +407,7 @@ def main():
             return 1
         
         # Get images cursor for streaming
-        cursor = producer.get_images_from_database(args.limit, args.group, args.resume)
+        cursor = producer.get_images_from_database(args.limit, args.group, args.resume, args.image_ids_file)
         if not cursor:
             print("❌ No images found in database")
             return 1
