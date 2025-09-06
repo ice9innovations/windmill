@@ -11,6 +11,7 @@ import pika
 import psycopg2
 import argparse
 import base64
+import requests
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -199,8 +200,26 @@ class GenericProducer:
             "submitted_at": datetime.now().isoformat()
         }
         
-        # Read and encode image file
+        # Try URL first (deployment-agnostic), fallback to local path
+        image_url = row[3] if row[3] else None
         image_path = row[2] if row[2] else None
+        
+        # Prefer URL for deployment-agnostic access
+        if image_url:
+            try:
+                print(f"🔗 Fetching image from URL: {image_url}")
+                response = requests.get(image_url, timeout=10)
+                response.raise_for_status()
+                image_bytes = response.content
+                image_data["image_data"] = base64.b64encode(image_bytes).decode('utf-8')
+                print(f"✅ Successfully loaded image_data ({len(image_bytes)} bytes)")
+                print(f"🔍 Image data keys: {list(image_data.keys())}")
+                return image_data
+            except Exception as e:
+                print(f"⚠️  Failed to fetch image from URL {image_url}: {e}")
+                # Fall through to try local path
+        
+        # Fallback to local file path
         if image_path and os.path.exists(image_path):
             try:
                 with open(image_path, 'rb') as f:
@@ -210,9 +229,9 @@ class GenericProducer:
             except Exception as e:
                 print(f"⚠️  Failed to read image {image_path}: {e}")
                 return None
-        else:
-            print(f"⚠️  Image path not found: {image_path}")
-            return None
+        
+        print(f"⚠️  No valid image source found - URL: {image_url}, Path: {image_path}")
+        return None
     
     def submit_job(self, queue_name, image_data):
         """Submit a single job to a queue"""
@@ -298,10 +317,6 @@ def main():
     """Main entry point with command line interface"""
     parser = argparse.ArgumentParser(description='Submit jobs to ML service queues')
     
-    parser.add_argument('--services', '-s', 
-                       help='Services to use: all, primary, spatial_only, full_catalog, or comma-separated list (default: all)', 
-                       default='all')
-    
     parser.add_argument('--limit', '-l', 
                        type=int, 
                        help='Limit number of images to process')
@@ -366,19 +381,8 @@ def main():
         if not producer.connect_to_database():
             return 1
         
-        # Determine services to use
-        if args.services == 'all':
-            # 'all' now means primary services only (excludes face/pose)
-            service_names = producer.config.get_primary_services()
-        elif args.services == 'primary':
-            service_names = producer.config.get_primary_services()
-        elif args.services == 'spatial_only':
-            service_names = producer.config.get_services_by_category('spatial_only')
-        elif args.services == 'full_catalog':
-            # Full catalog includes ALL services (including face/pose)
-            service_names = producer.config.get_available_services()
-        else:
-            service_names = [s.strip() for s in args.services.split(',')]
+        # Use all primary services only
+        service_names = producer.config.get_primary_services()
         
         print(f"🎯 Target services: {', '.join(service_names)}")
         
