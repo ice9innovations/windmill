@@ -412,6 +412,9 @@ class BoundingBoxMergerWorker:
                 continue
             
             predictions = data['predictions']
+            if not predictions:
+                self.logger.debug(f"Skipping {service} - empty predictions array")
+                continue
             for prediction in predictions:
                 if not prediction.get('bbox'):
                     self.logger.debug(f"Skipping {service} prediction - no bbox")
@@ -430,7 +433,7 @@ class BoundingBoxMergerWorker:
                 self.logger.debug(f"Added detection: {service} {detection['emoji']} {detection['label']}")
         
         if not all_detections:
-            self.logger.debug("No valid detections found after processing")
+            self.logger.info(f"No valid detections found after processing {len(bbox_results)} bbox results")
             return None
         
         self.logger.debug(f"Processing {len(all_detections)} detections from {len(bbox_results)} services")
@@ -438,9 +441,13 @@ class BoundingBoxMergerWorker:
         # Apply BoundingBoxService harmonization logic
         grouped_objects = self.group_by_label_with_cross_service_clustering(all_detections)
         
-        self.logger.debug(f"Grouped into {len(grouped_objects)} object groups")
+        self.logger.info(f"Grouped {len(all_detections)} detections into {len(grouped_objects)} object groups")
         
-        # Package harmonized results
+        # Package harmonized results  
+        if not grouped_objects:
+            self.logger.info("No valid object groups created - all detections filtered out")
+            return None
+            
         harmonized_data = {
             'all_detections': all_detections,
             'grouped_objects': grouped_objects,
@@ -660,8 +667,10 @@ class BoundingBoxMergerWorker:
                 # Get bbox results
                 bbox_results = self.get_bbox_results_for_image(image_id)
                 if not bbox_results:
-                    self.logger.debug(f"No bbox results for image {image_id}, skipping")
+                    self.logger.info(f"No bbox results found for image {image_id}, skipping")
                     return {'success': True, 'merged_boxes_created': False}  # Not an error - just no data to process
+                else:
+                    self.logger.info(f"Found {len(bbox_results)} bbox results for image {image_id}")
                 
                 # Harmonize bounding boxes
                 start_time = time.time()
@@ -675,18 +684,7 @@ class BoundingBoxMergerWorker:
                 # Safe atomic DELETE + INSERT with foreign key handling
                 cursor = self.db_conn.cursor()
                 
-                # Step 0: Check for active postprocessing references
-                cursor.execute("""
-                    SELECT COUNT(*) FROM postprocessing 
-                    WHERE merged_box_id IN (
-                        SELECT merged_id FROM merged_boxes WHERE image_id = %s
-                    )
-                """, (image_id,))
-                active_refs = cursor.fetchone()[0]
-                
-                if active_refs > 0:
-                    self.logger.debug(f"Skipping reharmonization for image {image_id} - {active_refs} active postprocessing references")
-                    return {'success': True, 'merged_boxes_created': False}  # Skip, don't fail
+                # Progressive harmonization: always reharmonize with latest bbox results
                 
                 # Step 1: Clear postprocessing references to avoid FK constraint violation
                 cursor.execute("""
