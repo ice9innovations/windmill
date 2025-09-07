@@ -1,0 +1,104 @@
+-- Production Database Schema
+
+                                             Table "public.images"
+     Column     |            Type             | Collation | Nullable |                 Default                  
+----------------+-----------------------------+-----------+----------+------------------------------------------
+ image_id       | bigint                      |           | not null | nextval('images_image_id_seq'::regclass)
+ image_filename | character varying(255)      |           |          | 
+ image_path     | text                        |           |          | 
+ image_url      | text                        |           |          | 
+ image_group    | character varying(255)      |           |          | 
+ image_created  | timestamp without time zone |           |          | now()
+Indexes:
+    "images_pkey" PRIMARY KEY, btree (image_id)
+    "idx_images_group" btree (image_group)
+Referenced by:
+    TABLE "consensus" CONSTRAINT "consensus_image_id_fkey" FOREIGN KEY (image_id) REFERENCES images(image_id)
+    TABLE "merged_boxes" CONSTRAINT "merged_boxes_image_id_fkey" FOREIGN KEY (image_id) REFERENCES images(image_id)
+    TABLE "postprocessing" CONSTRAINT "postprocessing_image_id_fkey" FOREIGN KEY (image_id) REFERENCES images(image_id)
+    TABLE "results" CONSTRAINT "results_image_id_fkey" FOREIGN KEY (image_id) REFERENCES images(image_id)
+
+
+                                              Table "public.results"
+     Column      |            Type             | Collation | Nullable |                  Default                   
+-----------------+-----------------------------+-----------+----------+--------------------------------------------
+ result_id       | bigint                      |           | not null | nextval('results_result_id_seq'::regclass)
+ image_id        | bigint                      |           | not null | 
+ service         | character varying(255)      |           | not null | 
+ data            | jsonb                       |           | not null | 
+ worker_id       | character varying(50)       |           |          | 
+ worker_hostname | character varying(100)      |           |          | 
+ status          | character varying(20)       |           | not null | 
+ error_message   | text                        |           |          | 
+ retry_count     | integer                     |           |          | 0
+ result_created  | timestamp without time zone |           |          | now()
+ processing_time | double precision            |           |          | 
+Indexes:
+    "results_pkey" PRIMARY KEY, btree (result_id)
+    "idx_results_created" btree (result_created)
+    "idx_results_image_service" btree (image_id, service)
+    "idx_results_status" btree (status)
+    "idx_results_worker" btree (worker_id)
+Foreign-key constraints:
+    "results_image_id_fkey" FOREIGN KEY (image_id) REFERENCES images(image_id)
+
+
+                                               Table "public.merged_boxes"
+      Column       |            Type             | Collation | Nullable |                     Default                     
+-------------------+-----------------------------+-----------+----------+-------------------------------------------------
+ merged_id         | bigint                      |           | not null | nextval('merged_boxes_merged_id_seq'::regclass)
+ image_id          | bigint                      |           | not null | 
+ source_result_ids | bigint[]                    |           | not null | 
+ merged_data       | jsonb                       |           | not null | 
+ worker_id         | character varying(50)       |           |          | 
+ status            | character varying(20)       |           | not null | 
+ created           | timestamp without time zone |           |          | now()
+Indexes:
+    "merged_boxes_pkey" PRIMARY KEY, btree (merged_id)
+    "idx_merged_boxes_image" btree (image_id)
+    "idx_merged_boxes_status" btree (status)
+    "idx_merged_boxes_worker" btree (worker_id)
+Foreign-key constraints:
+    "merged_boxes_image_id_fkey" FOREIGN KEY (image_id) REFERENCES images(image_id)
+Referenced by:
+    TABLE "postprocessing" CONSTRAINT "postprocessing_merged_box_id_fkey" FOREIGN KEY (merged_box_id) REFERENCES merged_boxes(merged_id)
+
+
+                                                 Table "public.consensus"
+      Column       |            Type             | Collation | Nullable |                     Default                     
+-------------------+-----------------------------+-----------+----------+-------------------------------------------------
+ consensus_id      | bigint                      |           | not null | nextval('consensus_consensus_id_seq'::regclass)
+ image_id          | bigint                      |           |          | 
+ consensus_data    | jsonb                       |           | not null | 
+ consensus_created | timestamp without time zone |           |          | now()
+ processing_time   | double precision            |           |          | 
+Indexes:
+    "consensus_pkey" PRIMARY KEY, btree (consensus_id)
+    "idx_consensus_created" btree (consensus_created)
+    "idx_consensus_image_created" btree (image_id, consensus_created DESC)
+Foreign-key constraints:
+    "consensus_image_id_fkey" FOREIGN KEY (image_id) REFERENCES images(image_id)
+
+
+                                             Table "public.postprocessing"
+     Column      |            Type             | Collation | Nullable |                     Default                     
+-----------------+-----------------------------+-----------+----------+-------------------------------------------------
+ post_id         | bigint                      |           | not null | nextval('postprocessing_post_id_seq'::regclass)
+ image_id        | bigint                      |           | not null | 
+ merged_box_id   | bigint                      |           |          | 
+ service         | character varying(255)      |           | not null | 
+ data            | jsonb                       |           | not null | 
+ status          | character varying(20)       |           | not null | 
+ error_message   | text                        |           |          | 
+ retry_count     | integer                     |           |          | 0
+ result_created  | timestamp without time zone |           |          | now()
+ processing_time | double precision            |           |          | 
+Indexes:
+    "postprocessing_pkey" PRIMARY KEY, btree (post_id)
+    "idx_postprocessing_image" btree (image_id)
+    "idx_postprocessing_merged_box" btree (merged_box_id)
+    "idx_postprocessing_status" btree (status)
+Foreign-key constraints:
+    "postprocessing_image_id_fkey" FOREIGN KEY (image_id) REFERENCES images(image_id)
+    "postprocessing_merged_box_id_fkey" FOREIGN KEY (merged_box_id) REFERENCES merged_boxes(merged_id)
+
