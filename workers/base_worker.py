@@ -96,6 +96,13 @@ class BaseWorker:
             # For services not in config (like consensus, bbox_merge), use service name
             return service_name
     
+    def _get_queue_by_service_type(self, service_type):
+        """Find service by service_type and return its queue name"""
+        for service_name, config in self.service_definitions.items():
+            if config.get('service_type') == service_type:
+                return config.get('queue_name', service_name)
+        raise ValueError(f"No service found with service_type: {service_type}")
+    
     def setup_logging(self):
         """Setup logging for this worker"""
         self.logger = logging.getLogger(self.service_name)
@@ -155,7 +162,7 @@ class BaseWorker:
                 
                 self.channel.basic_publish(
                     exchange='',
-                    routing_key=self._get_queue_name('consensus'),
+                    routing_key=self._get_queue_by_service_type('consensus'),
                     body=json.dumps(consensus_message),
                     properties=pika.BasicProperties(delivery_mode=2)
                 )
@@ -180,7 +187,7 @@ class BaseWorker:
                 
                 self.channel.basic_publish(
                     exchange='',
-                    routing_key=self._get_queue_name('caption_score'),
+                    routing_key=self._get_queue_by_service_type('caption_score'),
                     body=json.dumps(caption_score_message),
                     properties=pika.BasicProperties(delivery_mode=2)
                 )
@@ -218,8 +225,8 @@ class BaseWorker:
             # Declare queues
             self.channel.queue_declare(queue=self.queue_name, durable=True)
             if self.enable_triggers:
-                self.channel.queue_declare(queue=self._get_queue_name('bbox_merge'), durable=True)
-                self.channel.queue_declare(queue=self._get_queue_name('consensus'), durable=True)
+                self.channel.queue_declare(queue=self._get_queue_by_service_type('harmonization'), durable=True)
+                self.channel.queue_declare(queue=self._get_queue_by_service_type('consensus'), durable=True)
             
             self.channel.basic_qos(prefetch_count=self.worker_prefetch_count)
             self.logger.info(f"Connected to RabbitMQ at {self.queue_host}")
@@ -262,12 +269,13 @@ class BaseWorker:
                 
                 self.channel.basic_publish(
                     exchange='',
-                    routing_key=self._get_queue_name('bbox_merge'),
+                    routing_key=self._get_queue_by_service_type('harmonization'),
                     body=json.dumps(bbox_message),
                     properties=pika.BasicProperties(delivery_mode=2)
                 )
                 
-                self.logger.debug(f"Published bbox completion to queue_bbox_merge")
+                harmonization_queue = self._get_queue_by_service_type('harmonization')
+                self.logger.debug(f"Published bbox completion to {harmonization_queue}")
             
             # Trigger caption scoring
             if self.enable_caption_scoring:

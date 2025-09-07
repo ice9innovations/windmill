@@ -181,7 +181,7 @@
     },
     "postprocessing_merge": {
       "category": "infrastructure",
-      "service_type": "bbox_harmonization",
+      "service_type": "harmonization",
       "queue_name": "postprocessing_merge"
     },
     "postprocessing_colors": {
