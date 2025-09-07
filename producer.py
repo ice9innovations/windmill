@@ -14,6 +14,8 @@ import base64
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
+from PIL import Image
+import io
 
 class ProducerConfig:
     """Load producer configuration"""
@@ -22,9 +24,10 @@ class ProducerConfig:
         # Load .env file (optional for producer)
         load_dotenv(env_file)
         
-        # Load service definitions
-        with open('service_config.json', 'r') as f:
-            self.service_definitions = json.load(f)['services']
+        # Load service configuration using new YAML loader
+        sys.path.append('workers')
+        from service_config import get_service_config
+        self.config = get_service_config()
         
         # Queue configuration
         self.queue_host = self._get_required('QUEUE_HOST')
@@ -46,24 +49,22 @@ class ProducerConfig:
     
     def get_available_services(self):
         """Get list of available service names"""
-        return list(self.service_definitions.keys())
+        primary_services = list(self.config.get_services_by_category('primary').keys())
+        return [name.split('.', 1)[1] for name in primary_services]  # Remove 'primary.' prefix for CLI
     
     def get_services_by_category(self, category):
-        """Get services that belong to a specific category (handles comma-separated categories)"""
-        return [
-            service_name for service_name, service_config in self.service_definitions.items()
-            if category in [cat.strip() for cat in service_config.get('category', '').split(',')]
-        ]
+        """Get services that belong to a specific category"""
+        services = self.config.get_services_by_category(category)
+        return [name.split('.', 1)[1] for name in services.keys()]  # Remove category prefix for CLI
     
     def get_primary_services(self):
-        """Get services that run on whole images (excludes postprocessing-only services which are handled by postprocessing workers)"""
+        """Get services that run on whole images (excludes postprocessing-only services)"""
         return self.get_services_by_category('primary')
     
     def get_queue_name(self, service_name):
-        """Get queue name for a service"""
-        if service_name not in self.service_definitions:
-            raise ValueError(f"Unknown service: {service_name}")
-        return self.service_definitions[service_name].get('queue_name', service_name)
+        """Get queue name for a service (expects service_name without category prefix)"""
+        full_service_name = f'primary.{service_name}'
+        return self.config.get_queue_name(full_service_name)
 
 class GenericProducer:
     """Generic producer for submitting jobs to ML service queues"""
@@ -74,6 +75,15 @@ class GenericProducer:
         self.channel = None
         self.db_conn = None
         print(f"🚀 Generic Queue Producer initialized")
+    
+    def extract_image_dimensions(self, image_bytes):
+        """Extract width and height from image bytes using PIL"""
+        try:
+            image = Image.open(io.BytesIO(image_bytes))
+            return image.width, image.height
+        except Exception as e:
+            print(f"⚠️  Failed to extract image dimensions: {e}")
+            return -1, -1
     
     def connect_to_rabbitmq(self):
         """Connect to RabbitMQ"""
@@ -221,7 +231,12 @@ class GenericProducer:
                 response = requests.get(image_url, timeout=10)
                 response.raise_for_status()
                 image_bytes = response.content
+                
+                # Extract dimensions and add image data
+                width, height = self.extract_image_dimensions(image_bytes)
                 image_data["image_data"] = base64.b64encode(image_bytes).decode('utf-8')
+                image_data["image_width"] = width
+                image_data["image_height"] = height
                 return image_data
             except Exception as e:
                 print(f"⚠️  Failed to fetch image from URL {image_url}: {e}")
@@ -232,7 +247,12 @@ class GenericProducer:
             try:
                 with open(image_path, 'rb') as f:
                     image_bytes = f.read()
+                    
+                    # Extract dimensions and add image data
+                    width, height = self.extract_image_dimensions(image_bytes)
                     image_data["image_data"] = base64.b64encode(image_bytes).decode('utf-8')
+                    image_data["image_width"] = width
+                    image_data["image_height"] = height
                 return image_data
             except Exception as e:
                 print(f"⚠️  Failed to read image {image_path}: {e}")
@@ -362,9 +382,10 @@ def main():
             primary_services = producer.config.get_primary_services()
             print("📋 PRIMARY (whole image processing):")
             for service in sorted(primary_services):
-                desc = producer.config.service_definitions[service]['description']
-                port = producer.config.service_definitions[service]['port']
-                print(f"  {service:12} (port {port}): {desc}")
+                full_service_name = f'primary.{service}'
+                service_config = producer.config.config.get_service_config(full_service_name)
+                port = service_config.get('port', 'N/A')
+                print(f"  {service:12} (port {port})")
             
             print()
             
@@ -372,9 +393,10 @@ def main():
             postprocessing_services = producer.config.get_services_by_category('postprocessing')
             print("🔍 POSTPROCESSING (bbox region processing via postprocessing workers):")
             for service in sorted(postprocessing_services):
-                desc = producer.config.service_definitions[service]['description']
-                port = producer.config.service_definitions[service]['port']
-                print(f"  {service:12} (port {port}): {desc}")
+                full_service_name = f'postprocessing.{service}'
+                service_config = producer.config.config.get_service_config(full_service_name)
+                port = service_config.get('port', 'N/A')
+                print(f"  {service:12} (port {port})")
             
             print()
             print("Service sets:")
