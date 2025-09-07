@@ -1,10 +1,10 @@
 {
   "services": {
     "blip": {
+      "queue_name": "blip",
       "host": "localhost",
       "port": 7777,
       "endpoint": "/v3/analyze",
-      "queue_prefix": "queue_",
       "category": "primary",
       "description": "Image captioning with emoji mapping",
       "service_type": "semantic",
@@ -13,10 +13,10 @@
       "enable_consensus_triggers": true
     },
     "clip": {
+      "queue_name": "clip",
       "host": "localhost",
       "port": 7788,
       "endpoint": "/v3/analyze",
-      "queue_prefix": "queue_",
       "category": "primary",
       "description": "Two stage image classification with confidence scoring",
       "service_type": "spatial,classification",
@@ -24,21 +24,21 @@
       "enable_consensus_triggers": true
     },
     "colors": {
+      "queue_name": "colors",
       "host": "localhost",
       "port": 7770,
       "endpoint": "/v3/analyze", 
-      "queue_prefix": "queue_",
-      "category": "primary",
+      "category": "primary,postprocessing",
       "description": "Copic/Prismacolor color analysis",
       "service_type": "other",
       "enable_triggers": true,
       "enable_consensus_triggers": false
     },
     "detectron2": {
+      "queue_name": "detectron",
       "host": "localhost",
       "port": 7771,
       "endpoint": "/v3/analyze",
-      "queue_prefix": "queue_",
       "category": "primary",
       "description": "Object detection with bounding boxes",
       "service_type": "spatial",
@@ -46,20 +46,20 @@
       "enable_consensus_triggers": true
     },
     "face": {
+      "queue_name": "postprocessing_face",
       "host": "localhost",
       "port": 7772,
       "endpoint": "/v3/analyze",
-      "queue_prefix": "queue_",
-      "category": "spatial_only",
+      "category": "postprocessing",
       "description": "Face detection",
       "service_type": "specialized",
       "enable_consensus_triggers": true
     },
     "xception": {
+      "queue_name": "xception",
       "host": "localhost",
       "port": 7799,
       "endpoint": "/v3/analyze",
-      "queue_prefix": "queue_",
       "category": "primary",
       "description": "Xception two stage ImageNet classification",
       "service_type": "spatial,classification",
@@ -67,20 +67,20 @@
       "enable_consensus_triggers": true
     },
     "metadata": {
+      "queue_name": "metadata",
       "host": "localhost",
       "port": 7781,
       "endpoint": "/v3/analyze",
-      "queue_prefix": "queue_",
       "category": "primary",
       "description": "EXIF/technical metadata extraction",
       "service_type": "other",
       "enable_consensus_triggers": false
     },
     "ocr": {
+      "queue_name": "ocr",
       "host": "localhost",
       "port": 7775,
       "endpoint": "/v3/analyze",
-      "queue_prefix": "queue_",
       "category": "primary",
       "description": "Text extraction with PaddleOCR",
       "service_type": "specialized",
@@ -88,10 +88,10 @@
       "enable_consensus_triggers": true
     },
     "nsfw2": {
+      "queue_name": "nsfw",
       "host": "localhost",
       "port": 7774,
       "endpoint": "/v3/analyze",
-      "queue_prefix": "queue_",
       "category": "primary",
       "description": "Content moderation",
       "service_type": "specialized",
@@ -99,10 +99,10 @@
       "enable_consensus_triggers": true
     },
     "ollama": {
+      "queue_name": "ollama",
       "host": "localhost",
       "port": 7782,
       "endpoint": "/v3/analyze",
-      "queue_prefix": "queue_",
       "category": "primary",
       "description": "LLM vision analysis",
       "service_type": "semantic",
@@ -111,20 +111,20 @@
       "enable_consensus_triggers": true
     },
     "pose": {
+      "queue_name": "postprocessing_pose",
       "host": "localhost",
       "port": 7786,
       "endpoint": "/v3/analyze",
-      "queue_prefix": "queue_",
-      "category": "spatial_only",
+      "category": "postprocessing",
       "description": "Pose Estimation",
       "service_type": "specialized",
       "enable_consensus_triggers": false
     },
     "rtdetr": {
+      "queue_name": "rtdetr",
       "host": "localhost",
       "port": 7780,
       "endpoint": "/v3/analyze",
-      "queue_prefix": "queue_",
       "category": "primary",
       "description": "Transformer-based object detection",
       "service_type": "spatial",
@@ -132,10 +132,10 @@
       "enable_consensus_triggers": true
     },
     "yolov8": {
+      "queue_name": "yolov8",
       "host": "localhost",
       "port": 7773,
       "endpoint": "/v3/analyze",
-      "queue_prefix": "queue_",
       "category": "primary",
       "description": "Real-time object detection",
       "service_type": "spatial",
@@ -143,10 +143,10 @@
       "enable_consensus_triggers": true
     },
     "yolo_365": {
+      "queue_name": "yolo_365",
       "host": "localhost",
       "port": 7790,
       "endpoint": "/v3/analyze",
-      "queue_prefix": "queue_",
       "category": "primary",
       "description": "YOLOv11 object detection with Object365 training",
       "service_type": "spatial",
@@ -154,10 +154,10 @@
       "enable_consensus_triggers": true
     },
     "yolo_oi7": {
+      "queue_name": "yolo_oi7",
       "host": "localhost",
       "port": 7791,
       "endpoint": "/v3/analyze",
-      "queue_prefix": "queue_",
       "category": "primary",
       "description": "YOLOv8 object detection with Open Images v7 training",
       "service_type": "spatial",
@@ -165,14 +165,29 @@
       "enable_consensus_triggers": true
     },
     "caption_score": {
+      "queue_name": "caption_score",
       "host": "localhost",
       "port": 7778,
       "endpoint": "/score",
-      "queue_prefix": "queue_",
       "category": "postprocessing",
       "description": "Caption similarity scoring using CLIP",
-      "service_type": "other",
+      "service_type": "caption_score",
       "enable_consensus_triggers": false
+    },
+    "postprocessing_consensus": {
+      "category": "infrastructure",
+      "service_type": "consensus",
+      "queue_name": "postprocessing_consensus"
+    },
+    "postprocessing_merge": {
+      "category": "infrastructure",
+      "service_type": "bbox_harmonization",
+      "queue_name": "postprocessing_merge"
+    },
+    "postprocessing_colors": {
+      "category": "infrastructure",
+      "service_type": "postprocessing",
+      "queue_name": "postprocessing_colors"
     }
   }
 }
