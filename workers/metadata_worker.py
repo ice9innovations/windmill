@@ -12,7 +12,7 @@ class MetadataWorker(BaseWorker):
     """Worker for metadata ML service"""
     
     def __init__(self):
-        super().__init__('metadata')
+        super().__init__('primary.metadata')
 
 if __name__ == "__main__":
     worker = MetadataWorker()

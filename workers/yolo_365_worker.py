@@ -12,7 +12,7 @@ class Yolo_365Worker(BaseWorker):
     """Worker for YOLOv11 Object365 detection service"""
     
     def __init__(self):
-        super().__init__('yolo_365')
+        super().__init__('primary.yolo_365')
 
 if __name__ == "__main__":
     worker = Yolo_365Worker()

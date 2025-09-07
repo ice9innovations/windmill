@@ -12,7 +12,7 @@ class ClipWorker(BaseWorker):
     """Worker for CLIP image classification service"""
     
     def __init__(self):
-        super().__init__('clip')
+        super().__init__('primary.clip')
 
 if __name__ == "__main__":
     worker = ClipWorker()

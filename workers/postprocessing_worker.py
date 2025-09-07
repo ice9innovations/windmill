@@ -17,30 +17,48 @@ from base_worker import BaseWorker
 class PostProcessingWorker(BaseWorker):
     """Base class for postprocessing workers that handle cropped images"""
     
-    def __init__(self, service_name, service_url, service_port=None):
+    def __init__(self, service_name):
         super().__init__(service_name)
         
-        # Override queue name for postprocessing - use config queue_name directly
-        if service_name in self.service_definitions:
-            self.queue_name = self.service_definitions[service_name].get('queue_name', service_name)
+        # Queue name is handled by base_worker via config now
+        # Service URL is built from config
+        if self.service_host and self.service_port and self.service_endpoint:
+            self.service_url = f"http://{self.service_host}:{self.service_port}{self.service_endpoint}"
         else:
-            # Fallback for services not in config
-            self.queue_name = service_name
-        
-        # Service configuration for postprocessing
-        if service_port:
-            self.service_url = f"http://localhost:{service_port}/v3/analyze"
-        else:
-            self.service_url = service_url
+            # For postprocessing services that might not have HTTP endpoints
+            self.service_url = None
     
     def start(self):
         """Start the postprocessing worker - setup database transactions"""
-        # Call parent start to establish connections
-        super().start()
+        self.logger.info(f"Starting {self.service_name} postprocessing worker ({self.worker_id})")
         
-        # Configure database for transactions (needed for FK handling)
+        # Connect to services (from base worker)
+        if not self.connect_to_database():
+            sys.exit(1)
+        if not self.connect_to_queue():
+            sys.exit(1)
+        
+        # Configure database for transactions (needed for FK handling in postprocessing)
         if self.db_conn:
             self.db_conn.autocommit = False
+        
+        # Start consuming with our custom message processor
+        self.channel.basic_consume(
+            queue=self.queue_name,
+            on_message_callback=self.process_message
+        )
+        
+        self.logger.info("Waiting for postprocessing messages. Press CTRL+C to exit")
+        try:
+            self.channel.start_consuming()
+        except KeyboardInterrupt:
+            self.logger.info("Stopping worker...")
+            self.channel.stop_consuming()
+            self.connection.close()
+        finally:
+            if self.db_conn:
+                self.db_conn.close()
+            self.logger.info(f"{self.service_name} postprocessing worker stopped")
     
     def process_service(self, cropped_image_data):
         """Process the cropped image with the specific service - override in subclasses"""

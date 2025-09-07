@@ -12,7 +12,7 @@ class Detectron2Worker(BaseWorker):
     """Worker for detectron2 ML service"""
     
     def __init__(self):
-        super().__init__('detectron2')
+        super().__init__('primary.detectron2')
 
 if __name__ == "__main__":
     worker = Detectron2Worker()

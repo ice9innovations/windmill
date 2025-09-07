@@ -12,7 +12,7 @@ class Nsfw2Worker(BaseWorker):
     """Worker for nsfw2 ML service"""
     
     def __init__(self):
-        super().__init__('nsfw2')
+        super().__init__('primary.nsfw2')
 
 if __name__ == "__main__":
     worker = Nsfw2Worker()

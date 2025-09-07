@@ -12,7 +12,7 @@ import psycopg2
 import pika
 import re
 from datetime import datetime
-from dotenv import load_dotenv
+from base_worker import BaseWorker
 
 def normalize_emoji(emoji):
     """Remove variation selectors and other invisible modifiers from emoji"""
@@ -22,120 +22,36 @@ def normalize_emoji(emoji):
     # and zero-width joiner (U+200D) for consistent grouping
     return re.sub(r'[\uFE00-\uFE0F\u180B-\u180D\u200D]', '', emoji)
 
-class ConsensusWorker:
+class ConsensusWorker(BaseWorker):
     """Continuous consensus/voting worker"""
     
     def __init__(self):
-        # Load configuration
-        if not load_dotenv():
-            raise ValueError("Could not load .env file")
+        # Initialize with consensus service type
+        super().__init__('system.consensus')
         
-        # Database configuration
-        self.db_host = self._get_required('DB_HOST')
-        self.db_name = self._get_required('DB_NAME')
-        self.db_user = self._get_required('DB_USER')
-        self.db_password = self._get_required('DB_PASSWORD')
-        
-        # Worker configuration
-        self.worker_id = os.getenv('WORKER_ID', f'consensus_worker_{int(time.time())}')
-        
-        # Queue configuration
-        # Load service definitions to get queue name
-        with open('service_config.json', 'r') as f:
-            service_definitions = json.load(f)['services']
-        
-        # Get queue name from config
-        self.queue_name = service_definitions['postprocessing_consensus']['queue_name']
-        self.queue_host = self._get_required('QUEUE_HOST')
-        self.queue_user = self._get_required('QUEUE_USER')
-        self.queue_password = self._get_required('QUEUE_PASSWORD')
         
         
         # V3 Voting configuration
-        self.service_names = {
-            'blip': 'blip',
-            'clip': 'clip', 
-            'yolov8': 'yolo',
-            'colors': 'colors',
-            'detectron2': 'detectron2',
-            'face': 'face',
-            'nsfw2': 'nsfw',
-            'ocr': 'ocr',
-            'inception_v3': 'inception',
-            'rtdetr': 'rtdetr',
-            'metadata': 'metadata',
-            'ollama': 'llama',
-            'pose': 'pose'
-        }
-        
-        # Special emojis that auto-promote
         self.special_emojis = ['🔞', '💬']
-        
-        # Democratic voting configuration
         self.default_confidence = float(os.getenv('DEFAULT_CONFIDENCE', '0.75'))
         self.low_confidence_threshold = float(os.getenv('LOW_CONFIDENCE_THRESHOLD', '0.4'))
         
-        # Logging
-        self.setup_logging()
-        self.db_conn = None
+        # Consensus worker needs separate read connection for queries
         self.read_db_conn = None
         
-        # Load service configuration (after logger is set up)
-        self.service_config = self.load_service_config()
-        
-    def setup_logging(self):
-        """Configure logging"""
-        log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
-        logging.basicConfig(
-            level=getattr(logging, log_level),
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
-        self.logger = logging.getLogger('consensus_worker')
     
-    
-    def _get_required(self, key):
-        """Get required environment variable with no fallback"""
-        value = os.getenv(key)
-        if not value:
-            raise ValueError(f"Required environment variable {key} not set")
-        return value
-    
-    def load_service_config(self):
-        """Load service configuration from service_config.json"""
-        try:
-            config_path = os.path.join(os.path.dirname(__file__), '..', 'service_config.json')
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-            return config.get('services', {})
-        except Exception as e:
-            self.logger.error(f"Failed to load service_config.json: {e}")
-            return {}
     
     def connect_to_database(self):
-        """Connect to PostgreSQL database"""
+        """Connect to PostgreSQL database with dual connections"""
+        # Call parent to set up main connection
+        if not super().connect_to_database():
+            return False
+            
         try:
-            # Close existing connections if any
-            if hasattr(self, 'db_conn') and self.db_conn:
-                try:
-                    self.db_conn.close()
-                except:
-                    pass
-            if hasattr(self, 'read_db_conn') and self.read_db_conn:
-                try:
-                    self.read_db_conn.close()
-                except:
-                    pass
+            # Set up transaction mode for main connection
+            self.db_conn.autocommit = False
             
-            # Main connection for transactions (write operations)
-            self.db_conn = psycopg2.connect(
-                host=self.db_host,
-                database=self.db_name,
-                user=self.db_user,
-                password=self.db_password
-            )
-            self.db_conn.autocommit = False  # Use transactions
-            
-            # Read-only connection for queries (prevents idle transactions)
+            # Create separate read connection for queries
             self.read_db_conn = psycopg2.connect(
                 host=self.db_host,
                 database=self.db_name,
@@ -144,11 +60,10 @@ class ConsensusWorker:
             )
             self.read_db_conn.autocommit = True  # Auto-commit for read queries
             
-            self.logger.info(f"Connected to PostgreSQL at {self.db_host}")
             return True
             
         except Exception as e:
-            self.logger.error(f"Failed to connect to database: {e}")
+            self.logger.error(f"Failed to set up dual database connections: {e}")
             return False
     
     def ensure_database_connection(self):
@@ -185,30 +100,6 @@ class ConsensusWorker:
             
         return True
     
-    def connect_to_rabbitmq(self):
-        """Connect to RabbitMQ for queue-based processing"""
-        try:
-            credentials = pika.PlainCredentials(self.queue_user, self.queue_password)
-            self.connection = pika.BlockingConnection(
-                pika.ConnectionParameters(
-                    host=self.queue_host,
-                    credentials=credentials
-                )
-            )
-            self.channel = self.connection.channel()
-            
-            # Declare the consensus queue
-            self.channel.queue_declare(queue=self.queue_name, durable=True)
-            
-            # Set prefetch count for fair distribution
-            self.channel.basic_qos(prefetch_count=1)
-            
-            self.logger.info(f"Connected to RabbitMQ at {self.queue_host}, queue: {self.queue_name}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to connect to RabbitMQ: {e}")
-            return False
     
     
     def get_service_results_for_image(self, image_id):
@@ -288,15 +179,15 @@ class ConsensusWorker:
         try:
             cursor = self.db_conn.cursor()
             cursor.execute("""
-                SELECT merged_id, merged_data, status
+                SELECT merged_id, source_result_ids, merged_data
                 FROM merged_boxes 
-                WHERE image_id = %s AND status = 'success'
+                WHERE image_id = %s
                 ORDER BY created DESC
             """, (image_id,))
             
             merged_boxes = []
             for row in cursor.fetchall():
-                merged_data = row[1]  # JSONB data
+                merged_data = row[2]  # JSONB data
                 
                 # Only include multi-service merged boxes (detection_count >= 2)
                 if merged_data.get('detection_count', 0) >= 2:
@@ -358,7 +249,7 @@ class ConsensusWorker:
             if not result.get('success') or not result.get('predictions'):
                 continue
 
-            service_display_name = self.service_names.get(service_name, service_name)
+            service_display_name = service_name
             seen_emojis = set()  # Deduplicate within service
 
             for prediction in result['predictions']:
@@ -449,15 +340,14 @@ class ConsensusWorker:
     
     def get_evidence_type(self, service_name):
         """Determine evidence type based on service configuration"""
-        service_config = self.service_config.get(service_name, {})
-        service_type = service_config.get('service_type', 'other')
-        
-        # Handle comma-separated service types - for bbox predictions, use the first type
-        # (full_image predictions get forced to 'classification' in extract_all_detections)
-        if ',' in service_type:
-            return service_type.split(',')[0].strip()
-        
-        return service_type
+        # Use the same methods as BaseWorker
+        if self.config.is_spatial_service(service_name):
+            return 'spatial'
+        elif self.config.is_semantic_service(service_name):
+            return 'semantic'
+        else:
+            # For classification services like CLIP, xception
+            return 'classification'
 
     def extract_context(self, prediction, service_name):
         """Extract context information from prediction (ported from V3VotingService.js)"""
@@ -834,9 +724,9 @@ class ConsensusWorker:
             
             # Insert new consensus
             cursor.execute("""
-                INSERT INTO consensus (image_id, consensus_data, processing_time)
-                VALUES (%s, %s, %s)
-            """, (image_id, json.dumps(consensus_data), processing_time))
+                INSERT INTO consensus (image_id, consensus_data)
+                VALUES (%s, %s)
+            """, (image_id, json.dumps(consensus_data)))
             
             # CRITICAL: Commit the transaction!
             self.db_conn.commit()
@@ -895,7 +785,7 @@ class ConsensusWorker:
         if not self.connect_to_database():
             return 1
         
-        if not self.connect_to_rabbitmq():
+        if not self.connect_to_queue():
             return 1
         
         self.logger.info(f"Starting consensus worker ({self.worker_id})")

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BboxPoseWorker - Pose estimation on cropped person bounding boxes
+BboxFaceWorker - Face detection on cropped person bounding boxes
 """
 import sys
 import os
@@ -11,19 +11,19 @@ import io
 import requests
 from postprocessing_worker import PostProcessingWorker
 
-class BboxPoseWorker(PostProcessingWorker):
-    """Worker for pose estimation on cropped person bounding boxes"""
+class BboxFaceWorker(PostProcessingWorker):
+    """Worker for face detection on cropped person bounding boxes"""
     
     def __init__(self):
-        super().__init__('pose', None, service_port=7786)
+        super().__init__('postprocessing.face')
     
     def process_service(self, cropped_image_data):
-        """Process pose estimation on cropped image"""
+        """Process face detection on cropped image"""
         try:
             # Decode base64 image data
             image_bytes = base64.b64decode(cropped_image_data.encode('latin-1'))
             
-            # Call pose service
+            # Call face service
             files = {'file': ('bbox_crop.jpg', io.BytesIO(image_bytes), 'image/jpeg')}
             response = requests.post(
                 self.service_url,
@@ -32,17 +32,17 @@ class BboxPoseWorker(PostProcessingWorker):
             )
             
             if response.status_code == 200:
-                pose_data = response.json()
-                if pose_data.get('status') == 'success' and pose_data.get('predictions'):
-                    return pose_data
+                face_data = response.json()
+                if face_data.get('status') == 'success' and face_data.get('predictions'):
+                    return face_data
             
-            self.logger.warning(f"Pose service returned status {response.status_code}: {response.text[:200]}")
+            self.logger.warning(f"Face service returned status {response.status_code}: {response.text[:200]}")
             return None
             
         except Exception as e:
-            self.logger.error(f"Error processing pose estimation: {e}")
+            self.logger.error(f"Error processing face detection: {e}")
             return None
 
 if __name__ == "__main__":
-    worker = BboxPoseWorker()
+    worker = BboxFaceWorker()
     worker.start()

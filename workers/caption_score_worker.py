@@ -12,118 +12,50 @@ import psycopg2
 import pika
 import requests
 from datetime import datetime
-from dotenv import load_dotenv
+from base_worker import BaseWorker
 
-class CaptionScoreWorker:
+class CaptionScoreWorker(BaseWorker):
     """Worker that scores captions against images using CLIP similarity"""
     
     def __init__(self):
-        # Load configuration
-        if not load_dotenv():
-            raise ValueError("Could not load .env file")
+        # Initialize with caption score service type
+        super().__init__('postprocessing.caption_score')
         
-        # Load service definitions
-        with open('service_config.json', 'r') as f:
-            self.service_definitions = json.load(f)['services']
-        
-        # Database configuration
-        self.db_host = self._get_required('DB_HOST')
-        self.db_name = self._get_required('DB_NAME')
-        self.db_user = self._get_required('DB_USER')
-        self.db_password = self._get_required('DB_PASSWORD')
-        
-        # CLIP score service configuration
-        clip_config = self.service_definitions.get('caption_score', {})
-        self.clip_score_url = f"http://{clip_config.get('host', 'localhost')}:{clip_config.get('port', 7778)}{clip_config.get('endpoint', '/score')}"
-        
-        # Worker configuration
-        self.worker_id = os.getenv('WORKER_ID', f'caption_score_worker_{int(time.time())}')
-        self.request_timeout = int(os.getenv('REQUEST_TIMEOUT', '30'))
-        
-        # Queue configuration
-        # Load service definitions to find caption scoring service
-        with open('service_config.json', 'r') as f:
-            service_definitions = json.load(f)['services']
-        
-        # Find caption scoring service by service_type
-        caption_service = None
-        for service_name, config in service_definitions.items():
-            if config.get('service_type') == 'caption_score':
-                caption_service = service_name
-                break
-        
-        if not caption_service:
-            raise ValueError("No caption scoring service found in service config")
-            
-        # Get queue name from config
-        default_queue = service_definitions[caption_service].get('queue_name', caption_service)
-        self.queue_name = os.getenv('CAPTION_SCORE_QUEUE_NAME', default_queue)
-        self.queue_host = self._get_required('QUEUE_HOST')
-        self.queue_user = self._get_required('QUEUE_USER')
-        self.queue_password = self._get_required('QUEUE_PASSWORD')
+        # CLIP score service configuration - find by service_type
+        caption_score_services = self.config.get_service_group('postprocessing.caption_score[]')
+        service_config = self.config.get_service_config(caption_score_services[0])
+        self.clip_score_url = f"http://{service_config['host']}:{service_config['port']}{service_config['endpoint']}"
         
         # Services that trigger caption scoring
-        self.trigger_services = ['blip', 'ollama']  # ollama = llama in service config
+        self.trigger_services = self.config.get_service_group('primary.semantic[]')
         
-        # Logging
-        self.setup_logging()
-        self.db_conn = None
+        # Caption score worker needs separate read connection for queries
         self.read_db_conn = None
         
-    def setup_logging(self):
-        """Configure logging"""
-        log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
-        logging.basicConfig(
-            level=getattr(logging, log_level),
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
-        self.logger = logging.getLogger('caption_score_worker')
-    
-    def _get_required(self, key):
-        """Get required environment variable with no fallback"""
-        value = os.getenv(key)
-        if not value:
-            raise ValueError(f"Required environment variable {key} not set")
-        return value
     
     def connect_to_database(self):
-        """Connect to PostgreSQL database"""
-        try:
-            # Close existing connections if any
-            if hasattr(self, 'db_conn') and self.db_conn:
-                try:
-                    self.db_conn.close()
-                except:
-                    pass
-            if hasattr(self, 'read_db_conn') and self.read_db_conn:
-                try:
-                    self.read_db_conn.close()
-                except:
-                    pass
+        """Connect to PostgreSQL database with dual connections"""
+        # Call parent to set up main connection
+        if not super().connect_to_database():
+            return False
             
-            # Main connection for transactions (write operations)
-            self.db_conn = psycopg2.connect(
-                host=self.db_host,
-                database=self.db_name,
-                user=self.db_user,
-                password=self.db_password
-            )
+        try:
+            # Set up transaction mode for main connection
             self.db_conn.autocommit = False
             
-            # Read-only connection for queries
+            # Create separate read connection for queries
             self.read_db_conn = psycopg2.connect(
                 host=self.db_host,
                 database=self.db_name,
                 user=self.db_user,
                 password=self.db_password
             )
-            self.read_db_conn.autocommit = True
+            self.read_db_conn.autocommit = True  # Auto-commit for read queries
             
-            self.logger.info(f"Connected to PostgreSQL at {self.db_host}")
             return True
             
         except Exception as e:
-            self.logger.error(f"Failed to connect to database: {e}")
+            self.logger.error(f"Failed to set up dual database connections: {e}")
             return False
     
     def ensure_database_connection(self):
@@ -162,30 +94,6 @@ class CaptionScoreWorker:
             
         return True
     
-    def connect_to_rabbitmq(self):
-        """Connect to RabbitMQ for queue-based processing"""
-        try:
-            credentials = pika.PlainCredentials(self.queue_user, self.queue_password)
-            self.connection = pika.BlockingConnection(
-                pika.ConnectionParameters(
-                    host=self.queue_host,
-                    credentials=credentials
-                )
-            )
-            self.channel = self.connection.channel()
-            
-            # Declare the queue
-            self.channel.queue_declare(queue=self.queue_name, durable=True)
-            
-            # Set prefetch count for fair distribution
-            self.channel.basic_qos(prefetch_count=1)
-            
-            self.logger.info(f"Connected to RabbitMQ at {self.queue_host}, queue: {self.queue_name}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to connect to RabbitMQ: {e}")
-            return False
     
     def get_service_caption(self, image_id, service_name):
         """Get caption from a specific service for this image"""
@@ -402,7 +310,7 @@ class CaptionScoreWorker:
         if not self.connect_to_database():
             return 1
         
-        if not self.connect_to_rabbitmq():
+        if not self.connect_to_queue():
             return 1
         
         self.logger.info(f"Starting caption score worker ({self.worker_id})")

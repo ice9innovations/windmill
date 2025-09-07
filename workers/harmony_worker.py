@@ -15,7 +15,7 @@ import pika
 import re
 import requests
 from datetime import datetime
-from dotenv import load_dotenv
+from base_worker import BaseWorker
 from PIL import Image
 
 def normalize_emoji(emoji):
@@ -33,120 +33,37 @@ def normalize_person_emoji(emoji):
         return 'person'  # Group all person types under neutral 'person' key
     return normalized
 
-class BoundingBoxMergerWorker:
+class BoundingBoxMergerWorker(BaseWorker):
     """Continuous bounding box harmonization worker"""
     
     def __init__(self):
-        # Load configuration
-        if not load_dotenv():
-            raise ValueError("Could not load .env file")
+        # Initialize with harmony service type
+        super().__init__('system.harmony')
         
-        # Load service definitions
-        with open('service_config.json', 'r') as f:
-            self.service_definitions = json.load(f)['services']
+        # Bounding box services to harmonize - use new array notation
+        self.bbox_services = self.config.get_service_group('primary.spatial[]')
+        # Get clean service names for database queries (remove category prefix)
+        self.clean_bbox_services = [service.split('.', 1)[1] if '.' in service else service for service in self.bbox_services]
         
-        # Database configuration
-        self.db_host = self._get_required('DB_HOST')
-        self.db_name = self._get_required('DB_NAME')
-        self.db_user = self._get_required('DB_USER')
-        self.db_password = self._get_required('DB_PASSWORD')
-        
-        # Worker configuration
-        self.worker_id = os.getenv('WORKER_ID', f'bbox_merger_{int(time.time())}')
-        
-        # Queue configuration
-        self.queue_name = self._get_queue_name('postprocessing_merge')
-        self.queue_host = self._get_required('QUEUE_HOST')
-        self.queue_user = self._get_required('QUEUE_USER')
-        self.queue_password = self._get_required('QUEUE_PASSWORD')
-        # Removed downstream_queue - using new postprocessing dispatch instead
-        
-        # Bounding box services to harmonize - get from service config
-        self.bbox_services = self._get_bbox_services_from_config()
-        
-        
-        # Logging
-        self.setup_logging()
-        self.db_conn = None
+        # Harmony worker needs separate read connection for queries
         self.read_db_conn = None
         
-        # Queue connections
-        self.queue_connection = None
-        self.queue_channel = None
-        
     
-    def _get_required(self, key):
-        """Get required environment variable or raise error"""
-        value = os.getenv(key)
-        if not value:
-            raise ValueError(f"Required environment variable {key} not set")
-        return value
-    
-    def _get_bbox_services_from_config(self):
-        """Get services that produce bounding boxes from service config"""
-        bbox_services = []
-        
-        for service_name, config in self.service_definitions.items():
-            service_type = config.get('service_type', '')
-            category = config.get('category', '')
-            
-            # Parse comma-separated service types
-            service_types = [t.strip() for t in service_type.split(',')]
-            
-            # Include services that have spatial type (produce bboxes) and are primary category
-            if 'spatial' in service_types and category == 'primary':
-                bbox_services.append(service_name)
-        
-        if not bbox_services:
-            raise ValueError("No bbox services found in service config")
-            
-        return sorted(bbox_services)
-    
-    def _get_queue_name(self, service_name):
-        """Get queue name for any service using its queue_name configuration"""
-        if service_name in self.service_definitions:
-            return self.service_definitions[service_name].get('queue_name', service_name)
-        else:
-            # For services not in config (like bbox_merge), use service name
-            return service_name
-        
-    def setup_logging(self):
-        """Configure logging"""
-        log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
-        logging.basicConfig(
-            level=getattr(logging, log_level),
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
-        self.logger = logging.getLogger('bbox_merger')
     
     
     
     
     def connect_to_database(self):
-        """Connect to PostgreSQL database"""
-        try:
-            # Close existing connections if any
-            if hasattr(self, 'db_conn') and self.db_conn:
-                try:
-                    self.db_conn.close()
-                except:
-                    pass
-            if hasattr(self, 'read_db_conn') and self.read_db_conn:
-                try:
-                    self.read_db_conn.close()
-                except:
-                    pass
+        """Connect to PostgreSQL database with dual connections"""
+        # Call parent to set up main connection
+        if not super().connect_to_database():
+            return False
             
-            # Main connection for transactions (write operations)
-            self.db_conn = psycopg2.connect(
-                host=self.db_host,
-                database=self.db_name,
-                user=self.db_user,
-                password=self.db_password
-            )
+        try:
+            # Set up transaction mode for main connection
             self.db_conn.autocommit = False
             
-            # Read-only connection for queries (prevents idle transactions)
+            # Create separate read connection for queries
             self.read_db_conn = psycopg2.connect(
                 host=self.db_host,
                 database=self.db_name,
@@ -155,11 +72,10 @@ class BoundingBoxMergerWorker:
             )
             self.read_db_conn.autocommit = True  # Auto-commit for read queries
             
-            self.logger.info(f"Connected to PostgreSQL at {self.db_host}")
             return True
             
         except Exception as e:
-            self.logger.error(f"Failed to connect to database: {e}")
+            self.logger.error(f"Failed to set up dual database connections: {e}")
             return False
     
     def ensure_database_connection(self):
@@ -214,17 +130,29 @@ class BoundingBoxMergerWorker:
             self.queue_channel.queue_declare(queue=self.queue_name, durable=True)
             # Removed old downstream queue
             
-            # Declare bbox postprocessing queues
-            self.queue_channel.queue_declare(queue='postprocessing_colors', durable=True)
-            self.queue_channel.queue_declare(queue='postprocessing_face', durable=True)
-            self.queue_channel.queue_declare(queue='postprocessing_pose', durable=True)
+            # Declare bbox postprocessing queues - read from config
+            colors_queue = self._get_queue_name('postprocessing.colors')
+            face_queue = self._get_queue_name('postprocessing.face')
+            pose_queue = self._get_queue_name('postprocessing.pose')
+            
+            self.queue_channel.queue_declare(queue=colors_queue, durable=True)
+            self.queue_channel.queue_declare(queue=face_queue, durable=True)
+            self.queue_channel.queue_declare(queue=pose_queue, durable=True)
+            
+            # Store queue names for later use
+            self.postprocessing_queues = {
+                'colors': colors_queue,
+                'face': face_queue, 
+                'pose': pose_queue
+            }
             
             # Set prefetch count for fair distribution
             self.queue_channel.basic_qos(prefetch_count=1)
             
             self.logger.info(f"Connected to RabbitMQ at {self.queue_host}")
             self.logger.info(f"Consuming from: {self.queue_name}")
-            self.logger.info(f"Publishing to postprocessing queues: bbox_colors, bbox_face, bbox_pose")
+            queue_names = ', '.join([self.postprocessing_queues['colors'], self.postprocessing_queues['face'], self.postprocessing_queues['pose']])
+            self.logger.info(f"Publishing to postprocessing queues: {queue_names}")
             return True
             
         except Exception as e:
@@ -274,12 +202,12 @@ class BoundingBoxMergerWorker:
                     }
                     
                     # Always dispatch colors
-                    self.publish_bbox_message('postprocessing_colors', base_message)
+                    self.publish_bbox_message(self.postprocessing_queues['colors'], base_message)
                     
                     # Dispatch face/pose for person boxes
                     if self.is_person_box(instance):
-                        self.publish_bbox_message('postprocessing_face', base_message)
-                        self.publish_bbox_message('postprocessing_pose', base_message)
+                        self.publish_bbox_message(self.postprocessing_queues['face'], base_message)
+                        self.publish_bbox_message(self.postprocessing_queues['pose'], base_message)
                     
         except Exception as e:
             self.logger.error(f"Error in dispatch_bbox_postprocessing: {e}")
@@ -326,6 +254,11 @@ class BoundingBoxMergerWorker:
     def publish_bbox_message(self, queue_name, message):
         """Publish message to bbox postprocessing queue"""
         try:
+            # Check if connection is healthy
+            if not self.queue_channel or self.queue_connection.is_closed:
+                self.logger.warning("RabbitMQ queue connection lost, reconnecting...")
+                self.connect_to_queue()
+            
             self.queue_channel.basic_publish(
                 exchange='',
                 routing_key=queue_name,
@@ -371,6 +304,9 @@ class BoundingBoxMergerWorker:
                 else:
                     self.logger.info(f"Successfully processed bbox merge for {image_filename}, no merged boxes to enrich")
                 
+                # Trigger consensus after harmony completes
+                self.trigger_consensus(image_id, message)
+                
                 # Acknowledge the message
                 ch.basic_ack(delivery_tag=method.delivery_tag)
                 
@@ -404,7 +340,7 @@ class BoundingBoxMergerWorker:
                 ORDER BY service
             """
             
-            cursor.execute(query, (image_id, tuple(self.bbox_services)))
+            cursor.execute(query, (image_id, tuple(self.clean_bbox_services)))
             results = cursor.fetchall()
             cursor.close()
             
@@ -720,8 +656,7 @@ class BoundingBoxMergerWorker:
                 
                 # Step 1: Clear postprocessing references to avoid FK constraint violation
                 cursor.execute("""
-                    UPDATE postprocessing 
-                    SET merged_box_id = NULL 
+                    DELETE FROM postprocessing 
                     WHERE merged_box_id IN (
                         SELECT merged_id FROM merged_boxes WHERE image_id = %s
                     )
@@ -755,8 +690,8 @@ class BoundingBoxMergerWorker:
                             VALUES (%s, %s, %s, %s, %s)
                         """, (
                             image_id,
-                            merged_data['source_result_ids'],
-                            json.dumps(merged_box_data),
+                            merged_box_data['source_result_ids'],
+                            json.dumps({k: v for k, v in merged_box_data.items() if k != 'source_result_ids'}),
                             self.worker_id,
                             'success'
                         ))

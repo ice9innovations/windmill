@@ -14,8 +14,10 @@ import io
 import pika
 import psycopg2
 import requests
+import yaml
 from datetime import datetime
 from dotenv import load_dotenv
+from service_config import get_service_config
 
 class BaseWorker:
     """Base class for all ML service workers"""
@@ -30,28 +32,24 @@ class BaseWorker:
         self.jobs_failed = 0
         
     def load_config(self, env_file):
-        """Load configuration from .env and service_config.json"""
+        """Load configuration from .env and service_config.yaml"""
         # Load .env file
         if not load_dotenv(env_file):
             raise ValueError(f"Could not load {env_file} file. Copy .env.example to .env and configure.")
         
-        # Load service definitions
-        with open('service_config.json', 'r') as f:
-            self.service_definitions = json.load(f)['services']
+        # Load service configuration using new YAML loader
+        self.config = get_service_config()
         
-        # Validate service name
-        if self.service_name not in self.service_definitions:
-            available = ', '.join(self.service_definitions.keys())
-            raise ValueError(f"Unknown service '{self.service_name}'. Available: {available}")
+        # Validate service name (must be in category.service format)
+        service_def = self.config.get_service_config(self.service_name)
         
         # Service configuration
-        service_def = self.service_definitions[self.service_name]
-        self.service_host = service_def['host']
-        self.service_port = service_def['port']
-        self.service_endpoint = service_def['endpoint']
+        self.service_host = service_def.get('host')
+        self.service_port = service_def.get('port')
+        self.service_endpoint = service_def.get('endpoint')
         
         # Queue configuration
-        self.queue_name = service_def.get('queue_name', self.service_name)
+        self.queue_name = self.config.get_queue_name(self.service_name)
         self.queue_host = self._get_required('QUEUE_HOST')
         self.queue_user = self._get_required('QUEUE_USER')
         self.queue_password = self._get_required('QUEUE_PASSWORD')
@@ -69,14 +67,18 @@ class BaseWorker:
         self.max_retries = int(os.getenv('MAX_RETRIES', '3'))
         self.retry_delay = int(os.getenv('RETRY_DELAY', '5'))
         
-        # Post-processing triggers - dynamically load spatial services from config
-        self.bbox_services = [
-            service_name for service_name, config in self.service_definitions.items()
-            if 'spatial' in config.get('service_type', '').split(',')
-        ]
-        self.enable_triggers = service_def.get('enable_triggers', False)
-        self.enable_consensus_triggers = service_def.get('enable_consensus_triggers', False)
-        self.enable_caption_scoring = service_def.get('enable_caption_scoring', False)
+        # Post-processing triggers - use new config loader methods
+        self.bbox_services = self.config.get_spatial_services()
+        
+        # Determine triggers based on service type and YAML rules
+        self.is_spatial = self.config.is_spatial_service(self.service_name)
+        self.is_semantic = self.config.is_semantic_service(self.service_name)
+        self.enable_consensus_triggers = self.config.should_trigger_consensus(self.service_name)
+        
+        # Enable triggers for spatial services (for bbox harmonization)
+        self.enable_triggers = self.is_spatial
+        # Enable caption scoring for semantic services
+        self.enable_caption_scoring = self.is_semantic
         
         # Performance configuration
         self.processing_delay = float(os.getenv('PROCESSING_DELAY', '0.0'))
@@ -90,18 +92,21 @@ class BaseWorker:
     
     def _get_queue_name(self, service_name):
         """Get queue name for any service using its queue_name configuration"""
-        if service_name in self.service_definitions:
-            return self.service_definitions[service_name].get('queue_name', service_name)
-        else:
-            # For services not in config (like consensus, bbox_merge), use service name
+        try:
+            return self.config.get_queue_name(service_name)
+        except ValueError:
+            # For services not in config (legacy support), use service name
             return service_name
     
     def _get_queue_by_service_type(self, service_type):
         """Find service by service_type and return its queue name"""
-        for service_name, config in self.service_definitions.items():
-            if config.get('service_type') == service_type:
-                return config.get('queue_name', service_name)
-        raise ValueError(f"No service found with service_type: {service_type}")
+        return self.config.get_queue_by_service_type(service_type)
+    
+    def _get_clean_service_name(self):
+        """Get clean service name without category prefix"""
+        if '.' in self.service_name:
+            return self.service_name.split('.', 1)[1]  # Return part after first dot
+        return self.service_name
     
     def setup_logging(self):
         """Setup logging for this worker"""
@@ -151,6 +156,11 @@ class BaseWorker:
         """Trigger consensus processing"""
         if self.enable_consensus_triggers:
             try:
+                # Check if connection is healthy
+                if not self.channel or self.connection.is_closed:
+                    self.logger.warning("RabbitMQ connection lost, reconnecting...")
+                    self.connect_to_queue()
+                
                 consensus_message = {
                     'image_id': image_id,
                     'image_filename': message.get('image_filename', f'image_{image_id}'),
@@ -174,8 +184,13 @@ class BaseWorker:
     
     def trigger_caption_scoring(self, image_id, message):
         """Trigger caption scoring for caption generation services"""
-        if self.enable_triggers and self.enable_caption_scoring:
+        if self.enable_caption_scoring:
             try:
+                # Check if connection is healthy
+                if not self.channel or self.connection.is_closed:
+                    self.logger.warning("RabbitMQ connection lost, reconnecting...")
+                    self.connect_to_queue()
+                
                 caption_score_message = {
                     'image_id': image_id,
                     'image_filename': message.get('image_filename', f'image_{image_id}'),
@@ -253,11 +268,17 @@ class BaseWorker:
             cursor.execute("""
                 INSERT INTO results (image_id, service, data, status, result_created, worker_id)
                 VALUES (%s, %s, %s, %s, %s, %s)
-            """, (image_id, self.service_name, json.dumps(result), 'success', datetime.now(), self.worker_id))
+            """, (image_id, self._get_clean_service_name(), json.dumps(result), 'success', datetime.now(), self.worker_id))
+            self.db_conn.commit()  # CRITICAL: Commit the transaction!
             cursor.close()
             
             # Trigger post-processing for bbox services
             if self.service_name in self.bbox_services and self.enable_triggers:
+                # Check if connection is healthy
+                if not self.channel or self.connection.is_closed:
+                    self.logger.warning("RabbitMQ connection lost, reconnecting...")
+                    self.connect_to_queue()
+                
                 bbox_message = {
                     'image_id': image_id,
                     'image_filename': message.get('image_filename', f'image_{image_id}'),
