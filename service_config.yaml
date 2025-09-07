@@ -1,0 +1,154 @@
+# Windmill Service Configuration
+# Defines ML services, infrastructure components, and their queue mappings
+#
+
+# Rules: 
+# Spatial services trigger box harmonization
+# Semantic services trigger caption scores
+# All services trigger consesus building unless tagged with consensus: false
+
+services:
+  # Primary ML Services - Run on full images
+  primary: 
+    blip:
+      queue_name: blip # allows overrides if explicitly defined, uses service name if not
+      host: localhost
+      port: 7777
+      endpoint: /v3/analyze
+      service_type: semantic
+
+    clip:
+      # queue_name: clip # queue name commented out to prove that this works
+      host: localhost
+      port: 7788
+      endpoint: /v3/analyze
+      service_type: spatial,classification # some services can be in multiple categories 
+
+    colors:
+      queue_name: colors
+      host: localhost
+      port: 7770
+      endpoint: /v3/analyze
+      service_type: colors
+      consensus: false
+
+    detectron2:
+      queue_name: detectron # not hardcoded
+      host: localhost
+      port: 7771
+      endpoint: /v3/analyze
+      service_type: spatial
+
+    # xception:
+    #   queue_name: xception
+    #   host: localhost
+    #   port: 7799
+    #   endpoint: /v3/analyze
+    #   service_type: spatial, classification # note there is a space in the csv for testing
+
+    metadata:
+      queue_name: metadata
+      host: localhost
+      port: 7781
+      endpoint: /v3/analyze
+      service_type: metadata
+
+    ocr:
+      queue_name: ocr
+      host: localhost
+      port: 7775
+      endpoint: /v3/analyze
+      service_type: specialized
+
+    nsfw2:
+      queue_name: nsfw
+      host: localhost
+      port: 7774
+      endpoint: /v3/analyze
+      service_type: specialized
+
+    ollama:
+      queue_name: ollama
+      host: localhost
+      port: 7782
+      endpoint: /v3/analyze
+      service_type: semantic
+      # caption_scoring: true # all semantic services trigger caption scoring
+
+    rtdetr:
+      queue_name: rtdetr
+      host: localhost
+      port: 7780
+      endpoint: /v3/analyze
+      service_type: spatial
+
+    yolo_v8:
+      queue_name: yolo_v8
+      host: localhost
+      port: 7773
+      endpoint: /v3/analyze
+      service_type: spatial
+
+    yolo_365:
+      queue_name: yolo_365
+      host: localhost
+      port: 7790
+      endpoint: /v3/analyze
+      service_type: spatial
+
+    yolo_oi7:
+      queue_name: yolo_oi7
+      host: localhost
+      port: 7791
+      endpoint: /v3/analyze
+      service_type: spatial
+
+  postprocessing:
+    # Postprocessing Services - Run on cropped bbox regions or captions
+    colors:
+      queue_name: colors_post
+      host: localhost
+      port: 7770
+      endpoint: /v3/analyze
+      service_type: colors
+      consensus: false
+      
+    face:
+      queue_name: face
+      host: localhost
+      port: 7772
+      endpoint: /v3/analyze
+      service_type: specialized
+
+    pose:
+      queue_name: pose
+      host: localhost
+      port: 7786
+      endpoint: /v3/analyze
+      service_type: specialized
+      consensus: false
+
+    caption_score:
+      queue_name: caption_score
+      host: localhost
+      port: 7778
+      endpoint: /score
+      service_type: caption_score
+      consensus: false
+
+  system:
+
+    # Infrastructure Services - Queue processing and harmonization
+    # Handled differently to avoid recursion
+    # Consensus does not trigger consensus
+    # Harmony does not trigger harmony
+
+    consensus:
+      queue_name: consensus
+      category: infrastructure
+      service_type: consensus
+
+    harmony:
+      queue_name: harmony
+      category: infrastructure
+      service_type: harmonization
