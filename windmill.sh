@@ -15,15 +15,15 @@ get_all_workers() {
     # Get all worker files and extract service names, excluding base classes
     for worker_file in workers/*_worker.py; do
         if [ -f "$worker_file" ]; then
-            # Extract worker name: workers/blip_worker.py -> blip
-            worker_name=$(basename "$worker_file" "_worker.py")
+            # Extract worker name from full filename
+            basename_file=$(basename "$worker_file" ".py")
             
             # Skip base classes and utilities
-            if [[ "$worker_name" != "base" && "$worker_name" != "generic" && "$worker_name" != "postprocessing" ]]; then
-                echo "$worker_name"
+            if [[ "$basename_file" != "base_worker" && "$basename_file" != "postprocessing_worker" && "$basename_file" != "service_config" ]]; then
+                echo "$basename_file"
             fi
         fi
-    done
+    done | sort -u
 }
 
 start_all() {
@@ -33,7 +33,7 @@ start_all() {
     # Start all workers - now they all use the same clean pattern
     for worker in $(get_all_workers); do
         echo "  Starting $worker..."
-        nohup python workers/${worker}_worker.py > logs/${worker}_worker.log 2>&1 &
+        nohup python workers/${worker}.py > logs/${worker}.log 2>&1 &
     done
     
     sleep 2
@@ -45,7 +45,7 @@ stop_all() {
     
     # Stop each worker individually - now they can all be targeted precisely!
     for worker in $(get_all_workers); do
-        if pkill -f "workers/${worker}_worker.py" 2>/dev/null; then
+        if pkill -f "workers/${worker}.py" 2>/dev/null; then
             echo "  ✅ Stopped $worker"
         fi
     done
@@ -68,8 +68,8 @@ status_all() {
     
     # Check all workers - unified clean approach
     for worker in $(get_all_workers); do
-        if pgrep -f "workers/${worker}_worker.py" >/dev/null 2>&1; then
-            local pid=$(pgrep -f "workers/${worker}_worker.py")
+        if pgrep -f "workers/${worker}.py" >/dev/null 2>&1; then
+            local pid=$(pgrep -f "workers/${worker}.py")
             echo -e "${GREEN}✅ $worker${NC} (PID: $pid)"
         else
             echo -e "${RED}❌ $worker${NC} (not running)"
@@ -79,7 +79,41 @@ status_all() {
 
 stop_worker() {
     local worker="$1"
-    if pkill -f "workers/${worker}_worker.py" 2>/dev/null; then
+    local worker_file=""
+    
+    # Map service names to actual worker files (same mapping as start_worker)
+    case "$worker" in
+        "harmony")
+            worker_file="workers/harmony_worker.py"
+            ;;
+        "consensus")
+            worker_file="workers/consensus_worker.py"
+            ;;
+        "caption_score")
+            worker_file="workers/caption_score_worker.py"
+            ;;
+        "colors_post")
+            worker_file="workers/colors_post_worker.py"
+            ;;
+        "face")
+            worker_file="workers/face_worker.py"
+            ;;
+        "pose")
+            worker_file="workers/pose_worker.py"
+            ;;
+        *)
+            # For service workers, try the standard pattern first
+            if [ -f "workers/${worker}_worker.py" ]; then
+                worker_file="workers/${worker}_worker.py"
+            elif [ -f "workers/${worker}.py" ]; then
+                worker_file="workers/${worker}.py"
+            else
+                worker_file="workers/${worker}.py"  # fallback
+            fi
+            ;;
+    esac
+    
+    if pkill -f "$worker_file" 2>/dev/null; then
         echo "✅ Stopped $worker"
         return 0
     else
@@ -90,15 +124,46 @@ stop_worker() {
 
 start_worker() {
     local worker="$1"
+    local worker_file=""
+    
+    # Map service names to actual worker files
+    case "$worker" in
+        "harmony")
+            worker_file="workers/harmony_worker.py"
+            ;;
+        "consensus")
+            worker_file="workers/consensus_worker.py"
+            ;;
+        "caption_score")
+            worker_file="workers/caption_score_worker.py"
+            ;;
+        "colors_post")
+            worker_file="workers/colors_post_worker.py"
+            ;;
+        "face")
+            worker_file="workers/face_worker.py"
+            ;;
+        "pose")
+            worker_file="workers/pose_worker.py"
+            ;;
+        *)
+            # For service workers, try the standard pattern first
+            if [ -f "workers/${worker}_worker.py" ]; then
+                worker_file="workers/${worker}_worker.py"
+            elif [ -f "workers/${worker}.py" ]; then
+                worker_file="workers/${worker}.py"
+            fi
+            ;;
+    esac
     
     # Check if worker file exists
-    if [ ! -f "workers/${worker}_worker.py" ]; then
-        echo "❌ ERROR: workers/${worker}_worker.py does not exist"
+    if [ ! -f "$worker_file" ]; then
+        echo "❌ ERROR: $worker_file does not exist"
         return 1
     fi
     
     echo "  Starting $worker..."
-    nohup python workers/${worker}_worker.py > logs/${worker}_worker.log 2>&1 &
+    nohup python $worker_file > logs/${worker}.log 2>&1 &
     echo "✅ Started $worker"
 }
 
