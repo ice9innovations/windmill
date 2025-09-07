@@ -20,8 +20,13 @@ class PostProcessingWorker(BaseWorker):
     def __init__(self, service_name, service_url, service_port=None):
         super().__init__(service_name)
         
-        # Override queue name for postprocessing
-        self.queue_name = f"queue_bbox_{service_name}"
+        # Override queue name for postprocessing - use config-based naming
+        if service_name in self.service_definitions:
+            configured_queue = self.service_definitions[service_name].get('queue_name', service_name)
+            self.queue_name = f"postprocessing_{configured_queue}"
+        else:
+            # Fallback for services not in config
+            self.queue_name = f"postprocessing_{service_name}"
         
         # Service configuration for postprocessing
         if service_port:

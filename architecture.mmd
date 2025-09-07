@@ -1,0 +1,89 @@
+flowchart TD
+    %% Input
+    Producer[producer.py<br/>Fetches images from DB<br/>Base64 encodes image_data<br/>Includes image_filename]
+    
+    %% Primary Service Queues 
+    Producer --> qBlip[queue_blip<br/>1 consumer]
+    Producer --> qClip[queue_clip<br/>1 consumer] 
+    Producer --> qColors[queue_colors<br/>4 consumers]
+    Producer --> qDetectron2[queue_detectron2<br/>1 consumer]
+    Producer --> qXception[queue_xception<br/>2 consumers]
+    Producer --> qMetadata[queue_metadata<br/>1 consumer]
+    Producer --> qOCR[queue_ocr<br/>1 consumer]
+    Producer --> qNSFW2[queue_nsfw2<br/>1 consumer]
+    Producer --> qOllama[queue_ollama<br/>5 consumers]
+    Producer --> qRTDETR[queue_rtdetr<br/>1 consumer]
+    Producer --> qYolov8[queue_yolov8<br/>1 consumer]
+    Producer --> qYolo365[queue_yolo_365<br/>1 consumer]
+    Producer --> qYoloOI7[queue_yolo_oi7<br/>1 consumer]
+    
+    %% Primary Workers → Results Table
+    qBlip --> wBlip[blip_worker.py] --> ResultsDB[(results table)]
+    qClip --> wClip[clip_worker.py] --> ResultsDB
+    qColors --> wColors[colors_worker.py] --> ResultsDB
+    qDetectron2 --> wDetectron2[detectron2_worker.py] --> ResultsDB
+    qXception --> wXception[xception_worker.py] --> ResultsDB
+    qMetadata --> wMetadata[metadata_worker.py] --> ResultsDB
+    qOCR --> wOCR[ocr_worker.py] --> ResultsDB
+    qNSFW2 --> wNSFW2[nsfw2_worker.py] --> ResultsDB
+    qOllama --> wOllama[ollama_worker.py] --> ResultsDB
+    qRTDETR --> wRTDETR[rtdetr_worker.py] --> ResultsDB
+    qYolov8 --> wYolov8[yolov8_worker.py] --> ResultsDB
+    qYolo365 --> wYolo365[yolo_365_worker.py] --> ResultsDB
+    qYoloOI7 --> wYoloOI7[yolo_oi7_worker.py] --> ResultsDB
+    
+    %% Bbox Merge Triggers (spatial services with enable_triggers=true)
+    wClip -.->|service_type: spatial,classification<br/>enable_triggers: true<br/>Includes image_data| qBboxMerge[queue_bbox_merge<br/>5 consumers]
+    wDetectron2 -.->|service_type: spatial<br/>enable_triggers: true| qBboxMerge
+    wXception -.->|service_type: spatial,classification<br/>enable_triggers: true| qBboxMerge
+    wRTDETR -.->|service_type: spatial<br/>enable_triggers: true| qBboxMerge
+    wYolov8 -.->|service_type: spatial<br/>enable_triggers: true| qBboxMerge
+    wYolo365 -.->|service_type: spatial<br/>enable_triggers: true| qBboxMerge
+    wYoloOI7 -.->|service_type: spatial<br/>enable_triggers: true| qBboxMerge
+    
+    %% Bbox Harmonization
+    qBboxMerge --> wBboxMerger[bbox_merger_worker.py<br/>Harmonizes overlapping boxes<br/>DELETE+INSERT pattern]
+    wBboxMerger --> MergedBoxesDB[(merged_boxes table)]
+    
+    %% Postprocessing Dispatch (with cropped image data)
+    wBboxMerger --> qBboxColors[queue_bbox_colors<br/>4 consumers<br/>ALL merged boxes]
+    wBboxMerger --> qBboxFace[queue_bbox_face<br/>1 consumer<br/>Person emojis: 🧑🙂👩🧒]
+    wBboxMerger --> qBboxPose[queue_bbox_pose<br/>1 consumer<br/>Person emojis: 🧑🙂👩🧒]
+    
+    %% Postprocessing Workers
+    qBboxColors --> wBboxColors[bbox_colors_worker.py] --> PostprocessingDB[(postprocessing table)]
+    qBboxFace --> wBboxFace[bbox_face_worker.py] --> PostprocessingDB
+    qBboxPose --> wBboxPose[bbox_pose_worker.py] --> PostprocessingDB
+    
+    %% Consensus Triggers (enable_consensus_triggers=true - nearly all services except colors/metadata/postprocessing)
+    wBlip -.->|enable_consensus_triggers: true| qConsensus[queue_consensus<br/>5 consumers]
+    wClip -.-> qConsensus
+    wDetectron2 -.-> qConsensus
+    wXception -.-> qConsensus
+    wOCR -.-> qConsensus
+    wNSFW2 -.-> qConsensus
+    wOllama -.-> qConsensus
+    wRTDETR -.-> qConsensus
+    wYolov8 -.-> qConsensus
+    wYolo365 -.-> qConsensus
+    wYoloOI7 -.-> qConsensus
+    
+    %% Consensus Processing (reads merged_boxes for spatial evidence)
+    qConsensus --> wConsensus[consensus_worker.py<br/>V3 voting algorithm<br/>DELETE+INSERT pattern]
+    MergedBoxesDB -.-> wConsensus
+    wConsensus --> ConsensusDB[(consensus table)]
+    
+    %% Caption Scoring (enable_caption_scoring=true)
+    wBlip -.->|enable_caption_scoring: true| qCaptionScore[queue_caption_score<br/>1 consumer]
+    wOllama -.-> qCaptionScore
+    qCaptionScore --> wCaptionScore[caption_score_worker.py] --> PostprocessingDB
+    
+    %% Styling
+    classDef queueStyle fill:#e1f5fe,stroke:#01579b,stroke-width:2px
+    classDef workerStyle fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
+    classDef dbStyle fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
+    classDef triggerStyle stroke-dasharray: 5 5,stroke:#ff6f00,stroke-width:2px
+    
+    class qBlip,qClip,qColors,qDetectron2,qXception,qMetadata,qOCR,qNSFW2,qOllama,qRTDETR,qYolov8,qYolo365,qYoloOI7,qBboxMerge,qBboxColors,qBboxFace,qBboxPose,qConsensus,qCaptionScore queueStyle
+    class wBlip,wClip,wColors,wDetectron2,wXception,wMetadata,wOCR,wNSFW2,wOllama,wRTDETR,wYolov8,wYolo365,wYoloOI7,wBboxMerger,wBboxColors,wBboxFace,wBboxPose,wConsensus,wCaptionScore workerStyle
+    class ResultsDB,MergedBoxesDB,PostprocessingDB,ConsensusDB dbStyle

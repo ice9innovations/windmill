@@ -49,22 +49,21 @@ class ProducerConfig:
         return list(self.service_definitions.keys())
     
     def get_services_by_category(self, category):
-        """Get services that belong to a specific category"""
+        """Get services that belong to a specific category (handles comma-separated categories)"""
         return [
             service_name for service_name, service_config in self.service_definitions.items()
-            if service_config.get('category') == category
+            if category in [cat.strip() for cat in service_config.get('category', '').split(',')]
         ]
     
     def get_primary_services(self):
-        """Get services that run on whole images (excludes spatial_only which are handled by postprocessing workers)"""
+        """Get services that run on whole images (excludes postprocessing-only services which are handled by postprocessing workers)"""
         return self.get_services_by_category('primary')
     
     def get_queue_name(self, service_name):
         """Get queue name for a service"""
         if service_name not in self.service_definitions:
             raise ValueError(f"Unknown service: {service_name}")
-        prefix = self.service_definitions[service_name].get('queue_prefix', 'queue_')
-        return f"{prefix}{service_name}"
+        return self.service_definitions[service_name].get('queue_name', service_name)
 
 class GenericProducer:
     """Generic producer for submitting jobs to ML service queues"""
@@ -369,10 +368,10 @@ def main():
             
             print()
             
-            # Spatial-only services (bbox region processing)
-            spatial_services = producer.config.get_services_by_category('spatial_only')
-            print("🔍 SPATIAL_ONLY (bbox region processing via postprocessing workers):")
-            for service in sorted(spatial_services):
+            # Postprocessing-only services (bbox region processing)
+            postprocessing_services = producer.config.get_services_by_category('postprocessing')
+            print("🔍 POSTPROCESSING (bbox region processing via postprocessing workers):")
+            for service in sorted(postprocessing_services):
                 desc = producer.config.service_definitions[service]['description']
                 port = producer.config.service_definitions[service]['port']
                 print(f"  {service:12} (port {port}): {desc}")
@@ -381,8 +380,8 @@ def main():
             print("Service sets:")
             print("  all          = primary services (recommended for whole image processing)")
             print("  primary      = primary services (same as 'all')")  
-            print("  spatial_only = face + pose services (handled by postprocessing workers, not for direct use)")
-            print("  full_catalog = all services including spatial_only")
+            print("  postprocessing = face + pose services (handled by postprocessing workers, not for direct use)")
+            print("  full_catalog = all services including postprocessing")
             
             return 0
         

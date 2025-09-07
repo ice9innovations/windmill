@@ -41,7 +41,23 @@ class CaptionScoreWorker:
         self.request_timeout = int(os.getenv('REQUEST_TIMEOUT', '30'))
         
         # Queue configuration
-        self.queue_name = os.getenv('CAPTION_SCORE_QUEUE_NAME', 'queue_caption_score')
+        # Load service definitions to find caption scoring service
+        with open('service_config.json', 'r') as f:
+            service_definitions = json.load(f)['services']
+        
+        # Find caption scoring service by service_type
+        caption_service = None
+        for service_name, config in service_definitions.items():
+            if config.get('service_type') == 'caption_score':
+                caption_service = service_name
+                break
+        
+        if not caption_service:
+            raise ValueError("No caption scoring service found in service config")
+            
+        # Get queue name from config
+        default_queue = service_definitions[caption_service].get('queue_name', caption_service)
+        self.queue_name = os.getenv('CAPTION_SCORE_QUEUE_NAME', default_queue)
         self.queue_host = self._get_required('QUEUE_HOST')
         self.queue_user = self._get_required('QUEUE_USER')
         self.queue_password = self._get_required('QUEUE_PASSWORD')

@@ -51,7 +51,7 @@ class BaseWorker:
         self.service_endpoint = service_def['endpoint']
         
         # Queue configuration
-        self.queue_name = f"queue_{self.service_name}"
+        self.queue_name = service_def.get('queue_name', self.service_name)
         self.queue_host = self._get_required('QUEUE_HOST')
         self.queue_user = self._get_required('QUEUE_USER')
         self.queue_password = self._get_required('QUEUE_PASSWORD')
@@ -87,6 +87,14 @@ class BaseWorker:
         if not value:
             raise ValueError(f"Required environment variable {key} not set")
         return value
+    
+    def _get_queue_name(self, service_name):
+        """Get queue name for any service using its queue_name configuration"""
+        if service_name in self.service_definitions:
+            return self.service_definitions[service_name].get('queue_name', service_name)
+        else:
+            # For services not in config (like consensus, bbox_merge), use service name
+            return service_name
     
     def setup_logging(self):
         """Setup logging for this worker"""
@@ -147,7 +155,7 @@ class BaseWorker:
                 
                 self.channel.basic_publish(
                     exchange='',
-                    routing_key='queue_consensus',
+                    routing_key=self._get_queue_name('consensus'),
                     body=json.dumps(consensus_message),
                     properties=pika.BasicProperties(delivery_mode=2)
                 )
@@ -172,7 +180,7 @@ class BaseWorker:
                 
                 self.channel.basic_publish(
                     exchange='',
-                    routing_key='queue_caption_score',
+                    routing_key=self._get_queue_name('caption_score'),
                     body=json.dumps(caption_score_message),
                     properties=pika.BasicProperties(delivery_mode=2)
                 )
@@ -210,8 +218,8 @@ class BaseWorker:
             # Declare queues
             self.channel.queue_declare(queue=self.queue_name, durable=True)
             if self.enable_triggers:
-                self.channel.queue_declare(queue='queue_bbox_merge', durable=True)
-                self.channel.queue_declare(queue='queue_consensus', durable=True)
+                self.channel.queue_declare(queue=self._get_queue_name('bbox_merge'), durable=True)
+                self.channel.queue_declare(queue=self._get_queue_name('consensus'), durable=True)
             
             self.channel.basic_qos(prefetch_count=self.worker_prefetch_count)
             self.logger.info(f"Connected to RabbitMQ at {self.queue_host}")
@@ -254,7 +262,7 @@ class BaseWorker:
                 
                 self.channel.basic_publish(
                     exchange='',
-                    routing_key='queue_bbox_merge',
+                    routing_key=self._get_queue_name('bbox_merge'),
                     body=json.dumps(bbox_message),
                     properties=pika.BasicProperties(delivery_mode=2)
                 )

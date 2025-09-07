@@ -41,6 +41,10 @@ class BoundingBoxMergerWorker:
         if not load_dotenv():
             raise ValueError("Could not load .env file")
         
+        # Load service definitions
+        with open('service_config.json', 'r') as f:
+            self.service_definitions = json.load(f)['services']
+        
         # Database configuration
         self.db_host = self._get_required('DB_HOST')
         self.db_name = self._get_required('DB_NAME')
@@ -51,14 +55,14 @@ class BoundingBoxMergerWorker:
         self.worker_id = os.getenv('WORKER_ID', f'bbox_merger_{int(time.time())}')
         
         # Queue configuration
-        self.queue_name = os.getenv('BBOX_QUEUE_NAME', 'queue_bbox_merge')
+        self.queue_name = self._get_queue_name('postprocessing_merge')
         self.queue_host = self._get_required('QUEUE_HOST')
         self.queue_user = self._get_required('QUEUE_USER')
         self.queue_password = self._get_required('QUEUE_PASSWORD')
         # Removed downstream_queue - using new postprocessing dispatch instead
         
-        # Bounding box services to harmonize
-        self.bbox_services = ['yolov8', 'rtdetr', 'detectron2', 'xception', 'clip']
+        # Bounding box services to harmonize - get from service config
+        self.bbox_services = self._get_bbox_services_from_config()
         
         
         # Logging
@@ -77,6 +81,34 @@ class BoundingBoxMergerWorker:
         if not value:
             raise ValueError(f"Required environment variable {key} not set")
         return value
+    
+    def _get_bbox_services_from_config(self):
+        """Get services that produce bounding boxes from service config"""
+        bbox_services = []
+        
+        for service_name, config in self.service_definitions.items():
+            service_type = config.get('service_type', '')
+            category = config.get('category', '')
+            
+            # Parse comma-separated service types
+            service_types = [t.strip() for t in service_type.split(',')]
+            
+            # Include services that have spatial type (produce bboxes) and are primary category
+            if 'spatial' in service_types and category == 'primary':
+                bbox_services.append(service_name)
+        
+        if not bbox_services:
+            raise ValueError("No bbox services found in service config")
+            
+        return sorted(bbox_services)
+    
+    def _get_queue_name(self, service_name):
+        """Get queue name for any service using its queue_name configuration"""
+        if service_name in self.service_definitions:
+            return self.service_definitions[service_name].get('queue_name', service_name)
+        else:
+            # For services not in config (like bbox_merge), use service name
+            return service_name
         
     def setup_logging(self):
         """Configure logging"""
@@ -183,9 +215,9 @@ class BoundingBoxMergerWorker:
             # Removed old downstream queue
             
             # Declare bbox postprocessing queues
-            self.queue_channel.queue_declare(queue='queue_bbox_colors', durable=True)
-            self.queue_channel.queue_declare(queue='queue_bbox_face', durable=True)
-            self.queue_channel.queue_declare(queue='queue_bbox_pose', durable=True)
+            self.queue_channel.queue_declare(queue='postprocessing_colors', durable=True)
+            self.queue_channel.queue_declare(queue='postprocessing_face', durable=True)
+            self.queue_channel.queue_declare(queue='postprocessing_pose', durable=True)
             
             # Set prefetch count for fair distribution
             self.queue_channel.basic_qos(prefetch_count=1)
@@ -242,12 +274,12 @@ class BoundingBoxMergerWorker:
                     }
                     
                     # Always dispatch colors
-                    self.publish_bbox_message('queue_bbox_colors', base_message)
+                    self.publish_bbox_message('postprocessing_colors', base_message)
                     
                     # Dispatch face/pose for person boxes
                     if self.is_person_box(instance):
-                        self.publish_bbox_message('queue_bbox_face', base_message)
-                        self.publish_bbox_message('queue_bbox_pose', base_message)
+                        self.publish_bbox_message('postprocessing_face', base_message)
+                        self.publish_bbox_message('postprocessing_pose', base_message)
                     
         except Exception as e:
             self.logger.error(f"Error in dispatch_bbox_postprocessing: {e}")

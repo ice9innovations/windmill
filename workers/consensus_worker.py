@@ -40,7 +40,12 @@ class ConsensusWorker:
         self.worker_id = os.getenv('WORKER_ID', f'consensus_worker_{int(time.time())}')
         
         # Queue configuration
-        self.queue_name = os.getenv('CONSENSUS_QUEUE_NAME', 'queue_consensus')
+        # Load service definitions to get queue name
+        with open('service_config.json', 'r') as f:
+            service_definitions = json.load(f)['services']
+        
+        # Get queue name from config
+        self.queue_name = service_definitions['postprocessing_consensus']['queue_name']
         self.queue_host = self._get_required('QUEUE_HOST')
         self.queue_user = self._get_required('QUEUE_USER')
         self.queue_password = self._get_required('QUEUE_PASSWORD')
