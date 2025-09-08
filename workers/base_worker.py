@@ -237,11 +237,24 @@ class BaseWorker:
             )
             self.channel = self.connection.channel()
             
-            # Declare queues
-            self.channel.queue_declare(queue=self.queue_name, durable=True)
+            # Declare queues with DLQ/TTL policy
+            def declare_with_dlq(channel, queue_name):
+                dlq_name = f"{queue_name}.dlq"
+                # Declare DLQ first
+                channel.queue_declare(queue=dlq_name, durable=True)
+                # Declare main queue with dead letter exchange routing to DLQ and a sane per-message TTL
+                args = {
+                    'x-dead-letter-exchange': '',
+                    'x-dead-letter-routing-key': dlq_name,
+                    'x-message-ttl': int(os.getenv('QUEUE_MESSAGE_TTL_MS', '120000')),  # 2 minutes default
+                    'x-max-length': int(os.getenv('QUEUE_MAX_LENGTH', '100000'))
+                }
+                channel.queue_declare(queue=queue_name, durable=True, arguments=args)
+            
+            declare_with_dlq(self.channel, self.queue_name)
             if self.enable_triggers:
-                self.channel.queue_declare(queue=self._get_queue_by_service_type('harmonization'), durable=True)
-                self.channel.queue_declare(queue=self._get_queue_by_service_type('consensus'), durable=True)
+                declare_with_dlq(self.channel, self._get_queue_by_service_type('harmonization'))
+                declare_with_dlq(self.channel, self._get_queue_by_service_type('consensus'))
             
             self.channel.basic_qos(prefetch_count=self.worker_prefetch_count)
             self.logger.info(f"Connected to RabbitMQ at {self.queue_host}")

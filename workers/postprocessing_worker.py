@@ -76,7 +76,7 @@ class PostProcessingWorker(BaseWorker):
             """, (
                 merged_box_id, 
                 image_id, 
-                self.service_name, 
+                self._get_clean_service_name(),
                 json.dumps(result_data) if result_data else json.dumps({}),
                 'success',
                 datetime.now()

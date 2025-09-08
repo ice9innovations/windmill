@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bounding Box Merger Worker - Harmonizes bbox results from yolo, rtdetr, detectron2
+Harmony Worker - Harmonizes bbox results from yolo, rtdetr, detectron2
 Triggers immediately after each bbox service completes for continuous harmonization
 """
 import os
@@ -33,7 +33,7 @@ def normalize_person_emoji(emoji):
         return 'person'  # Group all person types under neutral 'person' key
     return normalized
 
-class BoundingBoxMergerWorker(BaseWorker):
+class HarmonyWorker(BaseWorker):
     """Continuous bounding box harmonization worker"""
     
     def __init__(self):
@@ -126,8 +126,19 @@ class BoundingBoxMergerWorker(BaseWorker):
             )
             self.queue_channel = self.queue_connection.channel()
             
-            # Declare queues (create if they don't exist)
-            self.queue_channel.queue_declare(queue=self.queue_name, durable=True)
+            # Declare queues (create if they don't exist) with DLQ/TTL
+            def declare_with_dlq(channel, queue_name):
+                dlq_name = f"{queue_name}.dlq"
+                channel.queue_declare(queue=dlq_name, durable=True)
+                args = {
+                    'x-dead-letter-exchange': '',
+                    'x-dead-letter-routing-key': dlq_name,
+                    'x-message-ttl': int(os.getenv('QUEUE_MESSAGE_TTL_MS', '120000')),
+                    'x-max-length': int(os.getenv('QUEUE_MAX_LENGTH', '100000'))
+                }
+                channel.queue_declare(queue=queue_name, durable=True, arguments=args)
+
+            declare_with_dlq(self.queue_channel, self.queue_name)
             # Removed old downstream queue
             
             # Declare bbox postprocessing queues - read from config
@@ -135,9 +146,9 @@ class BoundingBoxMergerWorker(BaseWorker):
             face_queue = self._get_queue_name('postprocessing.face')
             pose_queue = self._get_queue_name('postprocessing.pose')
             
-            self.queue_channel.queue_declare(queue=colors_queue, durable=True)
-            self.queue_channel.queue_declare(queue=face_queue, durable=True)
-            self.queue_channel.queue_declare(queue=pose_queue, durable=True)
+            declare_with_dlq(self.queue_channel, colors_queue)
+            declare_with_dlq(self.queue_channel, face_queue)
+            declare_with_dlq(self.queue_channel, pose_queue)
             
             # Store queue names for later use
             self.postprocessing_queues = {
@@ -285,7 +296,7 @@ class BoundingBoxMergerWorker(BaseWorker):
             image_filename = message.get('image_filename', f'image_{image_id}')
             image_data = message.get('image_data')  # Base64 encoded image data
             
-            # Process the bbox merge for this image
+            # Process the harmony merge for this image
             result = self.update_merged_boxes_for_image(image_id, image_filename, image_data)
             
             if result['success']:
@@ -295,14 +306,14 @@ class BoundingBoxMergerWorker(BaseWorker):
                     completion_message = {
                         'image_id': image_id,
                         'image_filename': image_filename,
-                        'service': 'bbox_merger',
+                        'service': 'harmony',
                         'worker_id': self.worker_id,
                         'processed_at': datetime.now().isoformat()
                     }
                     # Old downstream publishing removed - using new postprocessing dispatch
-                    self.logger.info(f"Successfully processed bbox merge for {image_filename}, postprocessing dispatched")
+                    self.logger.info(f"Successfully processed harmony for {image_filename}, postprocessing dispatched")
                 else:
-                    self.logger.info(f"Successfully processed bbox merge for {image_filename}, no merged boxes to enrich")
+                    self.logger.info(f"Successfully processed harmony for {image_filename}, no merged boxes to enrich")
                 
                 # Trigger consensus after harmony completes
                 self.trigger_consensus(image_id, message)
@@ -313,7 +324,7 @@ class BoundingBoxMergerWorker(BaseWorker):
             else:
                 # Reject and requeue for retry
                 ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-                self.logger.error(f"Failed to process bbox merge for {image_filename}, requeuing")
+                self.logger.error(f"Failed to process harmony for {image_filename}, requeuing")
                 
         except Exception as e:
             self.logger.error(f"Error processing queue message: {e}")
@@ -752,7 +763,7 @@ class BoundingBoxMergerWorker(BaseWorker):
     
     def run(self):
         """Main entry point - pure queue-based processing"""
-        self.logger.info(f"Starting bbox merger worker in QUEUE MODE ({self.worker_id})")
+        self.logger.info(f"Starting harmony worker in QUEUE MODE ({self.worker_id})")
         self.logger.info(f"Queue: {self.queue_name} → postprocessing queues")
         
         if not self.connect_to_database():
@@ -767,12 +778,12 @@ class BoundingBoxMergerWorker(BaseWorker):
             on_message_callback=self.process_queue_message
         )
         
-        self.logger.info("Waiting for bbox merge messages. Press CTRL+C to exit")
+        self.logger.info("Waiting for harmony messages. Press CTRL+C to exit")
         
         try:
             self.queue_channel.start_consuming()
         except KeyboardInterrupt:
-            self.logger.info("Stopping bbox merger worker...")
+            self.logger.info("Stopping harmony worker...")
             self.queue_channel.stop_consuming()
         finally:
             self.cleanup_connections()
@@ -789,7 +800,7 @@ class BoundingBoxMergerWorker(BaseWorker):
         if self.queue_connection and not self.queue_connection.is_closed:
             self.queue_connection.close()
         
-        self.logger.info("Bbox merger worker stopped")
+        self.logger.info("Harmony worker stopped")
     
 
 def main():
@@ -802,7 +813,7 @@ def main():
         print(f"Configuration error: {e}")
         return 1
     except Exception as e:
-        print(f"Bbox merger worker error: {e}")
+        print(f"Harmony worker error: {e}")
         return 1
 
 if __name__ == "__main__":
