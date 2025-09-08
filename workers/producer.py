@@ -92,7 +92,12 @@ class GenericProducer:
             self.connection = pika.BlockingConnection(
                 pika.ConnectionParameters(
                     host=self.config.queue_host,
-                    credentials=credentials
+                    credentials=credentials,
+                    heartbeat=60,
+                    blocked_connection_timeout=300,
+                    connection_attempts=10,
+                    retry_delay=5,
+                    socket_timeout=10
                 )
             )
             self.channel = self.connection.channel()

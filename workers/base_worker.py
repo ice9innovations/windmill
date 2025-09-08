@@ -236,7 +236,15 @@ class BaseWorker:
         try:
             credentials = pika.PlainCredentials(self.queue_user, self.queue_password)
             self.connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host=self.queue_host, credentials=credentials)
+                pika.ConnectionParameters(
+                    host=self.queue_host,
+                    credentials=credentials,
+                    heartbeat=60,
+                    blocked_connection_timeout=300,
+                    connection_attempts=10,
+                    retry_delay=5,
+                    socket_timeout=10
+                )
             )
             self.channel = self.connection.channel()
             
@@ -350,20 +358,40 @@ class BaseWorker:
         if not self.connect_to_queue():
             sys.exit(1)
         
-        # Start consuming
-        self.channel.basic_consume(
-            queue=self.queue_name,
-            on_message_callback=self.process_message
-        )
+        # Start consuming with reconnect loop
+        while True:
+            try:
+                self.channel.basic_consume(
+                    queue=self.queue_name,
+                    on_message_callback=self.process_message
+                )
+                self.logger.info("Waiting for messages. Press CTRL+C to exit")
+                self.channel.start_consuming()
+            except KeyboardInterrupt:
+                self.logger.info("Stopping worker...")
+                try:
+                    self.channel.stop_consuming()
+                except Exception:
+                    pass
+                try:
+                    self.connection.close()
+                except Exception:
+                    pass
+                break
+            except (pika.exceptions.AMQPConnectionError, pika.exceptions.StreamLostError, pika.exceptions.ChannelClosedByBroker) as e:
+                self.logger.warning(f"Queue connection lost/recovered needed: {e}. Reconnecting...")
+                time.sleep(self.retry_delay)
+                if not self.connect_to_queue():
+                    self.logger.warning("Reconnect failed, retrying...")
+                    time.sleep(self.retry_delay)
+                    continue
+            finally:
+                if self.db_conn and self.db_conn.closed:
+                    try:
+                        self.connect_to_database()
+                    except Exception:
+                        pass
         
-        self.logger.info("Waiting for messages. Press CTRL+C to exit")
-        try:
-            self.channel.start_consuming()
-        except KeyboardInterrupt:
-            self.logger.info("Stopping worker...")
-            self.channel.stop_consuming()
-            self.connection.close()
-        finally:
-            if self.db_conn:
-                self.db_conn.close()
-            self.logger.info(f"{self.service_name} worker stopped")
+        if self.db_conn:
+            self.db_conn.close()
+        self.logger.info(f"{self.service_name} worker stopped")
