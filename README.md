@@ -27,8 +27,8 @@ This approach is **fault-tolerant** (works if services fail) and **performance-o
 ## Architecture Components
 
 ### 1. Message Queue Infrastructure
-- **RabbitMQ** on k2.local (192.168.0.122)
-- **PostgreSQL** on k1.local (192.168.0.121)
+- **RabbitMQ** 
+- **PostgreSQL** 
 - **Queue-per-service** pattern (`queue_colors`, `queue_yolov8`, etc.)
 
 ### 2. Core Workers
@@ -38,9 +38,9 @@ This approach is **fault-tolerant** (works if services fail) and **performance-o
 - **BaseWorker inheritance** (`base_worker.py`) provides shared database, queue, and HTTP functionality
 - **Service-specific classes** extend BaseWorker with minimal service-specific logic
 
-#### Bounding Box Merger (`bbox_merger_worker.py`) 
+#### Bounding Box Harmonizer (`harmony_worker.py`) 
 - **Purpose**: Harmonize bbox results from yolov8, rtdetr, detectron2
-- **Trigger**: Queue-based processing via `queue_bbox_merge`
+- **Trigger**: Queue-based processing via `queue_harmony`
 - **Algorithm**: Cross-service IoU clustering with democratic filtering  
 - **Output**: Harmonized bounding boxes stored in `merged_boxes` table
 - **Dispatch**: Crops bounding boxes and dispatches to postprocessing queues
@@ -143,27 +143,14 @@ DB_PASSWORD=your_secure_db_password
 
 ### 1. Submit Jobs - Complete ML Pipeline
 ```bash
-# Process 100K images through all PRIMARY services (excludes face/pose - they run via postprocessing)
-python producer.py --services all --limit 100000
+# Submit jobs to all PRIMARY services (safe default)
+./producer.sh --limit 100000
 
-# Process through all services including spatial_only (face/pose)
-python producer.py --services full_catalog --limit 100000
-
-# Submit jobs to specific services for testing
-python producer.py --services blip,clip,colors,yolov8 --limit 1000
-
-# Process specific image group
-python producer.py --services all --group coco2017 --limit 10000
-
-# List all available services and categories
-python producer.py --list-services
+# Process a specific image group
+./producer.sh --group coco2017 --limit 10000
 ```
 
-**Service Categories:**
-- **`all`/`primary`**: Main ML services that process whole images (excludes face/pose)
-- **`spatial_only`**: Face/pose services (handled by postprocessing workers, not for direct submission)
-- **`full_catalog`**: All services including spatial_only (use with caution)
-- **Custom list**: Comma-separated service names for targeted testing
+Note: Selecting individual services has been intentionally removed to prevent data inconsistencies. The producer now targets the primary, safe set by design.
 
 ### 2. Worker Management
 ```bash
@@ -190,7 +177,7 @@ python producer.py --list-services
 
 **Available Workers (Dynamically Detected):**
 - **ML Service Workers**: blip, clip, colors, detectron2, xception, metadata, nsfw2, ocr, ollama, rtdetr, yolov8, yolo_365, yolo_oi7
-- **Processing Workers**: bbox_merger (harmonization), consensus (voting), caption_score
+- **Processing Workers**: harmony (harmonization), consensus (voting), caption_score
 - **Postprocessing Workers**: bbox_colors, bbox_face, bbox_pose (spatial analysis)
 
 **Note**: The `windmill.sh` script automatically detects all available worker files and can start/stop/reset individual workers or all workers. ML service workers will only start successfully if the corresponding services are running on their configured ports.
@@ -242,7 +229,7 @@ SELECT COUNT(*) as total_enrichments FROM postprocessing;
                      ↓
 2. All Primary Results → PostgreSQL results table
                      ↓  
-3. Bbox Services → queue_bbox_merge → bbox_merger_worker → merged_boxes table
+3. Bbox Services → queue_harmony → harmony_worker → merged_boxes table
                      ↓ (Crops bboxes and dispatches to postprocessing queues)
 4. ALL Services → queue_consensus → consensus_worker → consensus table (V3 Voting Algorithm)
                      ↓
@@ -266,23 +253,18 @@ SELECT COUNT(*) as total_enrichments FROM postprocessing;
 - **Resource usage**: GPU services can run on dedicated hardware
 - **Storage**: ~1KB per result, ~10KB per merged box, ~5KB per enrichment
 
+## Deployment
+
+See INSTALLATION.md for a setup guide (RabbitMQ/PostgreSQL anywhere, single‑machine or split infra).
+
 ## Deployment Patterns
 
 ### Single Machine Development
 ```bash
 # Terminal 1: Start ML services (blip:7777, clip:7788, yolov8:7773, face:7772, etc.)
-# Terminal 2: ./windmill.sh start bbox_merger consensus
+# Terminal 2: ./windmill.sh start harmony consensus
 # Terminal 3: ./windmill.sh start blip clip colors yolov8
 # Terminal 4: ./windmill.sh start bbox_colors bbox_face bbox_pose
-```
-
-### Pi Cluster Production
-```bash
-# k1.local (Pi with storage): PostgreSQL + consensus_worker  
-# k2.local (Pi with SSD): RabbitMQ + bbox_merger_worker
-# k3.local (Pi with GPU): yolov8/rtdetr services + workers
-# k4.local (Pi with NPU): face/pose services + postprocessing workers
-# Main box: Primary ML services + workers
 ```
 
 ### Cloud Scaling
@@ -297,7 +279,7 @@ SELECT COUNT(*) as total_enrichments FROM postprocessing;
 **Worker stops processing:**
 ```bash
 # Check queue has jobs
-curl -u animal_farm:your_secure_queue_password http://192.168.0.122:15672/api/queues
+curl -u animal_farm:your_secure_queue_password [server]:15672/api/queues
 
 # Check service is responding  
 curl http://localhost:7770/analyze
@@ -330,3 +312,53 @@ watch 'psql -c "SELECT COUNT(*) FROM results"'
 # Worker logs
 tail -f /var/log/animal-farm/workers.log
 ```
+
+### Dead Letter Queues (DLQ)
+
+All queues are created with a paired DLQ and sane defaults (TTL/max length). Each queue `X` has a dead-letter queue `X.dlq`.
+
+Inspect DLQs via RabbitMQ UI (Queues tab) or CLI:
+```bash
+# List DLQs quickly via utility
+QUEUE_HOST=... QUEUE_USER=... QUEUE_PASSWORD=... \
+python utils/list_dlqs.py
+```
+
+Requeue items from a DLQ back to the original queue:
+- Recommended: Use the RabbitMQ UI (Queues → <queue>.dlq → Get messages → Requeue to original)
+- Or use the utility script:
+
+```bash
+QUEUE_HOST=... QUEUE_USER=... QUEUE_PASSWORD=... \
+python utils/requeue_from_dlq.py queue_harmony --limit 500
+```
+
+Notes:
+- DLQs accumulate messages that exceeded retries/TTL or were negatively acknowledged repeatedly.
+- Investigate root-cause via worker logs before mass requeueing.
+
+#### Using RabbitMQ Web UI
+
+1) Inspect DLQs
+- Go to Queues → filter for `.dlq` queues → click a DLQ
+- Check “Messages” panel for total, ready/unacked, and rates
+
+2) Peek messages
+- In the DLQ page, click “Get messages”, set a small count (e.g., 10)
+- Ack mode:
+  - “Ack & remove” to drain samples
+  - “Requeue” puts them back into the same DLQ (not original queue)
+
+3) Purge a DLQ
+- DLQ page → “Purge Messages” (deletes all messages in the DLQ)
+
+4) Bulk requeue DLQ → original queue (UI shovel)
+- Enable shovels (one-time on the RabbitMQ host):
+  ```bash
+  rabbitmq-plugins enable rabbitmq_shovel rabbitmq_shovel_management
+  ```
+- UI → Admin → Shovels → Add new:
+  - Source: Queue = <queue>.dlq
+  - Destination: Queue = <queue>
+  - Prefetch = 100 (example), “Delete when” = idle
+  - Create; it will drain DLQ to the original queue and self-delete when idle
