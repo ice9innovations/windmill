@@ -20,14 +20,13 @@ import io
 class ProducerConfig:
     """Load producer configuration"""
     
-    def __init__(self, env_file='.env'):
+    def __init__(self, env_file='../.env'):
         # Load .env file (optional for producer)
         load_dotenv(env_file)
         
         # Load service configuration using new YAML loader
-        sys.path.append('workers')
         from service_config import get_service_config
-        self.config = get_service_config()
+        self.config = get_service_config('../service_config.yaml')
         
         # Queue configuration
         self.queue_host = self._get_required('QUEUE_HOST')
@@ -123,10 +122,22 @@ class GenericProducer:
         """Create queues for the specified services"""
         created_queues = []
         
+        # Helper to declare a queue with DLQ/TTL args matching workers
+        def declare_with_dlq(channel, queue_name):
+            dlq_name = f"{queue_name}.dlq"
+            channel.queue_declare(queue=dlq_name, durable=True)
+            args = {
+                'x-dead-letter-exchange': '',
+                'x-dead-letter-routing-key': dlq_name,
+                'x-message-ttl': int(os.getenv('QUEUE_MESSAGE_TTL_MS', '120000')),
+                'x-max-length': int(os.getenv('QUEUE_MAX_LENGTH', '100000'))
+            }
+            channel.queue_declare(queue=queue_name, durable=True, arguments=args)
+
         for service_name in service_names:
             try:
                 queue_name = self.config.get_queue_name(service_name)
-                self.channel.queue_declare(queue=queue_name, durable=True)
+                declare_with_dlq(self.channel, queue_name)
                 created_queues.append(queue_name)
                 
             except ValueError as e:
