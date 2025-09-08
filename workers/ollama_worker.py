@@ -12,7 +12,7 @@ class OllamaWorker(BaseWorker):
     """Worker for ollama ML service"""
     
     def __init__(self):
-        super().__init__('primary.ollama')
+        super().__init__('ollama')
 
 if __name__ == "__main__":
     worker = OllamaWorker()

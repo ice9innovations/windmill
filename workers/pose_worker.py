@@ -15,7 +15,7 @@ class BboxPoseWorker(PostProcessingWorker):
     """Worker for pose estimation on cropped person bounding boxes"""
     
     def __init__(self):
-        super().__init__('postprocessing.pose')
+        super().__init__('pose')
     
     def process_service(self, cropped_image_data):
         """Process pose estimation on cropped image"""

@@ -12,7 +12,7 @@ class Yolo_oi7Worker(BaseWorker):
     """Worker for YOLOv8 Open Images v7 detection service"""
     
     def __init__(self):
-        super().__init__('primary.yolo_oi7')
+        super().__init__('yolo_oi7')
 
 if __name__ == "__main__":
     worker = Yolo_oi7Worker()

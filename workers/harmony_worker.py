@@ -29,7 +29,7 @@ def normalize_emoji(emoji):
 def normalize_person_emoji(emoji):
     """Group person emojis together using 'person' as the canonical grouping key"""
     normalized = normalize_emoji(emoji)
-    if normalized in ['🧑', '👩']:
+    if normalized in ['🧑', '👩', '🧒']:
         return 'person'  # Group all person types under neutral 'person' key
     return normalized
 
@@ -38,7 +38,7 @@ class BoundingBoxMergerWorker(BaseWorker):
     
     def __init__(self):
         # Initialize with harmony service type
-        super().__init__('system.harmony')
+        super().__init__('harmony')
         
         # Bounding box services to harmonize - use new array notation
         self.bbox_services = self.config.get_service_group('primary.spatial[]')

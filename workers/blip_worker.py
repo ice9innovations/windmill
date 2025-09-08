@@ -12,7 +12,7 @@ class BlipWorker(BaseWorker):
     """Worker for BLIP image captioning service"""
     
     def __init__(self):
-        super().__init__('primary.blip')
+        super().__init__('blip')
 
 if __name__ == "__main__":
     worker = BlipWorker()

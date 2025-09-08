@@ -12,7 +12,7 @@ class Yolov8Worker(BaseWorker):
     """Worker for yolov8 ML service"""
     
     def __init__(self):
-        super().__init__('primary.yolo_v8')
+        super().__init__('yolo_v8')
 
 if __name__ == "__main__":
     worker = Yolov8Worker()

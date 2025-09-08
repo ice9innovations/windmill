@@ -12,7 +12,7 @@ class OcrWorker(BaseWorker):
     """Worker for ocr ML service"""
     
     def __init__(self):
-        super().__init__('primary.ocr')
+        super().__init__('ocr')
 
 if __name__ == "__main__":
     worker = OcrWorker()
