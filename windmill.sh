@@ -171,9 +171,14 @@ case "$ACTION" in
     start)
         if [ -n "$2" ]; then
             # Start individual worker: ./windmill.sh start blip
-            echo "🚀 Starting $2..."
-            mkdir -p logs
-            start_worker "$2"
+            if [ "$2" = "all" ]; then
+                echo "🚀 Starting all workers..."
+                start_all
+            else
+                echo "🚀 Starting $2..."
+                mkdir -p logs
+                start_worker "$2"
+            fi
         else
             # Start all workers
             start_all
@@ -182,8 +187,13 @@ case "$ACTION" in
     stop)
         if [ -n "$2" ]; then
             # Stop individual worker: ./windmill.sh stop blip
-            echo "🛑 Stopping $2..."
-            stop_worker "$2"
+            if [ "$2" = "all" ]; then
+                echo "🛑 Stopping all workers..."
+                stop_all
+            else
+                echo "🛑 Stopping $2..."
+                stop_worker "$2"
+            fi
         else
             # Stop all workers
             stop_all
@@ -192,12 +202,21 @@ case "$ACTION" in
     restart)
         if [ -n "$2" ]; then
             # Restart individual worker: ./windmill.sh restart ollama
-            echo "🔄 Restarting $2..."
-            stop_worker "$2"
-            sleep 1
-            start_worker "$2"
-            echo ""
-            status_all
+            if [ "$2" = "all" ]; then
+                echo "🔄 Restarting all workers..."
+                stop_all
+                sleep 2
+                start_all
+                echo ""
+                status_all
+            else
+                echo "🔄 Restarting $2..."
+                stop_worker "$2"
+                sleep 1
+                start_worker "$2"
+                echo ""
+                status_all
+            fi
         else
             # Restart all workers
             echo "🔄 Restarting all workers..."

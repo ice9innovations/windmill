@@ -1,0 +1,54 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${QUEUE_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${QUEUE_PASSWORD:-guest}
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: ${DB_NAME:-windmill}
+      POSTGRES_USER: ${DB_USER:-windmill}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-windmill}
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-windmill}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+
+  windmill:
+    build: .
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      QUEUE_HOST: rabbitmq
+      QUEUE_USER: ${QUEUE_USER:-guest}
+      QUEUE_PASSWORD: ${QUEUE_PASSWORD:-guest}
+      DB_HOST: postgres
+      DB_NAME: ${DB_NAME:-windmill}
+      DB_USER: ${DB_USER:-windmill}
+      DB_PASSWORD: ${DB_PASSWORD:-windmill}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - .:/app
+
+volumes:
+  dbdata:
+
+
