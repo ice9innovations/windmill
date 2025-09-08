@@ -211,6 +211,9 @@ class HarmonyWorker(BaseWorker):
                         'bbox': merged_bbox,
                         'cropped_image_data': cropped_image_data.decode('latin-1')  # Encode bytes for JSON
                     }
+                    # Propagate trace_id if present on harmony input
+                    if hasattr(self, 'current_trace_id') and self.current_trace_id:
+                        base_message['trace_id'] = self.current_trace_id
                     
                     # Always dispatch colors
                     self.publish_bbox_message(self.postprocessing_queues['colors'], base_message)
@@ -289,6 +292,8 @@ class HarmonyWorker(BaseWorker):
         try:
             # Parse message
             message = json.loads(body)
+            # Capture trace_id for propagation to postprocessing
+            self.current_trace_id = message.get('trace_id')
             self.logger.debug(f"Processing queue message: {message}")
             
             # Extract image info
@@ -806,7 +811,7 @@ class HarmonyWorker(BaseWorker):
 def main():
     """Main entry point"""
     try:
-        worker = BoundingBoxMergerWorker()
+        worker = HarmonyWorker()
         return worker.run()
         
     except ValueError as e:

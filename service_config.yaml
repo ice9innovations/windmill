@@ -152,3 +152,4 @@ services:
       queue_name: harmony
       category: infrastructure
       service_type: harmonization
+      prefetch: 2  # conservative concurrency for DB-bound harmony

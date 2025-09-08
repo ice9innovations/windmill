@@ -4,6 +4,7 @@ Generic Queue Producer - Submit jobs to multiple service queues
 Configurable producer that can send images to any combination of ML services
 """
 import os
+import uuid
 import sys
 import json
 import time
@@ -307,6 +308,8 @@ class GenericProducer:
                 continue
                 
             processed_images += 1
+            # Create a trace id for this image's batch of jobs
+            trace_id = str(uuid.uuid4())
             jobs_this_image = 0
             
             # Submit jobs for this image to all services
@@ -316,6 +319,7 @@ class GenericProducer:
                     
                     # Add service-specific metadata to job
                     job_data = image_data.copy()
+                    job_data['trace_id'] = trace_id
                     job_data['service_name'] = service_name
                     job_data['queue_name'] = queue_name
                     

@@ -62,7 +62,10 @@ class BaseWorker:
         
         # Worker configuration
         self.worker_id = f"worker_{self.service_name}_{int(time.time())}"
-        self.worker_prefetch_count = int(os.getenv('WORKER_PREFETCH_COUNT', '1'))
+        # Optional per-service prefetch override from YAML; fallback to env; default 1
+        self.worker_prefetch_count = int(
+            service_def.get('prefetch', os.getenv('WORKER_PREFETCH_COUNT', '1'))
+        )
         self.request_timeout = int(os.getenv('REQUEST_TIMEOUT', '30'))
         self.max_retries = int(os.getenv('MAX_RETRIES', '3'))
         self.retry_delay = int(os.getenv('RETRY_DELAY', '5'))
@@ -270,8 +273,12 @@ class BaseWorker:
             # Parse message
             message = json.loads(body)
             image_id = message['image_id']
+            trace_id = message.get('trace_id')
             
-            self.logger.debug(f"Processing {self.service_name} request for image {image_id}")
+            if trace_id:
+                self.logger.debug(f"[{trace_id}] Processing {self.service_name} request for image {image_id}")
+            else:
+                self.logger.debug(f"Processing {self.service_name} request for image {image_id}")
             
             # Call ML service
             result = self.post_image_data(message['image_data'])
@@ -296,6 +303,7 @@ class BaseWorker:
                     'image_id': image_id,
                     'image_filename': message.get('image_filename', f'image_{image_id}'),
                     'image_data': message['image_data'],  # Pass through base64 image data
+                    'trace_id': trace_id,
                     'service': self.service_name,
                     'worker_id': self.worker_id,
                     'processed_at': datetime.now().isoformat()
