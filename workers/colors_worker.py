@@ -12,7 +12,7 @@ class ColorsWorker(BaseWorker):
     """Worker for colors ML service"""
     
     def __init__(self):
-        super().__init__('colors')
+        super().__init__('primary.colors')
 
 if __name__ == "__main__":
     worker = ColorsWorker()

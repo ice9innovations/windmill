@@ -27,7 +27,7 @@ class ConsensusWorker(BaseWorker):
     
     def __init__(self):
         # Initialize with consensus service type
-        super().__init__('consensus')
+        super().__init__('system.consensus')
         
         
         

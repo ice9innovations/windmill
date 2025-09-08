@@ -19,7 +19,7 @@ class CaptionScoreWorker(BaseWorker):
     
     def __init__(self):
         # Initialize with caption score service type
-        super().__init__('caption_score')
+        super().__init__('postprocessing.caption_score')
         
         # CLIP score service configuration - find by service_type
         caption_score_services = self.config.get_service_group('postprocessing.caption_score[]')

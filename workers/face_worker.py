@@ -15,7 +15,7 @@ class BboxFaceWorker(PostProcessingWorker):
     """Worker for face detection on cropped person bounding boxes"""
     
     def __init__(self):
-        super().__init__('face')
+        super().__init__('postprocessing.face')
     
     def process_service(self, cropped_image_data):
         """Process face detection on cropped image"""

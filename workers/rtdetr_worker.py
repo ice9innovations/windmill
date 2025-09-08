@@ -12,7 +12,7 @@ class RtdetrWorker(BaseWorker):
     """Worker for rtdetr ML service"""
     
     def __init__(self):
-        super().__init__('rtdetr')
+        super().__init__('primary.rtdetr')
 
 if __name__ == "__main__":
     worker = RtdetrWorker()

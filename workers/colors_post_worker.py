@@ -15,7 +15,7 @@ class BboxColorsWorker(PostProcessingWorker):
     """Worker for color analysis on cropped bounding boxes"""
     
     def __init__(self):
-        super().__init__('colors')
+        super().__init__('postprocessing.colors')
     
     def process_service(self, cropped_image_data):
         """Process color analysis on cropped image"""
