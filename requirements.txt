@@ -1,11 +1,8 @@
 # Windmill ML Pipeline Dependencies
-# Core infrastructure
 pika>=1.3.0           # RabbitMQ message queue client
 psycopg2>=2.9.0; sys_platform == "darwin"           # PostgreSQL client (Mac source build)
 psycopg2-binary>=2.9.0; sys_platform != "darwin"      # PostgreSQL client (Linux binary)
 python-dotenv>=1.0.0  # Environment variable loading
 requests>=2.31.0      # HTTP client for ML service calls
 PyYAML>=6.0           # YAML configuration file parsing
-
-# Image processing (only needed for bbox_merger and postprocessing workers)
 Pillow>=10.0.0        # PIL/Pillow for image manipulation and cropping
