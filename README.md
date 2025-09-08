@@ -257,6 +257,8 @@ SELECT COUNT(*) as total_enrichments FROM postprocessing;
 
 See INSTALLATION.md for a setup guide (RabbitMQ/PostgreSQL anywhere, single‑machine or split infra).
 
+See RUNBOOK.md for operations (restart order, DLQ triage, reprocessing).
+
 ## Deployment Patterns
 
 ### Single Machine Development
