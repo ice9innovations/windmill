@@ -130,9 +130,11 @@ class GenericProducer:
             args = {
                 'x-dead-letter-exchange': '',
                 'x-dead-letter-routing-key': dlq_name,
-                'x-message-ttl': int(os.getenv('QUEUE_MESSAGE_TTL_MS', '120000')),
                 'x-max-length': int(os.getenv('QUEUE_MAX_LENGTH', '100000'))
             }
+            ttl_env = os.getenv('QUEUE_MESSAGE_TTL_MS')
+            if ttl_env and ttl_env.isdigit() and int(ttl_env) > 0:
+                args['x-message-ttl'] = int(ttl_env)
             channel.queue_declare(queue=queue_name, durable=True, arguments=args)
 
         for service_name in service_names:

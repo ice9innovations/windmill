@@ -126,16 +126,18 @@ class HarmonyWorker(BaseWorker):
             )
             self.queue_channel = self.queue_connection.channel()
             
-            # Declare queues (create if they don't exist) with DLQ/TTL
+            # Declare queues (create if they don't exist) with DLQ (TTL optional)
             def declare_with_dlq(channel, queue_name):
                 dlq_name = f"{queue_name}.dlq"
                 channel.queue_declare(queue=dlq_name, durable=True)
                 args = {
                     'x-dead-letter-exchange': '',
                     'x-dead-letter-routing-key': dlq_name,
-                    'x-message-ttl': int(os.getenv('QUEUE_MESSAGE_TTL_MS', '120000')),
                     'x-max-length': int(os.getenv('QUEUE_MAX_LENGTH', '100000'))
                 }
+                ttl_env = os.getenv('QUEUE_MESSAGE_TTL_MS')
+                if ttl_env and ttl_env.isdigit() and int(ttl_env) > 0:
+                    args['x-message-ttl'] = int(ttl_env)
                 channel.queue_declare(queue=queue_name, durable=True, arguments=args)
 
             declare_with_dlq(self.queue_channel, self.queue_name)

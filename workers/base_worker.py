@@ -240,18 +240,20 @@ class BaseWorker:
             )
             self.channel = self.connection.channel()
             
-            # Declare queues with DLQ/TTL policy
+            # Declare queues with DLQ (TTL optional/opt-in)
             def declare_with_dlq(channel, queue_name):
                 dlq_name = f"{queue_name}.dlq"
                 # Declare DLQ first
                 channel.queue_declare(queue=dlq_name, durable=True)
-                # Declare main queue with dead letter exchange routing to DLQ and a sane per-message TTL
+                # Declare main queue with dead letter exchange routing to DLQ
                 args = {
                     'x-dead-letter-exchange': '',
                     'x-dead-letter-routing-key': dlq_name,
-                    'x-message-ttl': int(os.getenv('QUEUE_MESSAGE_TTL_MS', '120000')),  # 2 minutes default
                     'x-max-length': int(os.getenv('QUEUE_MAX_LENGTH', '100000'))
                 }
+                ttl_env = os.getenv('QUEUE_MESSAGE_TTL_MS')
+                if ttl_env and ttl_env.isdigit() and int(ttl_env) > 0:
+                    args['x-message-ttl'] = int(ttl_env)
                 channel.queue_declare(queue=queue_name, durable=True, arguments=args)
             
             declare_with_dlq(self.channel, self.queue_name)
