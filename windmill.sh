@@ -112,7 +112,19 @@ stop_worker() {
             ;;
     esac
     
-    if pkill -f "$worker_file" 2>/dev/null; then
+    local pids=$(pgrep -f "$worker_file")
+    if [ -n "$pids" ]; then
+        echo "  Killing PIDs: $pids"
+        kill -9 $pids  # Force kill immediately - no more Mr. Nice Guy
+        sleep 2        # Give more time for cleanup
+        
+        # Verify everything is actually dead
+        local remaining=$(pgrep -f "$worker_file")
+        if [ -n "$remaining" ]; then
+            echo "  ERROR: Process $remaining still alive after SIGKILL!"
+            kill -9 $remaining  # Try again
+            sleep 1
+        fi
         echo "✅ Stopped $worker"
         return 0
     else
