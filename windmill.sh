@@ -102,13 +102,12 @@ stop_worker() {
             worker_file="workers/pose_worker.py"
             ;;
         *)
-            # For service workers, try the standard pattern first
+            # For service workers, use the standard pattern
             if [ -f "workers/${worker}_worker.py" ]; then
                 worker_file="workers/${worker}_worker.py"
-            elif [ -f "workers/${worker}.py" ]; then
-                worker_file="workers/${worker}.py"
             else
-                worker_file="workers/${worker}.py"  # fallback
+                echo "❌ ERROR: Unknown worker '$worker'"
+                return 1
             fi
             ;;
     esac
@@ -147,11 +146,12 @@ start_worker() {
             worker_file="workers/pose_worker.py"
             ;;
         *)
-            # For service workers, try the standard pattern first
+            # For service workers, use the standard pattern
             if [ -f "workers/${worker}_worker.py" ]; then
                 worker_file="workers/${worker}_worker.py"
-            elif [ -f "workers/${worker}.py" ]; then
-                worker_file="workers/${worker}.py"
+            else
+                echo "❌ ERROR: Unknown worker '$worker'"
+                return 1
             fi
             ;;
     esac

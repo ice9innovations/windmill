@@ -131,6 +131,10 @@ class HarmonyWorker(BaseWorker):
             )
             self.queue_channel = self.queue_connection.channel()
             
+            # Also set BaseWorker's expected connection variables for trigger_consensus()
+            self.connection = self.queue_connection
+            self.channel = self.queue_channel
+            
             # Declare queues (create if they don't exist) with DLQ (TTL optional)
             def declare_with_dlq(channel, queue_name):
                 dlq_name = f"{queue_name}.dlq"
@@ -279,6 +283,9 @@ class HarmonyWorker(BaseWorker):
             if not self.queue_channel or self.queue_connection.is_closed:
                 self.logger.warning("RabbitMQ queue connection lost, reconnecting...")
                 self.connect_to_queue()
+                # Update BaseWorker variables after reconnection
+                self.connection = self.queue_connection
+                self.channel = self.queue_channel
             
             self.queue_channel.basic_publish(
                 exchange='',

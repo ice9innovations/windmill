@@ -162,7 +162,9 @@ class BaseWorker:
                 # Check if connection is healthy
                 if not self.channel or self.connection.is_closed:
                     self.logger.warning("RabbitMQ connection lost, reconnecting...")
-                    self.connect_to_queue()
+                    if not self.connect_to_queue():
+                        self.logger.error("Failed to reconnect to RabbitMQ for consensus message")
+                        raise Exception("RabbitMQ reconnection failed")
                 
                 consensus_message = {
                     'image_id': image_id,
@@ -192,7 +194,9 @@ class BaseWorker:
                 # Check if connection is healthy
                 if not self.channel or self.connection.is_closed:
                     self.logger.warning("RabbitMQ connection lost, reconnecting...")
-                    self.connect_to_queue()
+                    if not self.connect_to_queue():
+                        self.logger.error("Failed to reconnect to RabbitMQ for consensus message")
+                        raise Exception("RabbitMQ reconnection failed")
                 
                 caption_score_message = {
                     'image_id': image_id,
@@ -307,7 +311,9 @@ class BaseWorker:
                 # Check if connection is healthy
                 if not self.channel or self.connection.is_closed:
                     self.logger.warning("RabbitMQ connection lost, reconnecting...")
-                    self.connect_to_queue()
+                    if not self.connect_to_queue():
+                        self.logger.error("Failed to reconnect to RabbitMQ for consensus message")
+                        raise Exception("RabbitMQ reconnection failed")
                 
                 bbox_message = {
                     'image_id': image_id,
