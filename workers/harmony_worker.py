@@ -17,6 +17,11 @@ import requests
 from datetime import datetime
 from base_worker import BaseWorker
 from PIL import Image
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+THRESHOLD = .4
+AREA_THRESHOLD = 0.8
 
 def normalize_emoji(emoji):
     """Remove variation selectors and other invisible modifiers from emoji"""
@@ -27,10 +32,10 @@ def normalize_emoji(emoji):
     return re.sub(r'[\uFE00-\uFE0F\u180B-\u180D\u200D]', '', emoji)
 
 def normalize_person_emoji(emoji):
-    """Group person emojis together using 'person' as the canonical grouping key"""
+    """Group person emojis together using neutral person emoji as the canonical grouping key"""
     normalized = normalize_emoji(emoji)
     if normalized in ['🧑', '👩']:
-        return 'person'  # Group all person types under neutral 'person' key
+        return '🧑'  # Group all person types under neutral person emoji
     return normalized
 
 class HarmonyWorker(BaseWorker):
@@ -226,8 +231,14 @@ class HarmonyWorker(BaseWorker):
                     if hasattr(self, 'current_trace_id') and self.current_trace_id:
                         base_message['trace_id'] = self.current_trace_id
                     
-                    # Always dispatch colors
-                    self.publish_bbox_message(self.postprocessing_queues['colors'], base_message)
+                    # Dispatch colors only for boxes >= 24x24 pixels (filter out tiny icons)
+                    width = merged_bbox.get('width', 0)
+                    height = merged_bbox.get('height', 0)
+                    if width >= 24 and height >= 24:
+                        self.publish_bbox_message(self.postprocessing_queues['colors'], base_message)
+                        self.logger.debug(f"Dispatched colors for {width}x{height} box")
+                    else:
+                        self.logger.debug(f"Skipped colors for {width}x{height} box (too small)")
                     
                     # Dispatch face/pose for person boxes
                     if self.is_person_box(instance):
@@ -451,130 +462,240 @@ class HarmonyWorker(BaseWorker):
             'grouped_objects': grouped_objects,
             'source_services': list(set(r[0] for r in bbox_results)),
             'total_detections': len(all_detections),
-            'harmonization_algorithm': 'cross_service_clustering_v1',
+            'harmonization_algorithm': 'greedy_many_to_one_v2',
             'source_result_ids': source_result_ids
         }
         
         return harmonized_data
     
     def group_by_label_with_cross_service_clustering(self, detections):
-        """Simplified version of BoundingBoxService clustering logic"""
+        """Greedy many-to-one detection assignment for multi-service consensus"""
+        if not detections:
+            self.logger.info("Hungarian: No detections provided")
+            return {}
+        
+        try:
+            # Discover potential objects through initial spatial clustering
+            potential_objects = self.discover_potential_objects(detections)
+            
+            if not potential_objects:
+                self.logger.warning(f"Greedy: No potential objects discovered from {len(detections)} detections")
+                return {}
+            
+            # Build assignments using greedy many-to-one approach  
+            assignments = self.solve_greedy_assignment(detections, potential_objects)
+            
+            if not assignments:
+                self.logger.warning(f"Greedy: No valid assignments from {len(potential_objects)} objects and {len(detections)} detections")
+                return {}
+            
+            # Build final groups from assignments
+            result = self.build_groups_from_assignments(detections, potential_objects, assignments)
+            self.logger.info(f"Greedy: Successfully processed {len(detections)} detections → {len(result)} groups")
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Greedy assignment algorithm failed: {e}")
+            # Fall back to empty result rather than crashing
+            return {}
+    
+    def discover_potential_objects(self, detections):
+        """Discover potential objects through coarse spatial clustering"""
+        # Group detections into spatial clusters using generous overlap threshold
+        clusters = []
+        used = set()
+        
+        self.logger.info(f"DEBUG: Starting clustering with {len(detections)} detections")
+        for i, det in enumerate(detections):
+            self.logger.info(f"DEBUG: Detection {i}: {det['service']} -> {det['emoji']} at {det['bbox']}")
+        
+        for i, detection in enumerate(detections):
+            if i in used:
+                continue
+                
+            cluster = [detection]
+            used.add(i)
+            
+            # Find all detections that overlap with this one
+            for j, other_detection in enumerate(detections[i+1:], i+1):
+                if j in used:
+                    continue
+                    
+                # Only cluster detections with the same emoji (same object type)
+                emoji1 = normalize_person_emoji(detection['emoji'])
+                emoji2 = normalize_person_emoji(other_detection['emoji'])
+                
+                if emoji1 == emoji2:
+                    # Same object type - check spatial overlap AND area similarity
+                    overlap = self.calculate_overlap_ratio(detection['bbox'], other_detection['bbox'])
+                    
+                    # Calculate area similarity ratio
+                    area1 = detection['bbox']['width'] * detection['bbox']['height']
+                    area2 = other_detection['bbox']['width'] * other_detection['bbox']['height']
+                    area_ratio = min(area1, area2) / max(area1, area2) if max(area1, area2) > 0 else 0
+                    
+                    self.logger.info(f"DEBUG: Same emoji {emoji1}, overlap = {overlap:.3f}, area_ratio = {area_ratio:.3f}")
+                    
+                    # Cluster only if both overlap AND area similarity are high (same object from multiple services)
+                    if overlap > THRESHOLD and area_ratio > AREA_THRESHOLD:
+                        cluster.append(other_detection)
+                        used.add(j)
+                        self.logger.info(f"DEBUG: Added to same-emoji cluster (overlap={overlap:.3f}, area_ratio={area_ratio:.3f})")
+                    else:
+                        self.logger.info(f"DEBUG: Not clustering - insufficient overlap ({overlap:.3f}) or area similarity ({area_ratio:.3f})")
+                else:
+                    self.logger.info(f"DEBUG: Different emojis {emoji1} vs {emoji2} - not clustering")
+            
+            if cluster:
+                clusters.append(cluster)
+                self.logger.info(f"DEBUG: Created cluster with {len(cluster)} detections: {[d['emoji'] for d in cluster]}")
+        
+        # Convert clusters to potential objects
+        potential_objects = []
+        for i, cluster in enumerate(clusters):
+            # Calculate cluster centroid and representative properties
+            potential_object = {
+                'id': i,
+                'representative_bbox': self.calculate_cluster_bbox(cluster),
+                'candidate_emojis': list(set(normalize_person_emoji(d['emoji']) for d in cluster)),
+                'cluster_detections': cluster
+            }
+            potential_objects.append(potential_object)
+            self.logger.info(f"DEBUG: Potential object {i}: emojis={potential_object['candidate_emojis']}, services={[d['service'] for d in cluster]}")
+        
+        self.logger.debug(f"Discovered {len(potential_objects)} potential objects from {len(detections)} detections")
+        return potential_objects
+    
+    def calculate_cluster_bbox(self, cluster):
+        """Calculate bounding box that encompasses all detections in cluster"""
+        if not cluster:
+            return {}
+        
+        if len(cluster) == 1:
+            return cluster[0]['bbox']
+            
+        boxes = [d['bbox'] for d in cluster]
+        x1 = min(b['x'] for b in boxes)
+        y1 = min(b['y'] for b in boxes)
+        x2 = max(b['x'] + b['width'] for b in boxes)
+        y2 = max(b['y'] + b['height'] for b in boxes)
+        
+        return {
+            'x': x1,
+            'y': y1,
+            'width': x2 - x1,
+            'height': y2 - y1
+        }
+    
+    def solve_greedy_assignment(self, detections, potential_objects):
+        """Solve many-to-one assignment using greedy approach (replaces Hungarian)"""
+        assignments = []
+        
+        # For each detection, assign it to the best matching object
+        for det_idx, detection in enumerate(detections):
+            best_cost = float('inf')
+            best_obj_idx = None
+            
+            # Find the object with lowest cost for this detection
+            for obj_idx, obj in enumerate(potential_objects):
+                cost = self.calculate_assignment_cost(detection, obj)
+                
+                # Accept assignment if cost is reasonable (good spatial overlap + emoji match)
+                if cost < 1.0:  # Spatial cost < 1.0 means some overlap, semantic cost adds 0.5 max
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_obj_idx = obj_idx
+            
+            # Assign detection to best object if found
+            if best_obj_idx is not None:
+                assignments.append((det_idx, best_obj_idx, best_cost))
+                self.logger.debug(f"Assigned detection {det_idx} ({detection['service']}:{detection['emoji']}) to object {best_obj_idx} (cost: {best_cost:.3f})")
+        
+        self.logger.debug(f"Greedy assignment: {len(assignments)} assignments from {len(detections)} detections")
+        return assignments
+    
+    def calculate_assignment_cost(self, detection, potential_object):
+        """Calculate cost of assigning detection to potential object"""
+        # Spatial cost (primary factor)
+        spatial_cost = 1.0 - self.calculate_overlap_ratio(detection['bbox'], potential_object['representative_bbox'])
+        
+        # Semantic cost (emoji disagreement penalty)
+        semantic_cost = 0.0
+        normalized_detection_emoji = normalize_person_emoji(detection['emoji'])
+        if normalized_detection_emoji not in potential_object['candidate_emojis']:
+            semantic_cost = 0.5
+        
+        return spatial_cost + semantic_cost
+    
+    def build_groups_from_assignments(self, detections, potential_objects, assignments):
+        """Build final groups from Hungarian algorithm assignments"""
         groups = {}
         
-        # Step 1: Group by emoji (the canonical identifier)
-        for detection in detections:
-            # Normalize emoji and treat 🧑/👩 as the same group
-            key = normalize_person_emoji(detection['emoji'])
-            if key not in groups:
-                groups[key] = {
-                    'label': detection['label'],
-                    'emoji': detection['emoji'],
-                    'type': detection['type'],
+        # Group assignments by object
+        object_assignments = {}
+        for det_idx, obj_idx, cost in assignments:
+            if obj_idx not in object_assignments:
+                object_assignments[obj_idx] = []
+            object_assignments[obj_idx].append((det_idx, cost))
+        
+        # Build groups
+        for obj_idx, det_assignments in object_assignments.items():
+            potential_object = potential_objects[obj_idx]
+            assigned_detections = [detections[det_idx] for det_idx, _ in det_assignments]
+            
+            # Choose primary emoji (most frequent in assignments)
+            emoji_counts = {}
+            for detection in assigned_detections:
+                emoji = normalize_person_emoji(detection['emoji'])
+                emoji_counts[emoji] = emoji_counts.get(emoji, 0) + 1
+            
+            primary_emoji = max(emoji_counts.keys(), key=emoji_counts.get)
+            
+            # Create group
+            if primary_emoji not in groups:
+                groups[primary_emoji] = {
+                    'label': assigned_detections[0]['label'],
+                    'emoji': primary_emoji,
+                    'type': assigned_detections[0]['type'],
                     'detections': [],
                     'instances': []
                 }
-            groups[key]['detections'].append(detection)
-        
-        # Step 2: Create cross-service instances for each group
-        for group_key, group in groups.items():
-            if group['detections']:
-                group['instances'] = self.create_cross_service_instances(
-                    group['detections'], 
-                    group['emoji']
-                )
+            
+            # Add detections to group
+            groups[primary_emoji]['detections'].extend(assigned_detections)
+            
+            # Create instance
+            instance = self.create_instance_from_assignments(assigned_detections, primary_emoji, obj_idx)
+            groups[primary_emoji]['instances'].append(instance)
         
         return groups
     
-    def create_cross_service_instances(self, detections, emoji):
-        """Create instances with cross-service clustering"""
-        if not detections:
-            return []
+    def create_instance_from_assignments(self, assigned_detections, primary_emoji, object_id):
+        """Create instance from assigned detections"""
+        # Clean assignments (remove same-service duplicates)
+        cleaned_detections = self.clean_cluster(assigned_detections)
         
-        # Find clusters of overlapping detections
-        clusters = self.find_cross_service_clusters(detections)
-        instances = []
+        # Calculate merged bounding box
+        merged_bbox = self.calculate_cluster_bbox(cleaned_detections)
         
-        for i, cluster in enumerate(clusters):
-            # Clean cluster (remove duplicates, filter weak detections)
-            cleaned_cluster = self.clean_cluster(cluster)
-            if not cleaned_cluster:
-                continue
-            
-            # Calculate merged bounding box
-            if len(cleaned_cluster) == 1:
-                merged_bbox = cleaned_cluster[0]['bbox']
-            else:
-                boxes = [d['bbox'] for d in cleaned_cluster]
-                x1 = min(b['x'] for b in boxes)
-                y1 = min(b['y'] for b in boxes)
-                x2 = max(b['x'] + b['width'] for b in boxes)
-                y2 = max(b['y'] + b['height'] for b in boxes)
-                
-                merged_bbox = {
-                    'x': x1,
-                    'y': y1,
-                    'width': x2 - x1,
-                    'height': y2 - y1
-                }
-            
-            # Create instance
-            services = list(set(d['service'] for d in cleaned_cluster))
-            avg_confidence = sum(d['confidence'] for d in cleaned_cluster) / len(cleaned_cluster)
-            
-            instance = {
-                'cluster_id': f"{cleaned_cluster[0]['emoji']}_{i+1}",
-                'emoji': emoji,
-                'labels': list(set(d['label'] for d in cleaned_cluster)),
-                'merged_bbox': merged_bbox,
-                'detection_count': len(cleaned_cluster),
-                'avg_confidence': round(avg_confidence, 3),
-                'contributing_services': services,
-                'detections': [{'service': d['service'], 'confidence': d['confidence']} 
-                             for d in cleaned_cluster]
-            }
-            instances.append(instance)
+        # Calculate metrics
+        services = list(set(d['service'] for d in cleaned_detections))
+        avg_confidence = sum(d['confidence'] for d in cleaned_detections) / len(cleaned_detections)
         
-        return instances
-    
-    def find_cross_service_clusters(self, detections):
-        """Find clusters using IoU overlap with proper transitive clustering via Union-Find"""
-        if not detections:
-            return []
+        instance = {
+            'cluster_id': f"{primary_emoji}_{object_id}",
+            'emoji': primary_emoji,
+            'labels': list(set(d['label'] for d in cleaned_detections)),
+            'merged_bbox': merged_bbox,
+            'detection_count': len(cleaned_detections),
+            'avg_confidence': round(avg_confidence, 3),
+            'contributing_services': services,
+            'detections': [{'service': d['service'], 'confidence': d['confidence']} 
+                         for d in cleaned_detections],
+            'assignment_method': 'hungarian_algorithm'
+        }
         
-        n = len(detections)
-        parent = list(range(n))  # Union-Find parent array
-        
-        def find(x):
-            if parent[x] != x:
-                parent[x] = find(parent[x])  # Path compression
-            return parent[x]
-        
-        def union(x, y):
-            px, py = find(x), find(y)
-            if px != py:
-                parent[px] = py
-                self.logger.debug(f"Clustering: Union {detections[x]['service']} {detections[x]['emoji']} with {detections[y]['service']} {detections[y]['emoji']}")
-        
-        # Build overlap graph using Union-Find
-        unions_made = 0
-        for i in range(n):
-            for j in range(i + 1, n):
-                # Hybrid approach: IoU for similar sizes, containment for different sizes
-                should_merge = self.should_merge_boxes(detections[i]['bbox'], detections[j]['bbox'])
-                if should_merge:
-                    union(i, j)
-                    unions_made += 1
-        
-        # Group detections by their root parent
-        cluster_map = {}
-        for i in range(n):
-            root = find(i)
-            if root not in cluster_map:
-                cluster_map[root] = []
-            cluster_map[root].append(detections[i])
-        
-        self.logger.debug(f"Clustering: {n} detections → {len(cluster_map)} clusters ({unions_made} unions made)")
-        return list(cluster_map.values())
+        return instance
     
     def clean_cluster(self, cluster):
         """Remove same-service duplicates"""
@@ -727,8 +848,6 @@ class HarmonyWorker(BaseWorker):
                         ))
                         merged_box_count += 1
                 
-                # Commit the transaction
-                self.db_conn.commit()
                 cursor.close()
                 
                 services = merged_data['source_services']
@@ -752,6 +871,9 @@ class HarmonyWorker(BaseWorker):
                         except:
                             pass
                         return {'success': False, 'merged_boxes_created': False}
+                
+                # Commit the transaction only after successful postprocessing dispatch
+                self.db_conn.commit()
                 
                 if attempt > 0:
                     self.logger.info(f"Successfully processed {image_filename} after {attempt + 1} attempts")
