@@ -174,8 +174,11 @@ start_worker() {
         return 1
     fi
     
+    # Extract actual worker name from file path for consistent logging
+    local log_name=$(basename "$worker_file" ".py")
+    
     echo "  Starting $worker..."
-    nohup python $worker_file > logs/${worker}.log 2>&1 &
+    nohup python $worker_file > logs/${log_name}.log 2>&1 &
     echo "✅ Started $worker"
 }
 
