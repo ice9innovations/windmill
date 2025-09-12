@@ -17,8 +17,6 @@ import requests
 from datetime import datetime
 from base_worker import BaseWorker
 from PIL import Image
-import numpy as np
-from scipy.optimize import linear_sum_assignment
 
 THRESHOLD = .05  # Reduced from 0.1 for better small object clustering
 AREA_THRESHOLD = 0.6  # Reduced from 0.7 for more flexible area matching
