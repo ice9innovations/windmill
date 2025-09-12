@@ -22,7 +22,7 @@ services:
       host: localhost
       port: 7788
       endpoint: /v3/analyze
-      service_type: spatial,classification # some services can be in multiple categories 
+      service_type: classification # some services can be in multiple categories 
 
     colors:
       queue_name: colors
@@ -152,4 +152,4 @@ services:
       queue_name: harmony
       category: infrastructure
       service_type: harmonization
-      prefetch: 2  # conservative concurrency for DB-bound harmony
+      # prefetch: 1  # default; keep single in-flight message per worker
