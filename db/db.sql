@@ -82,11 +82,11 @@ CREATE INDEX idx_consensus_image_created ON consensus(image_id, consensus_create
 ALTER TABLE consensus ADD CONSTRAINT consensus_image_id_fkey 
     FOREIGN KEY (image_id) REFERENCES images(image_id);
 
--- Postprocessing table: Postprocessing results on cropped bbox regions
+-- Postprocessing table: Postprocessing results on cropped bbox regions and image-level analysis
 CREATE TABLE postprocessing (
     post_id BIGSERIAL PRIMARY KEY,
     image_id BIGINT NOT NULL,
-    merged_box_id BIGINT,
+    merged_box_id BIGINT,  -- NULL for image-level analysis (e.g. caption scoring)
     service VARCHAR(255) NOT NULL,
     data JSONB NOT NULL,
     status VARCHAR(20) NOT NULL,
