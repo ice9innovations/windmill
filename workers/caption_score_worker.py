@@ -26,8 +26,10 @@ class CaptionScoreWorker(BaseWorker):
         service_config = self.config.get_service_config(caption_score_services[0])
         self.clip_score_url = f"http://{service_config['host']}:{service_config['port']}{service_config['endpoint']}"
         
-        # Services that trigger caption scoring
-        self.trigger_services = self.config.get_service_group('primary.semantic[]')
+        # Services that trigger caption scoring - use actual service names from database
+        semantic_services = self.config.get_service_group('primary.semantic[]')
+        # Extract just the service names (blip, ollama) from hierarchical names (primary.blip, primary.ollama)
+        self.trigger_services = [service.split('.')[-1] for service in semantic_services]
         
         # Caption score worker needs separate read connection for queries
         self.read_db_conn = None
@@ -264,8 +266,9 @@ class CaptionScoreWorker(BaseWorker):
                 ch.basic_ack(delivery_tag=method.delivery_tag)
                 return
             
-            # Get caption from the specific service that triggered this
-            caption_data = self.get_service_caption(image_id, service_name)
+            # Get caption from the specific service that triggered this - extract just service name from hierarchical name
+            actual_service_name = service_name.split('.')[-1]  # primary.blip -> blip
+            caption_data = self.get_service_caption(image_id, actual_service_name)
             
             if not caption_data:
                 self.logger.debug(f"No caption found from {service_name} for {image_filename}")
@@ -278,27 +281,29 @@ class CaptionScoreWorker(BaseWorker):
             
             similarity_score = self.score_caption_against_image(image_data, caption)
             
-            if similarity_score is not None:
-                caption_score = {
-                    'service': service,
-                    'caption': caption,
-                    'original_confidence': caption_data['original_confidence'],
-                    'similarity_score': similarity_score,
-                    'scored_at': datetime.now().isoformat()
-                }
-                
-                self.logger.info(f"{service} caption score: {similarity_score:.3f} for '{caption[:50]}...'")
-                
-                # Save individual caption score
-                if self.save_individual_caption_score(image_id, caption_score):
-                    self.logger.info(f"Saved caption score for {service}: {image_filename}")
-                else:
-                    self.logger.error(f"Failed to save caption score for {service}: {image_filename}")
-            else:
-                self.logger.warning(f"Failed to score caption from {service} for {image_filename}")
+            if similarity_score is None:
+                self.logger.error(f"CLIP service failed to score caption from {service} for {image_filename}")
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                return
             
-            # Acknowledge the message
-            ch.basic_ack(delivery_tag=method.delivery_tag)
+            caption_score = {
+                'service': service,
+                'caption': caption,
+                'original_confidence': caption_data['original_confidence'],
+                'similarity_score': similarity_score,
+                'scored_at': datetime.now().isoformat()
+            }
+            
+            self.logger.info(f"{service} caption score: {similarity_score:.3f} for '{caption[:50]}...'")
+            
+            # Save individual caption score - only acknowledge if database save succeeds
+            if self.save_individual_caption_score(image_id, caption_score):
+                self.logger.info(f"Saved caption score for {service}: {image_filename}")
+                # Only acknowledge message when EVERYTHING succeeds
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+            else:
+                self.logger.error(f"Database save failed for {service}: {image_filename}")
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
             
         except Exception as e:
             self.logger.error(f"Error processing queue message: {e}")
