@@ -20,8 +20,9 @@ from PIL import Image
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-THRESHOLD = .4
-AREA_THRESHOLD = 0.8
+THRESHOLD = .05  # Reduced from 0.1 for better small object clustering
+AREA_THRESHOLD = 0.6  # Reduced from 0.7 for more flexible area matching
+MINIMUM_CONFIDENCE = 0.51  # Filter out boxes with max confidence below this threshold
 
 def normalize_emoji(emoji):
     """Remove variation selectors and other invisible modifiers from emoji"""
@@ -49,6 +50,11 @@ class HarmonyWorker(BaseWorker):
         self.bbox_services = self.config.get_service_group('primary.spatial[]')
         # Get clean service names for database queries (remove category prefix)
         self.clean_bbox_services = [service.split('.', 1)[1] if '.' in service else service for service in self.bbox_services]
+        
+        # Harmony configuration
+        self.use_highest_confidence_bbox = os.getenv('HARMONY_USE_HIGHEST_CONFIDENCE', 'false').lower() == 'true'
+        bbox_method = "highest-confidence selection" if self.use_highest_confidence_bbox else "union encompassing"
+        self.logger.info(f"Using bbox harmonization method: {bbox_method}")
         
         # Harmony worker needs separate read connection for queries
         self.read_db_conn = None
@@ -450,7 +456,9 @@ class HarmonyWorker(BaseWorker):
         # Apply BoundingBoxService harmonization logic
         grouped_objects = self.group_by_label_with_cross_service_clustering(all_detections)
         
-        self.logger.info(f"Grouped {len(all_detections)} detections into {len(grouped_objects)} object groups")
+        # Count total instances for logging
+        total_instances = sum(len(group_data.get('instances', [])) for group_data in grouped_objects.values())
+        self.logger.info(f"Grouped {len(all_detections)} detections into {len(grouped_objects)} object groups ({total_instances} instances after confidence filtering >= {MINIMUM_CONFIDENCE})")
         
         # Package harmonized results  
         if not grouped_objects:
@@ -534,15 +542,46 @@ class HarmonyWorker(BaseWorker):
                     area2 = other_detection['bbox']['width'] * other_detection['bbox']['height']
                     area_ratio = min(area1, area2) / max(area1, area2) if max(area1, area2) > 0 else 0
                     
-                    self.logger.info(f"DEBUG: Same emoji {emoji1}, overlap = {overlap:.3f}, area_ratio = {area_ratio:.3f}")
+                    # For small objects, also check center distance
+                    max_area = max(area1, area2)
+                    is_small_object = max_area < 5000  # Pixels - threshold for small objects
+                    distance = 0
                     
-                    # Cluster only if both overlap AND area similarity are high (same object from multiple services)
+                    if is_small_object:
+                        # Calculate center-to-center distance for small objects
+                        cx1 = detection['bbox']['x'] + detection['bbox']['width'] / 2
+                        cy1 = detection['bbox']['y'] + detection['bbox']['height'] / 2
+                        cx2 = other_detection['bbox']['x'] + other_detection['bbox']['width'] / 2
+                        cy2 = other_detection['bbox']['y'] + other_detection['bbox']['height'] / 2
+                        distance = ((cx2 - cx1) ** 2 + (cy2 - cy1) ** 2) ** 0.5
+                    
+                    self.logger.info(f"DEBUG: Same emoji {emoji1}, overlap = {overlap:.3f}, area_ratio = {area_ratio:.3f}, small={is_small_object}, distance={distance:.1f}")
+                    
+                    # Check if one box contains the other (for different service scales)
+                    containment_ratio = self.calculate_containment_ratio(detection['bbox'], other_detection['bbox'])
+                    
+                    # Clustering criteria: overlap/area OR distance-based OR containment-based
+                    should_cluster = False
+                    
                     if overlap > THRESHOLD and area_ratio > AREA_THRESHOLD:
+                        # Standard overlap-based clustering
+                        should_cluster = True
+                        self.logger.info(f"DEBUG: Clustering via overlap/area")
+                    elif is_small_object and distance < 100:  # Within 100 pixels for small objects
+                        # Distance-based clustering for small objects
+                        should_cluster = True
+                        self.logger.info(f"DEBUG: Clustering small objects via distance ({distance:.1f}px)")
+                    elif containment_ratio > 0.7:  # One box is 70% contained in the other
+                        # Containment-based clustering (different scales of same object)
+                        should_cluster = True
+                        self.logger.info(f"DEBUG: Clustering via containment ({containment_ratio:.3f})")
+                    
+                    if should_cluster:
                         cluster.append(other_detection)
                         used.add(j)
-                        self.logger.info(f"DEBUG: Added to same-emoji cluster (overlap={overlap:.3f}, area_ratio={area_ratio:.3f})")
+                        self.logger.info(f"DEBUG: Added to same-emoji cluster")
                     else:
-                        self.logger.info(f"DEBUG: Not clustering - insufficient overlap ({overlap:.3f}) or area similarity ({area_ratio:.3f})")
+                        self.logger.info(f"DEBUG: Not clustering - insufficient criteria")
                 else:
                     self.logger.info(f"DEBUG: Different emojis {emoji1} vs {emoji2} - not clustering")
             
@@ -586,6 +625,18 @@ class HarmonyWorker(BaseWorker):
             'width': x2 - x1,
             'height': y2 - y1
         }
+    
+    def select_highest_confidence_bbox(self, cluster):
+        """Select the bounding box with highest confidence from cluster"""
+        if not cluster:
+            return {}
+        
+        if len(cluster) == 1:
+            return cluster[0]['bbox']
+            
+        # Find detection with highest confidence
+        best_detection = max(cluster, key=lambda d: d['confidence'])
+        return best_detection['bbox']
     
     def solve_greedy_assignment(self, detections, potential_objects):
         """Solve many-to-one assignment using greedy approach (replaces Hungarian)"""
@@ -651,6 +702,17 @@ class HarmonyWorker(BaseWorker):
             
             primary_emoji = max(emoji_counts.keys(), key=emoji_counts.get)
             
+            # Create instance using configured bbox method
+            instance = self.create_instance_from_assignments(
+                assigned_detections, primary_emoji, obj_idx, 
+                use_highest_confidence=self.use_highest_confidence_bbox
+            )
+            
+            # Apply confidence filtering - only include instances with max_confidence >= threshold
+            if instance['max_confidence'] < MINIMUM_CONFIDENCE:
+                self.logger.debug(f"Filtered out instance {instance['cluster_id']} with max_confidence {instance['max_confidence']} < {MINIMUM_CONFIDENCE}")
+                continue
+            
             # Create group
             if primary_emoji not in groups:
                 groups[primary_emoji] = {
@@ -664,23 +726,36 @@ class HarmonyWorker(BaseWorker):
             # Add detections to group
             groups[primary_emoji]['detections'].extend(assigned_detections)
             
-            # Create instance
-            instance = self.create_instance_from_assignments(assigned_detections, primary_emoji, obj_idx)
+            # Add instance to group
             groups[primary_emoji]['instances'].append(instance)
         
         return groups
     
-    def create_instance_from_assignments(self, assigned_detections, primary_emoji, object_id):
-        """Create instance from assigned detections"""
+    def create_instance_from_assignments(self, assigned_detections, primary_emoji, object_id, use_highest_confidence=False):
+        """Create instance from assigned detections
+        
+        Args:
+            assigned_detections: List of detections assigned to this instance
+            primary_emoji: Primary emoji for this instance
+            object_id: Object ID for cluster naming
+            use_highest_confidence: If True, use highest confidence bbox instead of union bbox
+        """
         # Clean assignments (remove same-service duplicates)
         cleaned_detections = self.clean_cluster(assigned_detections)
         
-        # Calculate merged bounding box
-        merged_bbox = self.calculate_cluster_bbox(cleaned_detections)
+        # Calculate merged bounding box using selected method
+        if use_highest_confidence:
+            merged_bbox = self.select_highest_confidence_bbox(cleaned_detections)
+            bbox_method = 'highest_confidence'
+        else:
+            merged_bbox = self.calculate_cluster_bbox(cleaned_detections)
+            bbox_method = 'union_encompassing'
         
         # Calculate metrics
         services = list(set(d['service'] for d in cleaned_detections))
-        avg_confidence = sum(d['confidence'] for d in cleaned_detections) / len(cleaned_detections)
+        confidences = [d['confidence'] for d in cleaned_detections]
+        avg_confidence = sum(confidences) / len(confidences)
+        max_confidence = max(confidences)  # Maximum confidence for filtering
         
         instance = {
             'cluster_id': f"{primary_emoji}_{object_id}",
@@ -689,10 +764,12 @@ class HarmonyWorker(BaseWorker):
             'merged_bbox': merged_bbox,
             'detection_count': len(cleaned_detections),
             'avg_confidence': round(avg_confidence, 3),
+            'max_confidence': round(max_confidence, 3),
             'contributing_services': services,
             'detections': [{'service': d['service'], 'confidence': d['confidence']} 
                          for d in cleaned_detections],
-            'assignment_method': 'hungarian_algorithm'
+            'assignment_method': 'greedy_assignment',
+            'bbox_merge_method': bbox_method
         }
         
         return instance
@@ -768,6 +845,24 @@ class HarmonyWorker(BaseWorker):
         
         return intersection / union if union > 0 else 0
     
+    def calculate_containment_ratio(self, box1, box2):
+        """Calculate how much one box is contained within the other"""
+        x1 = max(box1['x'], box2['x'])
+        y1 = max(box1['y'], box2['y'])
+        x2 = min(box1['x'] + box1['width'], box2['x'] + box2['width'])
+        y2 = min(box1['y'] + box1['height'], box2['y'] + box2['height'])
+        
+        if x1 >= x2 or y1 >= y2:
+            return 0  # No intersection
+        
+        intersection = (x2 - x1) * (y2 - y1)
+        area1 = box1['width'] * box1['height']
+        area2 = box2['width'] * box2['height']
+        
+        # Return the ratio of intersection to the smaller box (max containment)
+        smaller_area = min(area1, area2)
+        return intersection / smaller_area if smaller_area > 0 else 0
+    
     def update_merged_boxes_for_image(self, image_id, image_filename, image_data=None):
         """Update merged boxes for a single image using safe DELETE+INSERT pattern"""
         max_retries = 2
@@ -830,6 +925,7 @@ class HarmonyWorker(BaseWorker):
                             'merged_bbox': instance.get('merged_bbox', {}),
                             'detection_count': instance.get('detection_count', 0),
                             'avg_confidence': instance.get('avg_confidence', 0.0),
+                            'max_confidence': instance.get('max_confidence', 0.0),
                             'contributing_services': instance.get('contributing_services', []),
                             'detections': instance.get('detections', []),
                             'harmonization_algorithm': merged_data['harmonization_algorithm'],
