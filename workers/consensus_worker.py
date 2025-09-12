@@ -189,17 +189,17 @@ class ConsensusWorker(BaseWorker):
             for row in cursor.fetchall():
                 merged_data = row[2]  # JSONB data
                 
-                # Only include multi-service merged boxes (detection_count >= 2)
-                if merged_data.get('detection_count', 0) >= 2:
-                    merged_boxes.append({
-                        'merged_id': row[0],
-                        'emoji': merged_data.get('emoji'),
-                        'detection_count': merged_data.get('detection_count', 0),
-                        'avg_confidence': merged_data.get('avg_confidence', 0),
-                        'contributing_services': merged_data.get('contributing_services', []),
-                        'merged_bbox': merged_data.get('merged_bbox', {}),
-                        'labels': merged_data.get('labels', [])
-                    })
+                # Include all merged boxes (both single and multi-detection)
+                # Single detections will be validated against classification/semantic services
+                merged_boxes.append({
+                    'merged_id': row[0],
+                    'emoji': merged_data.get('emoji'),
+                    'detection_count': merged_data.get('detection_count', 0),
+                    'avg_confidence': merged_data.get('avg_confidence', 0),
+                    'contributing_services': merged_data.get('contributing_services', []),
+                    'merged_bbox': merged_data.get('merged_bbox', {}),
+                    'labels': merged_data.get('labels', [])
+                })
             
             cursor.close()
             return merged_boxes if merged_boxes else None
@@ -315,28 +315,69 @@ class ConsensusWorker(BaseWorker):
         # Extract spatial detections from merged_boxes data (harmonized bbox data)
         if bounding_box_data and isinstance(bounding_box_data, list):
             for merged_box in bounding_box_data:
-                if merged_box.get('emoji') and merged_box.get('detection_count', 0) >= 2:
-                    all_detections.append({
-                        'emoji': merged_box['emoji'],
-                        'service': 'merged_boxes',
-                        'evidence_type': 'spatial',
-                        'confidence': merged_box.get('avg_confidence', 0.75),
-                        'context': {
-                            'source': 'merged_boxes',
-                            'contributing_services': merged_box.get('contributing_services', []),
-                            'detection_count': merged_box.get('detection_count', 0)
-                        },
-                        'shiny': False,
-                        'spatial_data': {
-                            'detection_count': merged_box.get('detection_count', 0),
-                            'avg_confidence': merged_box.get('avg_confidence', 0),
-                            'contributing_services': merged_box.get('contributing_services', []),
-                            'bbox': merged_box.get('merged_bbox', {}),
-                            'labels': merged_box.get('labels', [])
-                        }
-                    })
+                if merged_box.get('emoji'):
+                    detection_count = merged_box.get('detection_count', 0)
+                    
+                    # Multi-detection boxes are always included
+                    if detection_count >= 2:
+                        include_detection = True
+                    # Single-detection boxes need validation against classification/semantic services
+                    elif detection_count == 1:
+                        include_detection = self.validate_single_detection_with_other_services(
+                            merged_box['emoji'], service_results
+                        )
+                    else:
+                        include_detection = False
+                    
+                    if include_detection:
+                        all_detections.append({
+                            'emoji': merged_box['emoji'],
+                            'service': 'merged_boxes',
+                            'evidence_type': 'spatial',
+                            'confidence': merged_box.get('avg_confidence', 0.75),
+                            'context': {
+                                'source': 'merged_boxes',
+                                'contributing_services': merged_box.get('contributing_services', []),
+                                'detection_count': detection_count,
+                                'single_detection_validated': detection_count == 1
+                            },
+                            'shiny': False,
+                            'spatial_data': {
+                                'detection_count': detection_count,
+                                'avg_confidence': merged_box.get('avg_confidence', 0),
+                                'contributing_services': merged_box.get('contributing_services', []),
+                                'bbox': merged_box.get('merged_bbox', {}),
+                                'labels': merged_box.get('labels', [])
+                            }
+                        })
 
         return all_detections
+    
+    def validate_single_detection_with_other_services(self, emoji, service_results):
+        """Check if a single spatial detection has support from classification/semantic services"""
+        for service_name, result_data in service_results.items():
+            # Check if service is classification type or semantic type using config
+            is_classification = service_name in self.config.get_services_by_type('classification')
+            is_semantic = self.config.is_semantic_service(service_name)
+            
+            if is_classification or is_semantic:
+                if self.service_supports_emoji(emoji, result_data):
+                    self.logger.info(f"Single detection {emoji} validated by {service_name}")
+                    return True
+        
+        return False
+    
+    def service_supports_emoji(self, emoji, result_data):
+        """Check if a service result includes the given emoji"""
+        try:
+            if isinstance(result_data, dict):
+                predictions = result_data.get('predictions', [])
+                for prediction in predictions:
+                    if normalize_emoji(prediction.get('emoji', '')) == normalize_emoji(emoji):
+                        return True
+        except Exception as e:
+            self.logger.debug(f"Error checking service support for emoji {emoji}: {e}")
+        return False
     
     def get_evidence_type(self, service_name):
         """Determine evidence type based on service configuration"""
@@ -382,18 +423,24 @@ class ConsensusWorker(BaseWorker):
         for emoji, detections in emoji_groups.items():
             voting_services = list(set(d['service'] for d in detections if d['service'] != 'spatial_clustering'))
             
+            # Analyze evidence first
+            spatial_evidence = self.analyze_spatial_evidence(detections, merged_boxes_data)
+            semantic_evidence = self.analyze_semantic_evidence(detections)
+            classification_evidence = self.analyze_classification_evidence(detections)
+            specialized_evidence = self.analyze_specialized_evidence(detections)
+            
             evidence_analysis = {
                 'emoji': emoji,
                 'total_votes': len(voting_services),
                 'voting_services': voting_services,
                 'detections': detections,
                 'evidence': {
-                    'spatial': self.analyze_spatial_evidence(detections, merged_boxes_data),
-                    'semantic': self.analyze_semantic_evidence(detections),
-                    'classification': self.analyze_classification_evidence(detections),
-                    'specialized': self.analyze_specialized_evidence(detections)
+                    'spatial': spatial_evidence,
+                    'semantic': semantic_evidence,
+                    'classification': classification_evidence,
+                    'specialized': specialized_evidence
                 },
-                'instances': self.extract_instance_information(detections),
+                'instances': self.extract_instance_information(detections, spatial_evidence),
                 'shiny': any(d.get('shiny', False) for d in detections)
             }
             
@@ -402,7 +449,8 @@ class ConsensusWorker(BaseWorker):
         return analysis
 
     def analyze_spatial_evidence(self, detections, merged_boxes_data=None):
-        """Analyze spatial evidence from merged_boxes table (harmonized bbox data)"""
+        """Analyze spatial evidence from merged_boxes data (which only exists if spatial services were involved)"""
+        # No merged_boxes data = no spatial evidence  
         if not merged_boxes_data:
             return None
             
@@ -411,24 +459,98 @@ class ConsensusWorker(BaseWorker):
         if not emoji:
             return None
             
-        matching_boxes = [box for box in merged_boxes_data if box.get('emoji') == emoji]
+        # Normalize emoji for consistent matching
+        normalized_emoji = normalize_emoji(emoji)
+        matching_boxes = [box for box in merged_boxes_data if normalize_emoji(box.get('emoji', '')) == normalized_emoji]
         if not matching_boxes:
             return None
         
-        # Use the harmonized spatial data from merged_boxes
+        # Verify that contributing services are actually spatial services according to config
+        valid_boxes = []
+        for box in matching_boxes:
+            contributing_services = box.get('contributing_services', [])
+            has_spatial_services = False
+            for service in contributing_services:
+                # Check if service is spatial (service names in merged_boxes are simple names like "detectron2")
+                self.logger.debug(f"Checking service: {service} -> primary.{service}")
+                if self.config.is_spatial_service(f"primary.{service}"):
+                    self.logger.debug(f"Service {service} is spatial")
+                    has_spatial_services = True
+                    break
+                else:
+                    self.logger.debug(f"Service {service} is NOT spatial")
+            if has_spatial_services:
+                valid_boxes.append(box)
+        
+        if not valid_boxes:
+            return None
+        
+        # Filter out single-service detections if multi-service instances exist for this emoji
+        # Pass detections for classification/semantic validation of single-service detections
+        filtered_boxes = self.filter_single_service_detections(valid_boxes, emoji, detections)
+        
+        if not filtered_boxes:
+            return None
+        
+        # Use the harmonized spatial data from filtered valid merged_boxes
+        confidences = [box.get('avg_confidence', 0) for box in filtered_boxes]
         return {
-            'service_count': sum(box.get('detection_count', 0) for box in matching_boxes),
+            'service_count': sum(box.get('detection_count', 0) for box in filtered_boxes),
             'clusters': [{
                 'detection_count': box.get('detection_count', 0),
                 'avg_confidence': box.get('avg_confidence', 0),
                 'contributing_services': box.get('contributing_services', []),
                 'bbox': box.get('merged_bbox', {}),
                 'labels': box.get('labels', [])
-            } for box in matching_boxes],
-            'max_detection_count': max(box.get('detection_count', 0) for box in matching_boxes),
-            'avg_confidence': sum(box.get('avg_confidence', 0) for box in matching_boxes) / len(matching_boxes),
-            'total_instances': len(matching_boxes)
+            } for box in filtered_boxes],
+            'max_detection_count': max(box.get('detection_count', 0) for box in filtered_boxes),
+            'avg_confidence': sum(confidences) / len(confidences),
+            'peak_confidence': max(confidences),
+            'total_instances': len(filtered_boxes)
         }
+
+    def filter_single_service_detections(self, valid_boxes, emoji, detections):
+        """Filter out single-service detections when multi-service instances exist for the same emoji"""
+        # Separate single-service from multi-service detections
+        multi_service_boxes = [box for box in valid_boxes if box.get('detection_count', 0) > 1]
+        single_service_boxes = [box for box in valid_boxes if box.get('detection_count', 0) == 1]
+        
+        # If there are multi-service detections, discard single-service ones for this emoji
+        if multi_service_boxes:
+            self.logger.info(f"Filtering out {len(single_service_boxes)} single-service detections for {emoji} - multi-service instances exist")
+            return multi_service_boxes
+        
+        # Only single-service detections exist - validate them against semantic/classification evidence
+        if single_service_boxes:
+            if self.validate_single_service_detections(emoji, detections):
+                self.logger.info(f"Keeping {len(single_service_boxes)} single-service detections for {emoji} - validated by semantic/classification services")
+                return valid_boxes
+            else:
+                self.logger.info(f"Filtering out {len(single_service_boxes)} single-service detections for {emoji} - no semantic/classification validation")
+                return []
+        
+        return valid_boxes
+
+    def validate_single_service_detections(self, emoji, detections):
+        """Validate single-service detections against semantic and classification evidence"""
+        # Check for semantic evidence (captioning services mentioned this emoji)
+        semantic_detections = [d for d in detections if d.get('evidence_type') == 'semantic' and d.get('emoji') == emoji]
+        has_semantic_support = len(semantic_detections) > 0
+        
+        # Check for classification evidence (classification services detected this emoji)
+        classification_detections = [d for d in detections if d.get('evidence_type') == 'classification' and d.get('emoji') == emoji]
+        has_classification_support = len(classification_detections) > 0
+        
+        if has_semantic_support:
+            self.logger.debug(f"Single-service {emoji} validated by semantic evidence from {len(semantic_detections)} services")
+            return True
+        
+        if has_classification_support:
+            self.logger.debug(f"Single-service {emoji} validated by classification evidence from {len(classification_detections)} services")
+            return True
+        
+        self.logger.debug(f"Single-service {emoji} has no semantic or classification validation")
+        return False
 
     def analyze_semantic_evidence(self, detections):
         """Analyze semantic evidence from captioning services (ported from V3VotingService.js)"""
@@ -468,17 +590,17 @@ class ConsensusWorker(BaseWorker):
         
         return by_type
 
-    def extract_instance_information(self, detections):
-        """Extract instance information (ported from V3VotingService.js)"""
-        spatial_detections = [d for d in detections if d.get('spatial_data')]
+    def extract_instance_information(self, detections, spatial_evidence=None):
+        """Extract instance information - if there's spatial evidence, it's spatial"""
+        # If there's any spatial evidence (bounding boxes), it's spatial
+        if spatial_evidence:
+            return {
+                'count': spatial_evidence.get('total_instances', 1),
+                'type': 'spatial'
+            }
         
-        if not spatial_detections:
-            return {'count': 1, 'type': 'non_spatial'}
-        
-        return {
-            'count': len(spatial_detections),
-            'type': 'spatial'
-        }
+        # No spatial evidence = non-spatial
+        return {'count': 1, 'type': 'non_spatial'}
 
     def calculate_evidence_weight(self, analysis):
         """Calculate evidence weight using consensus bonus system (ported from V3VotingService.js)"""
@@ -571,6 +693,7 @@ class ConsensusWorker(BaseWorker):
         return {
             'detection_count': spatial_evidence['max_detection_count'],
             'avg_confidence': round(spatial_evidence['avg_confidence'], 3),
+            'peak_confidence': round(spatial_evidence['peak_confidence'], 3),
             'instance_count': spatial_evidence['total_instances']
         }
 
@@ -598,6 +721,8 @@ class ConsensusWorker(BaseWorker):
         """Apply post-processing curation (ported from V3VotingService.js)"""
         # Build lookup for cross-emoji validation
         emoji_map = {item['emoji']: item for item in ranked_consensus}
+        
+        # Spatial relationships handled by harmony worker - consensus focuses on voting/scoring
         
         for item in ranked_consensus:
             curation_adjustment = 0
@@ -640,6 +765,7 @@ class ConsensusWorker(BaseWorker):
                 # Ensure we don't go negative
                 item['evidence_weight'] = max(0, item['evidence_weight'])
                 item['final_score'] = max(0, item['final_score'])
+
 
     def extract_special_detections(self, service_results):
         """Extract special detections (non-competing) (ported from V3VotingService.js)"""
