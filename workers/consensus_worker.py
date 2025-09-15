@@ -650,7 +650,10 @@ class ConsensusWorker(BaseWorker):
         
         # Sort by total votes (primary), then evidence weight (secondary)
         filtered_analysis.sort(key=lambda a: (a['total_votes'], a['evidence_weight']), reverse=True)
-        
+
+        # Resolve conflicts between overlapping spatial detections with different emojis
+        filtered_analysis = self.resolve_spatial_emoji_conflicts(filtered_analysis)
+
         # Convert to final result format
         results = []
         for analysis in filtered_analysis:
@@ -766,6 +769,147 @@ class ConsensusWorker(BaseWorker):
                 item['evidence_weight'] = max(0, item['evidence_weight'])
                 item['final_score'] = max(0, item['final_score'])
 
+    def resolve_spatial_emoji_conflicts(self, emoji_analysis):
+        """Resolve conflicts between overlapping spatial detections with different emojis"""
+        if len(emoji_analysis) <= 1:
+            return emoji_analysis
+
+        conflicts_resolved = 0
+        items_to_remove = set()
+
+        # Check each pair of emojis for spatial conflicts
+        for i, analysis1 in enumerate(emoji_analysis):
+            if i in items_to_remove:
+                continue
+
+            # Only consider emojis with spatial evidence
+            spatial1 = analysis1.get('evidence', {}).get('spatial')
+            if not spatial1:
+                continue
+
+            for j, analysis2 in enumerate(emoji_analysis[i+1:], i+1):
+                if j in items_to_remove:
+                    continue
+
+                # Only consider emojis with spatial evidence
+                spatial2 = analysis2.get('evidence', {}).get('spatial')
+                if not spatial2:
+                    continue
+
+                # Check for overlapping bounding boxes
+                if self.have_overlapping_bboxes(spatial1, spatial2):
+                    self.logger.info(f"Spatial conflict detected between {analysis1['emoji']} ({analysis1['total_votes']} votes) and {analysis2['emoji']} ({analysis2['total_votes']} votes)")
+
+                    # Determine winner based on votes, then evidence weight, then final score
+                    if analysis1['total_votes'] > analysis2['total_votes']:
+                        winner_idx, loser_idx = i, j
+                    elif analysis1['total_votes'] < analysis2['total_votes']:
+                        winner_idx, loser_idx = j, i
+                    elif analysis1['evidence_weight'] > analysis2['evidence_weight']:
+                        winner_idx, loser_idx = i, j
+                    elif analysis1['evidence_weight'] < analysis2['evidence_weight']:
+                        winner_idx, loser_idx = j, i
+                    elif analysis1['final_score'] > analysis2['final_score']:
+                        winner_idx, loser_idx = i, j
+                    else:
+                        winner_idx, loser_idx = j, i
+
+                    # Mark loser for removal
+                    items_to_remove.add(loser_idx)
+                    conflicts_resolved += 1
+
+                    winner_emoji = emoji_analysis[winner_idx]['emoji']
+                    loser_emoji = emoji_analysis[loser_idx]['emoji']
+                    self.logger.info(f"Resolved spatial conflict: {winner_emoji} beats {loser_emoji}")
+
+        # Build final list without removed items
+        resolved_analysis = []
+        for i, analysis in enumerate(emoji_analysis):
+            if i not in items_to_remove:
+                resolved_analysis.append(analysis)
+
+        if conflicts_resolved > 0:
+            self.logger.info(f"Resolved {conflicts_resolved} spatial emoji conflicts: {len(emoji_analysis)} → {len(resolved_analysis)} emojis")
+
+        return resolved_analysis
+
+    def have_overlapping_bboxes(self, spatial1, spatial2):
+        """Check if two spatial evidence objects have overlapping bounding boxes"""
+        try:
+            # Both need clusters with bounding boxes
+            clusters1 = spatial1.get('clusters', [])
+            clusters2 = spatial2.get('clusters', [])
+
+            if not clusters1 or not clusters2:
+                return False
+
+            # Check for overlap between any pair of clusters
+            for cluster1 in clusters1:
+                bbox1 = cluster1.get('bbox', {})
+                if not bbox1:
+                    continue
+
+                for cluster2 in clusters2:
+                    bbox2 = cluster2.get('bbox', {})
+                    if not bbox2:
+                        continue
+
+                    # Calculate overlap ratio
+                    overlap = self.calculate_bbox_overlap(bbox1, bbox2)
+                    containment = self.calculate_bbox_containment(bbox1, bbox2)
+
+                    # Consider overlapping if significant overlap or containment
+                    if overlap > 0.3 or containment > 0.7:
+                        return True
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"Error checking bbox overlap: {e}")
+            return False
+
+    def calculate_bbox_overlap(self, bbox1, bbox2):
+        """Calculate IoU overlap ratio between two bounding boxes"""
+        try:
+            x1 = max(bbox1['x'], bbox2['x'])
+            y1 = max(bbox1['y'], bbox2['y'])
+            x2 = min(bbox1['x'] + bbox1['width'], bbox2['x'] + bbox2['width'])
+            y2 = min(bbox1['y'] + bbox1['height'], bbox2['y'] + bbox2['height'])
+
+            if x1 >= x2 or y1 >= y2:
+                return 0  # No intersection
+
+            intersection = (x2 - x1) * (y2 - y1)
+            area1 = bbox1['width'] * bbox1['height']
+            area2 = bbox2['width'] * bbox2['height']
+            union = area1 + area2 - intersection
+
+            return intersection / union if union > 0 else 0
+
+        except Exception:
+            return 0
+
+    def calculate_bbox_containment(self, bbox1, bbox2):
+        """Calculate how much one box is contained within the other"""
+        try:
+            x1 = max(bbox1['x'], bbox2['x'])
+            y1 = max(bbox1['y'], bbox2['y'])
+            x2 = min(bbox1['x'] + bbox1['width'], bbox2['x'] + bbox2['width'])
+            y2 = min(bbox1['y'] + bbox1['height'], bbox2['y'] + bbox2['height'])
+
+            if x1 >= x2 or y1 >= y2:
+                return 0  # No intersection
+
+            intersection = (x2 - x1) * (y2 - y1)
+            area1 = bbox1['width'] * bbox1['height']
+            area2 = bbox2['width'] * bbox2['height']
+
+            # Return the ratio of intersection to the smaller box
+            smaller_area = min(area1, area2)
+            return intersection / smaller_area if smaller_area > 0 else 0
+
+        except Exception:
+            return 0
 
     def extract_special_detections(self, service_results):
         """Extract special detections (non-competing) (ported from V3VotingService.js)"""
