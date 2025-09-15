@@ -20,7 +20,7 @@ from PIL import Image
 
 THRESHOLD = .05  # Reduced from 0.1 for better small object clustering
 AREA_THRESHOLD = 0.6  # Reduced from 0.7 for more flexible area matching
-MINIMUM_CONFIDENCE = 0.51  # Filter out boxes with max confidence below this threshold
+MINIMUM_CONFIDENCE = 0.4  # Filter out boxes with max confidence below this threshold
 
 def normalize_emoji(emoji):
     """Remove variation selectors and other invisible modifiers from emoji"""
@@ -483,12 +483,12 @@ class HarmonyWorker(BaseWorker):
         try:
             # Discover potential objects through initial spatial clustering
             potential_objects = self.discover_potential_objects(detections)
-            
+
             if not potential_objects:
                 self.logger.warning(f"Greedy: No potential objects discovered from {len(detections)} detections")
                 return {}
-            
-            # Build assignments using greedy many-to-one approach  
+
+            # Build assignments using greedy many-to-one approach
             assignments = self.solve_greedy_assignment(detections, potential_objects)
             
             if not assignments:
