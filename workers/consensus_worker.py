@@ -858,8 +858,8 @@ class ConsensusWorker(BaseWorker):
                     overlap = self.calculate_bbox_overlap(bbox1, bbox2)
                     containment = self.calculate_bbox_containment(bbox1, bbox2)
 
-                    # Consider overlapping only if boxes are essentially identical
-                    if overlap > 0.9 or containment > 0.95:
+                    # Consider overlapping only if boxes are truly identical
+                    if overlap > 0.98 or containment > 0.99:
                         return True
 
             return False
