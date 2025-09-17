@@ -18,9 +18,11 @@ from datetime import datetime
 from base_worker import BaseWorker
 from PIL import Image
 
-THRESHOLD = .05  # Reduced from 0.1 for better small object clustering
-AREA_THRESHOLD = 0.6  # Reduced from 0.7 for more flexible area matching
-MINIMUM_CONFIDENCE = 0.4  # Filter out boxes with max confidence below this threshold
+THRESHOLD = .1  # Balanced for 640px images
+AREA_THRESHOLD = 0.7  # Balanced area matching for 640px
+SMALL_OBJECT_AREA = 1024  # COCO small object definition (32x32 pixels)
+SMALL_OBJECT_DISTANCE = 20  # ~3% of 640px width for small objects
+# MINIMUM_CONFIDENCE = 0.4  # Confidence filtering moved to consensus worker
 
 def normalize_emoji(emoji):
     """Remove variation selectors and other invisible modifiers from emoji"""
@@ -49,8 +51,8 @@ class HarmonyWorker(BaseWorker):
         # Get clean service names for database queries (remove category prefix)
         self.clean_bbox_services = [service.split('.', 1)[1] if '.' in service else service for service in self.bbox_services]
         
-        # Harmony configuration
-        self.use_highest_confidence_bbox = os.getenv('HARMONY_USE_HIGHEST_CONFIDENCE', 'false').lower() == 'true'
+        # Harmony configuration - using highest confidence for better mAP
+        self.use_highest_confidence_bbox = os.getenv('HARMONY_USE_HIGHEST_CONFIDENCE', 'true').lower() == 'true'
         bbox_method = "highest-confidence selection" if self.use_highest_confidence_bbox else "union encompassing"
         self.logger.info(f"Using bbox harmonization method: {bbox_method}")
         
@@ -456,7 +458,7 @@ class HarmonyWorker(BaseWorker):
         
         # Count total instances for logging
         total_instances = sum(len(group_data.get('instances', [])) for group_data in grouped_objects.values())
-        self.logger.info(f"Grouped {len(all_detections)} detections into {len(grouped_objects)} object groups ({total_instances} instances after confidence filtering >= {MINIMUM_CONFIDENCE})")
+        self.logger.info(f"Grouped {len(all_detections)} detections into {len(grouped_objects)} object groups ({total_instances} instances, confidence filtering moved to consensus)")
         
         # Package harmonized results  
         if not grouped_objects:
@@ -542,7 +544,7 @@ class HarmonyWorker(BaseWorker):
                     
                     # For small objects, also check center distance
                     max_area = max(area1, area2)
-                    is_small_object = max_area < 5000  # Pixels - threshold for small objects
+                    is_small_object = max_area < SMALL_OBJECT_AREA  # COCO small object definition
                     distance = 0
                     
                     if is_small_object:
@@ -565,7 +567,7 @@ class HarmonyWorker(BaseWorker):
                         # Standard overlap-based clustering
                         should_cluster = True
                         self.logger.info(f"DEBUG: Clustering via overlap/area")
-                    elif is_small_object and distance < 100:  # Within 100 pixels for small objects
+                    elif is_small_object and distance < SMALL_OBJECT_DISTANCE:  # Much tighter distance for small objects
                         # Distance-based clustering for small objects
                         should_cluster = True
                         self.logger.info(f"DEBUG: Clustering small objects via distance ({distance:.1f}px)")
@@ -665,16 +667,15 @@ class HarmonyWorker(BaseWorker):
     
     def calculate_assignment_cost(self, detection, potential_object):
         """Calculate cost of assigning detection to potential object"""
-        # Spatial cost (primary factor)
-        spatial_cost = 1.0 - self.calculate_overlap_ratio(detection['bbox'], potential_object['representative_bbox'])
-        
-        # Semantic cost (emoji disagreement penalty)
-        semantic_cost = 0.0
+        # Strict emoji matching - reject cross-emoji assignments completely
         normalized_detection_emoji = normalize_person_emoji(detection['emoji'])
         if normalized_detection_emoji not in potential_object['candidate_emojis']:
-            semantic_cost = 0.5
-        
-        return spatial_cost + semantic_cost
+            return float('inf')  # Reject cross-emoji assignments completely
+
+        # Spatial cost (only for same-emoji assignments)
+        spatial_cost = 1.0 - self.calculate_overlap_ratio(detection['bbox'], potential_object['representative_bbox'])
+
+        return spatial_cost
     
     def build_groups_from_assignments(self, detections, potential_objects, assignments):
         """Build final groups from Hungarian algorithm assignments"""
@@ -706,10 +707,10 @@ class HarmonyWorker(BaseWorker):
                 use_highest_confidence=self.use_highest_confidence_bbox
             )
             
-            # Apply confidence filtering - only include instances with max_confidence >= threshold
-            if instance['max_confidence'] < MINIMUM_CONFIDENCE:
-                self.logger.debug(f"Filtered out instance {instance['cluster_id']} with max_confidence {instance['max_confidence']} < {MINIMUM_CONFIDENCE}")
-                continue
+            # Confidence filtering removed - let consensus handle quality filtering based on votes
+            # if instance['max_confidence'] < MINIMUM_CONFIDENCE:
+            #     self.logger.debug(f"Filtered out instance {instance['cluster_id']} with max_confidence {instance['max_confidence']} < {MINIMUM_CONFIDENCE}")
+            #     continue
             
             # Create group
             if primary_emoji not in groups:
