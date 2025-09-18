@@ -805,82 +805,6 @@ class HarmonyWorker(BaseWorker):
             'height': int(weighted_h)
         }
 
-    def calculate_intersection_bbox(self, detections):
-        """Calculate intersection of all bounding boxes for tight consensus"""
-        if not detections:
-            return {}
-        if len(detections) == 1:
-            return detections[0]['bbox'].copy()
-
-        boxes = [d['bbox'] for d in detections]
-
-        # Find intersection boundaries
-        x1 = max(b['x'] for b in boxes)
-        y1 = max(b['y'] for b in boxes)
-        x2 = min(b['x'] + b['width'] for b in boxes)
-        y2 = min(b['y'] + b['height'] for b in boxes)
-
-        # Ensure valid intersection
-        if x2 <= x1 or y2 <= y1:
-            # No valid intersection, fall back to highest confidence bbox
-            best_detection = max(detections, key=lambda d: d['confidence'])
-            return best_detection['bbox'].copy()
-
-        return {
-            'x': x1,
-            'y': y1,
-            'width': x2 - x1,
-            'height': y2 - y1
-        }
-
-    def calculate_adaptive_bbox(self, detections):
-        """Adaptive bbox merging: intersection for tight clusters, highest-confidence for loose ones"""
-        if not detections:
-            return {}
-        if len(detections) == 1:
-            return detections[0]['bbox'].copy()
-
-        # Calculate average bbox size to detect small objects
-        boxes = [d['bbox'] for d in detections]
-        avg_area = sum(b['width'] * b['height'] for b in boxes) / len(boxes)
-        is_small_object = avg_area < 32 * 32  # COCO small object threshold
-
-        # Calculate average IoU between all pairs to measure cluster tightness
-        total_iou = 0
-        pair_count = 0
-
-        for i in range(len(boxes)):
-            for j in range(i + 1, len(boxes)):
-                iou = self.calculate_bbox_iou(boxes[i], boxes[j])
-                total_iou += iou
-                pair_count += 1
-
-        avg_iou = total_iou / pair_count if pair_count > 0 else 0
-
-        # Special handling for small objects - be more conservative with merging
-        if is_small_object:
-            # For small objects, prefer highest confidence to avoid size drift
-            if avg_iou > 0.8:  # Very high threshold for small object intersection
-                self.logger.debug(f"Small object adaptive: using intersection (IoU={avg_iou:.3f}, area={avg_area:.0f})")
-                return self.calculate_intersection_bbox(detections)
-            else:
-                self.logger.debug(f"Small object adaptive: using highest confidence (IoU={avg_iou:.3f}, area={avg_area:.0f})")
-                return self.select_highest_confidence_bbox(detections)
-
-        # Regular objects: more aggressive merging
-        # High agreement (avg IoU > 0.7): use intersection for tight fit
-        if avg_iou > 0.7:
-            self.logger.debug(f"Adaptive: using intersection (IoU={avg_iou:.3f}, area={avg_area:.0f})")
-            return self.calculate_intersection_bbox(detections)
-        # Medium agreement (avg IoU > 0.4): use confidence-weighted average
-        elif avg_iou > 0.4:
-            self.logger.debug(f"Adaptive: using confidence-weighted average (IoU={avg_iou:.3f}, area={avg_area:.0f})")
-            return self.calculate_confidence_weighted_bbox(detections)
-        # Low agreement: use highest confidence detection
-        else:
-            self.logger.debug(f"Adaptive: using highest confidence (IoU={avg_iou:.3f}, area={avg_area:.0f})")
-            return self.select_highest_confidence_bbox(detections)
-
     def create_instance_from_assignments(self, assigned_detections, primary_emoji, object_id, use_highest_confidence=False):
         """Create instance from assigned detections
 
@@ -907,9 +831,9 @@ class HarmonyWorker(BaseWorker):
             merged_bbox = self.select_highest_confidence_bbox(cleaned_detections)
             bbox_method = 'highest_confidence'
         else:
-            # Use adaptive merging for optimal mAP across different agreement levels
-            merged_bbox = self.calculate_adaptive_bbox(cleaned_detections)
-            bbox_method = 'adaptive'
+            # Use confidence-weighted averaging instead of union encompassing for better precision
+            merged_bbox = self.calculate_confidence_weighted_bbox(cleaned_detections)
+            bbox_method = 'confidence_weighted_average'
         
         # Calculate metrics
         services = list(set(d['service'] for d in cleaned_detections))
