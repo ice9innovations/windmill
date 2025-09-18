@@ -389,7 +389,10 @@ def main():
     
     parser.add_argument('--image-ids-file',
                        help='File containing image IDs to reprocess (one per line)')
-    
+
+    parser.add_argument('--services', '-s',
+                       help='Comma-separated services to run (e.g., "rtmdet,yolo_v8") or "all" for all primary services')
+
     args = parser.parse_args()
     
     try:
@@ -421,11 +424,16 @@ def main():
                 print(f"  {service:12} (port {port})")
             
             print()
-            print("Service sets:")
-            print("  all          = primary services (recommended for whole image processing)")
-            print("  primary      = primary services (same as 'all')")  
-            print("  postprocessing = face + pose services (handled by postprocessing workers, not for direct use)")
-            print("  full_catalog = all services including postprocessing")
+            print("Usage examples:")
+            print("  --services all              = all primary services (recommended for whole image processing)")
+            print("  --services rtmdet           = run only RTMDet analysis")
+            print("  --services rtmdet,yolo_v8   = run only RTMDet and YOLOv8 analysis")
+            print("  --services blip,clip        = run only captioning and classification services")
+            print()
+            print("Notes:")
+            print("  - Postprocessing services (face, pose) run automatically via bbox harmonization")
+            print("  - Running individual spatial services will trigger harmony/consensus recalculation")
+            print("  - Use specific services when you need to reprocess only certain analyses")
             
             return 0
         
@@ -436,9 +444,27 @@ def main():
         if not producer.connect_to_database():
             return 1
         
-        # Use all primary services only
-        service_names = producer.config.get_primary_services()
-        
+        # Determine which services to run
+        if args.services:
+            if args.services.lower() == 'all':
+                service_names = producer.config.get_primary_services()
+            else:
+                # Parse comma-separated list and validate each service
+                requested_services = [s.strip() for s in args.services.split(',')]
+                available_services = producer.config.get_primary_services()
+
+                # Validate all requested services exist
+                invalid_services = [s for s in requested_services if s not in available_services]
+                if invalid_services:
+                    print(f"❌ Invalid services: {', '.join(invalid_services)}")
+                    print(f"Available services: {', '.join(sorted(available_services))}")
+                    return 1
+
+                service_names = requested_services
+        else:
+            # Default to all primary services
+            service_names = producer.config.get_primary_services()
+
         print(f"🎯 Target services: {', '.join(service_names)}")
         
         # Create queues
