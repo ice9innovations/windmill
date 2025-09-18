@@ -19,10 +19,27 @@ from base_worker import BaseWorker
 from PIL import Image
 
 THRESHOLD = .1  # Balanced for 640px images
-AREA_THRESHOLD = 0.7  # Balanced area matching for 640px
+AREA_THRESHOLD = 0.8  # Balanced area matching for 640px
 SMALL_OBJECT_AREA = 1024  # COCO small object definition (32x32 pixels)
 SMALL_OBJECT_DISTANCE = 20  # ~3% of 640px width for small objects
 # MINIMUM_CONFIDENCE = 0.4  # Confidence filtering moved to consensus worker
+
+# Extensible merge rules: containment-based merging where smaller objects get absorbed into larger ones
+CONTAINMENT_MERGE_RULES = [
+    {
+        'contained_emoji': '⌨️',  # keyboard
+        'container_emoji': '💻',  # laptop
+        'containment_threshold': 0.9,  # 90% of keyboard must be within laptop (almost entirely contained)
+        'description': 'Merge keyboard into laptop when keyboard is entirely contained within laptop'
+    }
+    # Add more rules here as needed, e.g.:
+    # {
+    #     'contained_emoji': '🖱️',  # mouse
+    #     'container_emoji': '💻',  # laptop
+    #     'containment_threshold': 0.6,
+    #     'description': 'Merge mouse into laptop when mouse is near laptop'
+    # }
+]
 
 def normalize_emoji(emoji):
     """Remove variation selectors and other invisible modifiers from emoji"""
@@ -35,7 +52,7 @@ def normalize_emoji(emoji):
 def normalize_person_emoji(emoji):
     """Group person emojis together using neutral person emoji as the canonical grouping key"""
     normalized = normalize_emoji(emoji)
-    if normalized in ['🧑', '👩']:
+    if normalized in ['🧑', '👩', '🧒']:
         return '🧑'  # Group all person types under neutral person emoji
     return normalized
 
@@ -528,53 +545,87 @@ class HarmonyWorker(BaseWorker):
             for j, other_detection in enumerate(detections[i+1:], i+1):
                 if j in used:
                     continue
-                    
+
+                # Check for containment merge rules first (cross-emoji merging)
+                merge_info = self.check_containment_merge_rules(detection, other_detection)
+                if merge_info and merge_info['should_merge']:
+                    # Containment-based merge: always use container emoji and bbox
+                    container_det = merge_info['container_detection']
+                    contained_det = merge_info['contained_detection']
+                    rule = merge_info['rule']
+                    ratio = merge_info['containment_ratio']
+
+                    self.logger.info(f"DEBUG: Containment merge triggered - {contained_det['emoji']} (containment={ratio:.2f}) → {container_det['emoji']} with confidence boost per rule: {rule['description']}")
+
+                    # For containment merges, we want to preserve the container and absorb the contained
+                    # Create a new merged detection with container properties but combined metadata
+                    # Strengthen the container's vote by boosting confidence (simulates additional vote)
+                    base_confidence = max(container_det['confidence'], contained_det['confidence'])
+                    boosted_confidence = min(1.0, base_confidence + 0.1)  # Add 0.1 boost, cap at 1.0
+
+                    merged_detection = {
+                        'service': container_det['service'],  # Use container's service
+                        'label': container_det['label'],      # Use container's label
+                        'emoji': container_det['emoji'],      # Use container's emoji
+                        'bbox': container_det['bbox'],        # Use container's bbox
+                        'confidence': boosted_confidence,     # Boosted confidence to strengthen vote
+                        'type': container_det['type'],
+                        'merged_from': [detection, other_detection],  # Track what was merged
+                        'merge_reason': f"containment_rule_{rule['contained_emoji']}_into_{rule['container_emoji']}",
+                        'confidence_boost': 0.1,  # Track the boost applied
+                        'original_confidence': base_confidence
+                    }
+
+                    # Replace current cluster with merged detection
+                    cluster = [merged_detection]
+                    used.add(j)
+                    self.logger.info(f"DEBUG: Added to containment-merge cluster")
+                    continue
+
                 # Only cluster detections with the same emoji (same object type)
                 emoji1 = normalize_person_emoji(detection['emoji'])
                 emoji2 = normalize_person_emoji(other_detection['emoji'])
-                
+
                 if emoji1 == emoji2:
-                    # Same object type - check spatial overlap AND area similarity
+                    # Same object type - check if detections are near-identical
                     overlap = self.calculate_overlap_ratio(detection['bbox'], other_detection['bbox'])
-                    
-                    # Calculate area similarity ratio
+
+                    # Calculate area similarity ratio (for logging)
                     area1 = detection['bbox']['width'] * detection['bbox']['height']
                     area2 = other_detection['bbox']['width'] * other_detection['bbox']['height']
                     area_ratio = min(area1, area2) / max(area1, area2) if max(area1, area2) > 0 else 0
-                    
-                    # For small objects, also check center distance
-                    max_area = max(area1, area2)
-                    is_small_object = max_area < SMALL_OBJECT_AREA  # COCO small object definition
-                    distance = 0
-                    
-                    if is_small_object:
-                        # Calculate center-to-center distance for small objects
-                        cx1 = detection['bbox']['x'] + detection['bbox']['width'] / 2
-                        cy1 = detection['bbox']['y'] + detection['bbox']['height'] / 2
-                        cx2 = other_detection['bbox']['x'] + other_detection['bbox']['width'] / 2
-                        cy2 = other_detection['bbox']['y'] + other_detection['bbox']['height'] / 2
-                        distance = ((cx2 - cx1) ** 2 + (cy2 - cy1) ** 2) ** 0.5
-                    
-                    self.logger.info(f"DEBUG: Same emoji {emoji1}, overlap = {overlap:.3f}, area_ratio = {area_ratio:.3f}, small={is_small_object}, distance={distance:.1f}")
-                    
+
                     # Check if one box contains the other (for different service scales)
                     containment_ratio = self.calculate_containment_ratio(detection['bbox'], other_detection['bbox'])
-                    
-                    # Clustering criteria: overlap/area OR distance-based OR containment-based
+
+                    # Primary clustering: use multi-criteria near-identical detection
                     should_cluster = False
-                    
-                    if overlap > THRESHOLD and area_ratio > AREA_THRESHOLD:
-                        # Standard overlap-based clustering
+
+                    if self.are_detections_near_identical(detection['bbox'], other_detection['bbox']):
+                        # Multi-criteria clustering (IoU + center distance + size similarity)
                         should_cluster = True
-                        self.logger.info(f"DEBUG: Clustering via overlap/area")
-                    elif is_small_object and distance < SMALL_OBJECT_DISTANCE:  # Much tighter distance for small objects
-                        # Distance-based clustering for small objects
-                        should_cluster = True
-                        self.logger.info(f"DEBUG: Clustering small objects via distance ({distance:.1f}px)")
+                        self.logger.info(f"DEBUG: Clustering via multi-criteria (IoU={overlap:.3f}, area_ratio={area_ratio:.3f})")
                     elif containment_ratio > 0.7:  # One box is 70% contained in the other
-                        # Containment-based clustering (different scales of same object)
+                        # Fallback: containment-based clustering (different scales of same object)
                         should_cluster = True
                         self.logger.info(f"DEBUG: Clustering via containment ({containment_ratio:.3f})")
+                    else:
+                        # For small objects, use distance-based clustering as last resort
+                        max_area = max(area1, area2)
+                        is_small_object = max_area < SMALL_OBJECT_AREA  # COCO small object definition
+
+                        if is_small_object:
+                            cx1 = detection['bbox']['x'] + detection['bbox']['width'] / 2
+                            cy1 = detection['bbox']['y'] + detection['bbox']['height'] / 2
+                            cx2 = other_detection['bbox']['x'] + other_detection['bbox']['width'] / 2
+                            cy2 = other_detection['bbox']['y'] + other_detection['bbox']['height'] / 2
+                            distance = ((cx2 - cx1) ** 2 + (cy2 - cy1) ** 2) ** 0.5
+
+                            if distance < SMALL_OBJECT_DISTANCE:
+                                should_cluster = True
+                                self.logger.info(f"DEBUG: Clustering small objects via distance ({distance:.1f}px)")
+
+                    self.logger.info(f"DEBUG: Same emoji {emoji1}, overlap = {overlap:.3f}, area_ratio = {area_ratio:.3f}, should_cluster = {should_cluster}")
                     
                     if should_cluster:
                         cluster.append(other_detection)
@@ -730,32 +781,66 @@ class HarmonyWorker(BaseWorker):
         
         return groups
     
+    def calculate_confidence_weighted_bbox(self, detections):
+        """Average bbox coordinates weighted by confidence scores"""
+        if not detections:
+            return {}
+        if len(detections) == 1:
+            return detections[0]['bbox'].copy()
+
+        total_weight = sum(d['confidence'] for d in detections)
+        if total_weight == 0:
+            return detections[0]['bbox'].copy()
+
+        # Weighted average of centers and sizes
+        weighted_cx = sum(d['confidence'] * (d['bbox']['x'] + d['bbox']['width']/2) for d in detections) / total_weight
+        weighted_cy = sum(d['confidence'] * (d['bbox']['y'] + d['bbox']['height']/2) for d in detections) / total_weight
+        weighted_w = sum(d['confidence'] * d['bbox']['width'] for d in detections) / total_weight
+        weighted_h = sum(d['confidence'] * d['bbox']['height'] for d in detections) / total_weight
+
+        return {
+            'x': int(weighted_cx - weighted_w/2),
+            'y': int(weighted_cy - weighted_h/2),
+            'width': int(weighted_w),
+            'height': int(weighted_h)
+        }
+
     def create_instance_from_assignments(self, assigned_detections, primary_emoji, object_id, use_highest_confidence=False):
         """Create instance from assigned detections
-        
+
         Args:
             assigned_detections: List of detections assigned to this instance
             primary_emoji: Primary emoji for this instance
             object_id: Object ID for cluster naming
-            use_highest_confidence: If True, use highest confidence bbox instead of union bbox
+            use_highest_confidence: If True, use highest confidence bbox instead of averaging
         """
+        # Expand merged detections first
+        expanded_detections = []
+        for detection in assigned_detections:
+            if 'merged_from' in detection:
+                # This is a merged detection from containment rules
+                expanded_detections.extend(detection['merged_from'])
+            else:
+                expanded_detections.append(detection)
+
         # Clean assignments (remove same-service duplicates)
-        cleaned_detections = self.clean_cluster(assigned_detections)
-        
+        cleaned_detections = self.clean_cluster(expanded_detections)
+
         # Calculate merged bounding box using selected method
         if use_highest_confidence:
             merged_bbox = self.select_highest_confidence_bbox(cleaned_detections)
             bbox_method = 'highest_confidence'
         else:
-            merged_bbox = self.calculate_cluster_bbox(cleaned_detections)
-            bbox_method = 'union_encompassing'
+            # Use confidence-weighted averaging instead of union encompassing for better precision
+            merged_bbox = self.calculate_confidence_weighted_bbox(cleaned_detections)
+            bbox_method = 'confidence_weighted_average'
         
         # Calculate metrics
         services = list(set(d['service'] for d in cleaned_detections))
         confidences = [d['confidence'] for d in cleaned_detections]
         avg_confidence = sum(confidences) / len(confidences)
         max_confidence = max(confidences)  # Maximum confidence for filtering
-        
+
         instance = {
             'cluster_id': f"{primary_emoji}_{object_id}",
             'emoji': primary_emoji,
@@ -765,11 +850,18 @@ class HarmonyWorker(BaseWorker):
             'avg_confidence': round(avg_confidence, 3),
             'max_confidence': round(max_confidence, 3),
             'contributing_services': services,
-            'detections': [{'service': d['service'], 'confidence': d['confidence']} 
+            'detections': [{'service': d['service'], 'confidence': d['confidence']}
                          for d in cleaned_detections],
             'assignment_method': 'greedy_assignment',
             'bbox_merge_method': bbox_method
         }
+
+        # Add containment merge information if applicable
+        for detection in assigned_detections:
+            if 'merge_reason' in detection and detection['merge_reason'].startswith('containment_rule'):
+                instance['containment_merge_applied'] = True
+                instance['merge_reason'] = detection['merge_reason']
+                break
         
         return instance
     
@@ -850,18 +942,216 @@ class HarmonyWorker(BaseWorker):
         y1 = max(box1['y'], box2['y'])
         x2 = min(box1['x'] + box1['width'], box2['x'] + box2['width'])
         y2 = min(box1['y'] + box1['height'], box2['y'] + box2['height'])
-        
+
         if x1 >= x2 or y1 >= y2:
             return 0  # No intersection
-        
+
         intersection = (x2 - x1) * (y2 - y1)
         area1 = box1['width'] * box1['height']
         area2 = box2['width'] * box2['height']
-        
+
         # Return the ratio of intersection to the smaller box (max containment)
         smaller_area = min(area1, area2)
         return intersection / smaller_area if smaller_area > 0 else 0
-    
+
+    def check_containment_merge_rules(self, detection1, detection2):
+        """Check if two detections should be merged based on containment rules
+
+        Returns:
+            dict: Merge info if should merge, None otherwise
+            Format: {
+                'should_merge': True,
+                'container_detection': detection_obj,
+                'contained_detection': detection_obj,
+                'rule': rule_obj,
+                'containment_ratio': float
+            }
+        """
+        emoji1 = normalize_emoji(detection1['emoji'])
+        emoji2 = normalize_emoji(detection2['emoji'])
+
+        for rule in CONTAINMENT_MERGE_RULES:
+            contained_emoji = normalize_emoji(rule['contained_emoji'])
+            container_emoji = normalize_emoji(rule['container_emoji'])
+            threshold = rule['containment_threshold']
+
+            # Check if detection1 is contained in detection2
+            if emoji1 == contained_emoji and emoji2 == container_emoji:
+                containment_ratio = self.calculate_specific_containment_ratio(
+                    detection1['bbox'], detection2['bbox']
+                )
+                if containment_ratio >= threshold:
+                    return {
+                        'should_merge': True,
+                        'container_detection': detection2,
+                        'contained_detection': detection1,
+                        'rule': rule,
+                        'containment_ratio': containment_ratio
+                    }
+
+            # Check if detection2 is contained in detection1
+            elif emoji2 == contained_emoji and emoji1 == container_emoji:
+                containment_ratio = self.calculate_specific_containment_ratio(
+                    detection2['bbox'], detection1['bbox']
+                )
+                if containment_ratio >= threshold:
+                    return {
+                        'should_merge': True,
+                        'container_detection': detection1,
+                        'contained_detection': detection2,
+                        'rule': rule,
+                        'containment_ratio': containment_ratio
+                    }
+
+        return None
+
+    def calculate_specific_containment_ratio(self, contained_box, container_box):
+        """Calculate how much the contained_box is within the container_box"""
+        x1 = max(contained_box['x'], container_box['x'])
+        y1 = max(contained_box['y'], container_box['y'])
+        x2 = min(contained_box['x'] + contained_box['width'], container_box['x'] + container_box['width'])
+        y2 = min(contained_box['y'] + contained_box['height'], container_box['y'] + container_box['height'])
+
+        if x1 >= x2 or y1 >= y2:
+            return 0  # No intersection
+
+        intersection = (x2 - x1) * (y2 - y1)
+        contained_area = contained_box['width'] * contained_box['height']
+
+        return intersection / contained_area if contained_area > 0 else 0
+
+    def are_detections_near_identical(self, bbox1, bbox2, iou_threshold=0.8, center_distance_threshold=15, size_similarity_threshold=0.9):
+        """Check if two detections are near-identical using multiple criteria (same as consensus logic)"""
+        # 1. IoU check
+        iou = self.calculate_overlap_ratio(bbox1, bbox2)
+        if iou < iou_threshold:
+            return False
+
+        # 2. Center distance check
+        cx1 = bbox1['x'] + bbox1['width'] / 2
+        cy1 = bbox1['y'] + bbox1['height'] / 2
+        cx2 = bbox2['x'] + bbox2['width'] / 2
+        cy2 = bbox2['y'] + bbox2['height'] / 2
+        center_distance = ((cx2 - cx1) ** 2 + (cy2 - cy1) ** 2) ** 0.5
+
+        if center_distance > center_distance_threshold:
+            return False
+
+        # 3. Size similarity check
+        w1, h1 = bbox1['width'], bbox1['height']
+        w2, h2 = bbox2['width'], bbox2['height']
+        width_similarity = min(w1, w2) / max(w1, w2) if max(w1, w2) > 0 else 0
+        height_similarity = min(h1, h2) / max(h1, h2) if max(h1, h2) > 0 else 0
+        size_similarity = min(width_similarity, height_similarity)
+
+        if size_similarity < size_similarity_threshold:
+            return False
+
+        return True
+
+    def add_clip_fallback_boxes(self, image_id, image_filename, existing_merged_data):
+        """Add CLIP bounding boxes as fallback for emojis with no spatial evidence"""
+        try:
+            # Get CLIP results for this image
+            clip_results = self.get_clip_results_for_image(image_id)
+            if not clip_results:
+                return 0
+
+            # Get existing emojis that already have spatial evidence
+            existing_emojis = set()
+            if existing_merged_data:
+                self.logger.debug(f"CLIP fallback: existing_merged_data keys: {list(existing_merged_data.keys())}")
+                grouped_objects = existing_merged_data.get('grouped_objects', {})
+                self.logger.debug(f"CLIP fallback: grouped_objects keys: {list(grouped_objects.keys())}")
+                for group_key, group_data in grouped_objects.items():
+                    normalized_key = normalize_person_emoji(group_key)
+                    existing_emojis.add(normalized_key)
+                    self.logger.debug(f"CLIP fallback: added existing emoji {group_key} -> {normalized_key}")
+
+            self.logger.debug(f"CLIP fallback: existing_emojis = {existing_emojis}")
+
+            fallback_count = 0
+            cursor = self.db_conn.cursor()
+
+            # Process CLIP predictions for fallback opportunities
+            for service, data, result_id in clip_results:
+                if not isinstance(data, dict) or 'predictions' not in data:
+                    continue
+
+                predictions = data.get('predictions', [])
+                for prediction in predictions:
+                    if not prediction.get('bbox') or not prediction.get('emoji'):
+                        continue
+
+                    original_emoji = prediction['emoji']
+                    emoji = normalize_person_emoji(original_emoji)
+
+                    self.logger.debug(f"CLIP fallback: checking {original_emoji} -> {emoji}, existing: {emoji in existing_emojis}")
+
+                    # Only use as fallback if this emoji has no existing spatial evidence
+                    if emoji not in existing_emojis:
+                        # Create a merged box entry for this CLIP detection
+                        merged_box_data = {
+                            'cluster_id': f"{emoji}_clip_fallback",
+                            'emoji': emoji,
+                            'labels': [prediction.get('label', '')],
+                            'merged_bbox': prediction['bbox'],
+                            'detection_count': 1,
+                            'avg_confidence': prediction.get('confidence', 0.5),
+                            'max_confidence': prediction.get('confidence', 0.5),
+                            'contributing_services': ['clip'],
+                            'detections': [{'service': 'clip', 'confidence': prediction.get('confidence', 0.5)}],
+                            'harmonization_algorithm': 'clip_fallback',
+                            'source_result_ids': [result_id],
+                            'fallback_source': 'clip_spatial_fallback'
+                        }
+
+                        cursor.execute("""
+                            INSERT INTO merged_boxes (image_id, source_result_ids, merged_data, worker_id, status)
+                            VALUES (%s, %s, %s, %s, %s)
+                        """, (
+                            image_id,
+                            [result_id],
+                            json.dumps({k: v for k, v in merged_box_data.items() if k != 'source_result_ids'}),
+                            self.worker_id,
+                            'success'
+                        ))
+
+                        fallback_count += 1
+                        existing_emojis.add(emoji)  # Prevent duplicates
+                        self.logger.debug(f"Added CLIP fallback box for {emoji} with confidence {prediction.get('confidence', 0.5):.3f}")
+
+            cursor.close()
+            return fallback_count
+
+        except Exception as e:
+            self.logger.error(f"Error adding CLIP fallback boxes for image {image_id}: {e}")
+            return 0
+
+    def get_clip_results_for_image(self, image_id):
+        """Get CLIP results for an image"""
+        try:
+            cursor = self.read_db_conn.cursor()
+
+            query = """
+                SELECT service, data, result_id
+                FROM results
+                WHERE image_id = %s
+                AND service = 'clip'
+                AND status = 'success'
+                ORDER BY service
+            """
+
+            cursor.execute(query, (image_id,))
+            results = cursor.fetchall()
+            cursor.close()
+
+            return results
+
+        except Exception as e:
+            self.logger.error(f"Error getting CLIP results for image {image_id}: {e}")
+            return []
+
     def update_merged_boxes_for_image(self, image_id, image_filename, image_data=None):
         """Update merged boxes for a single image using safe DELETE+INSERT pattern"""
         max_retries = 2
@@ -953,6 +1243,12 @@ class HarmonyWorker(BaseWorker):
                 else:
                     self.logger.info(f"Harmonized boxes for {image_filename} ({detection_count} detections → {merged_box_count} merged boxes from {services})")
                 
+                # Check for CLIP fallback spatial evidence before finalizing
+                clip_fallback_count = self.add_clip_fallback_boxes(image_id, image_filename, merged_data)
+                if clip_fallback_count > 0:
+                    merged_box_count += clip_fallback_count
+                    self.logger.info(f"Added {clip_fallback_count} CLIP fallback bounding boxes for {image_filename}")
+
                 # Dispatch bbox postprocessing jobs for each merged box
                 if merged_box_count > 0 and image_data:
                     try:

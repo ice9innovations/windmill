@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Consensus Worker V2 - Clean rewrite with explicit logic
-Implements V3 voting algorithm with clear, debuggable confidence filtering
+Consensus Worker - Merge Focused
+Completely redesigned to MERGE detections instead of filtering them out
+Designed to fix the catastrophic 90%+ filter rates
 """
 import os
 import json
@@ -13,12 +14,9 @@ import re
 from datetime import datetime
 from base_worker import BaseWorker
 
-# Configuration constants
-MINIMUM_CONFIDENCE = 0.8  # High confidence threshold
-MULTI_SERVICE_MINIMUM_CONFIDENCE = 0.51  # Moderate confidence threshold
-STRONG_CONSENSUS_THRESHOLD = 3  # Services needed for strong consensus
-VERY_STRONG_CONSENSUS_THRESHOLD = 4  # Services needed to bypass confidence
-MINIMUM_VOTES_REQUIRED = 2  # Minimum votes to include in results
+# MERGE-FOCUSED configuration with democratic confidence
+MINIMUM_VOTES_REQUIRED = 3  # Require at least 2-service consensus
+TOTAL_AVAILABLE_SERVICES = 8  # Approximate total services that could vote
 
 def normalize_emoji(emoji):
     """Remove variation selectors and other invisible modifiers from emoji"""
@@ -26,16 +24,15 @@ def normalize_emoji(emoji):
         return emoji
     return re.sub(r'[\uFE00-\uFE0F\u180B-\u180D\u200D]', '', emoji)
 
-class ConsensusWorkerV2(BaseWorker):
-    """Clean consensus worker with explicit filtering logic"""
+class ConsensusWorkerMergeFocused(BaseWorker):
+    """Merge-focused consensus worker that prioritizes inclusion over filtering"""
 
     def __init__(self):
         super().__init__('system.consensus')
 
-        # V3 Voting configuration
+        # Merge-focused configuration
         self.special_emojis = ['🔞', '💬']
         self.default_confidence = float(os.getenv('DEFAULT_CONFIDENCE', '0.75'))
-        self.low_confidence_threshold = float(os.getenv('LOW_CONFIDENCE_THRESHOLD', '0.4'))
 
         # Dual database connections for read/write separation
         self.read_db_conn = None
@@ -270,8 +267,103 @@ class ConsensusWorkerV2(BaseWorker):
 
         return groups
 
-    def analyze_emoji_consensus(self, emoji, detections, spatial_evidence):
-        """Analyze consensus for a specific emoji with clear logic"""
+    def analyze_per_bbox_consensus(self, all_detections, spatial_evidence):
+        """Analyze consensus per bounding box instance instead of per emoji"""
+        bbox_results = []
+
+        # Group detections by evidence type for easier lookup
+        spatial_detections = [d for d in all_detections if d['evidence_type'] == 'spatial']
+        semantic_detections = [d for d in all_detections if d['evidence_type'] == 'semantic']
+        classification_detections = [d for d in all_detections if d['evidence_type'] == 'classification']
+
+        # Process each bounding box as a separate voting unit
+        for emoji, bbox_list in spatial_evidence.items():
+            normalized_emoji = normalize_emoji(emoji)
+
+            for bbox_data in bbox_list:
+                merged_id = bbox_data['merged_id']
+                contributing_services = bbox_data.get('contributing_services', [])
+
+                # Count spatial votes (services that contributed to this specific bbox)
+                spatial_votes = len(contributing_services)
+
+                # Count semantic votes (all semantic services that detected this emoji support this bbox)
+                semantic_votes = len([d for d in semantic_detections if normalize_emoji(d['emoji']) == normalized_emoji])
+
+                # Count classification votes (all classification services that detected this emoji support this bbox)
+                classification_votes = len([d for d in classification_detections if normalize_emoji(d['emoji']) == normalized_emoji])
+
+                total_votes = spatial_votes + semantic_votes + classification_votes
+
+                # Get all supporting detections for this bbox
+                supporting_detections = []
+
+                # Add spatial detections from contributing services
+                for detection in spatial_detections:
+                    if (normalize_emoji(detection['emoji']) == normalized_emoji and
+                        detection['service'] in contributing_services):
+                        supporting_detections.append(detection)
+
+                # Add semantic detections for this emoji
+                for detection in semantic_detections:
+                    if normalize_emoji(detection['emoji']) == normalized_emoji:
+                        supporting_detections.append(detection)
+
+                # Add classification detections for this emoji
+                for detection in classification_detections:
+                    if normalize_emoji(detection['emoji']) == normalized_emoji:
+                        supporting_detections.append(detection)
+
+                bbox_analysis = {
+                    'merged_id': merged_id,
+                    'emoji': emoji,
+                    'normalized_emoji': normalized_emoji,
+                    'total_votes': total_votes,
+                    'spatial_votes': spatial_votes,
+                    'semantic_votes': semantic_votes,
+                    'classification_votes': classification_votes,
+                    'bbox_data': bbox_data,
+                    'supporting_detections': supporting_detections,
+                    'contributing_services': contributing_services
+                }
+
+                bbox_results.append(bbox_analysis)
+
+        # Also handle non-spatial detections (emojis with no bounding boxes)
+        # These get processed as single instances per emoji type
+        all_spatial_emojis = set(normalize_emoji(emoji) for emoji in spatial_evidence.keys())
+        processed_non_spatial = set()
+
+        for detection in semantic_detections + classification_detections:
+            normalized_emoji = normalize_emoji(detection['emoji'])
+            if normalized_emoji not in all_spatial_emojis and normalized_emoji not in processed_non_spatial:
+                # This emoji has no spatial evidence, create a non-spatial instance
+                # Collect all detections for this emoji
+                emoji_detections = [d for d in semantic_detections + classification_detections
+                                  if normalize_emoji(d['emoji']) == normalized_emoji]
+
+                semantic_count = len([d for d in emoji_detections if d['evidence_type'] == 'semantic'])
+                classification_count = len([d for d in emoji_detections if d['evidence_type'] == 'classification'])
+
+                bbox_analysis = {
+                    'merged_id': None,
+                    'emoji': detection['emoji'],
+                    'normalized_emoji': normalized_emoji,
+                    'total_votes': semantic_count + classification_count,
+                    'spatial_votes': 0,
+                    'semantic_votes': semantic_count,
+                    'classification_votes': classification_count,
+                    'bbox_data': None,
+                    'supporting_detections': emoji_detections,
+                    'contributing_services': [d['service'] for d in emoji_detections]
+                }
+                bbox_results.append(bbox_analysis)
+                processed_non_spatial.add(normalized_emoji)
+
+        return bbox_results
+
+    def analyze_emoji_consensus_merge_focused(self, emoji, detections, spatial_evidence):
+        """Analyze consensus for a specific emoji with merge-focused logic"""
         # Count votes by evidence type
         spatial_votes = [d for d in detections if d['evidence_type'] == 'spatial']
         semantic_votes = [d for d in detections if d['evidence_type'] == 'semantic']
@@ -302,73 +394,252 @@ class ConsensusWorkerV2(BaseWorker):
             'classification_votes': len(classification_votes),
             'spatial_analysis': spatial_analysis,
             'all_detections': detections,
-            'spatial_boxes': spatial_evidence.get(emoji, [])  # Include raw spatial boxes for bbox extraction
+            'spatial_boxes': spatial_evidence.get(emoji, [])
         }
 
-    def apply_consensus_filtering(self, emoji_analysis):
-        """Apply clear, debuggable consensus filtering"""
-        filtered_results = []
+    def apply_vote_filtering(self, emoji_analysis):
+        """Apply simple vote-based filtering"""
+        accepted_results = []
 
         for analysis in emoji_analysis:
             should_keep = False
             reason = ""
 
-            # Rule 1: Minimum votes required
-            if analysis['total_votes'] < MINIMUM_VOTES_REQUIRED:
-                reason = f"insufficient votes ({analysis['total_votes']} < {MINIMUM_VOTES_REQUIRED})"
+            # Vote threshold check with spatial preference
+            spatial_votes_count = analysis['spatial_votes']
+            total_votes_count = analysis['total_votes']
 
-            # Rule 2: Non-spatial detections (semantic/classification only)
-            elif not analysis['spatial_analysis']:
+            # Accept if 3+ total votes OR 2+ spatial votes
+            if total_votes_count >= MINIMUM_VOTES_REQUIRED:
                 should_keep = True
-                reason = "non-spatial detection (semantic/classification only)"
-
-            # Rule 3: Spatial detections with confidence filtering
+                reason = f"sufficient total votes ({total_votes_count} >= {MINIMUM_VOTES_REQUIRED})"
+            elif spatial_votes_count >= (MINIMUM_VOTES_REQUIRED - 1):
+                should_keep = True
+                reason = f"sufficient spatial votes ({spatial_votes_count} >= {MINIMUM_VOTES_REQUIRED - 1})"
             else:
+                should_keep = False
+                reason = f"insufficient votes (total: {total_votes_count}, spatial: {spatial_votes_count})"
+
+            if should_keep and analysis['spatial_analysis']:
                 spatial = analysis['spatial_analysis']
                 max_services = spatial['max_services_per_box']
                 peak_confidence = spatial['peak_confidence']
-
-                # Very strong consensus (4+ services) - always keep
-                if max_services >= VERY_STRONG_CONSENSUS_THRESHOLD:
-                    should_keep = True
-                    reason = f"very strong consensus ({max_services} services)"
-
-                # Strong consensus (3 services) - lower confidence acceptable
-                elif max_services >= STRONG_CONSENSUS_THRESHOLD:
-                    should_keep = True
-                    reason = f"strong consensus ({max_services} services, conf={peak_confidence:.3f})"
-
-                # High confidence - keep regardless of consensus
-                elif peak_confidence >= MINIMUM_CONFIDENCE:
-                    should_keep = True
-                    reason = f"high confidence ({peak_confidence:.3f})"
-
-                # Moderate consensus (2 services) - need decent confidence AND semantic support
-                elif max_services >= 2 and peak_confidence >= MULTI_SERVICE_MINIMUM_CONFIDENCE:
-                    has_semantic_support = analysis['semantic_votes'] > 0 or analysis['classification_votes'] > 0
-                    if has_semantic_support:
-                        should_keep = True
-                        reason = f"moderate consensus with semantic support ({max_services} services, conf={peak_confidence:.3f})"
-                    else:
-                        reason = f"moderate consensus without semantic support ({max_services} services, conf={peak_confidence:.3f})"
-
-                # Everything else gets filtered
-                else:
-                    reason = f"low confidence and insufficient consensus (services={max_services}, conf={peak_confidence:.3f})"
+                reason += f" - spatial consensus ({max_services} services, peak conf={peak_confidence:.3f})"
 
             # Log the decision for debugging
-            action = "KEEP" if should_keep else "FILTER"
+            action = "ACCEPT" if should_keep else "FILTER"
             self.logger.debug(f"{action} {analysis['emoji']}: {reason}")
 
             if should_keep:
                 analysis['filter_reason'] = reason
-                filtered_results.append(analysis)
+                accepted_results.append(analysis)
 
-        self.logger.info(f"Consensus filtering: kept {len(filtered_results)}/{len(emoji_analysis)} emojis")
-        return filtered_results
+        kept_count = len(accepted_results)
+        total_count = len(emoji_analysis)
+        survival_rate = (kept_count / total_count * 100) if total_count > 0 else 0
+
+        self.logger.info(f"Vote filtering: kept {kept_count}/{total_count} emojis ({survival_rate:.1f}% survival rate)")
+        return accepted_results
+
+    def apply_bbox_vote_filtering(self, bbox_analysis):
+        """Apply vote-based filtering per bounding box"""
+        accepted_results = []
+
+        for analysis in bbox_analysis:
+            should_keep = False
+            reason = ""
+
+            # Vote threshold check with spatial preference
+            spatial_votes_count = analysis['spatial_votes']
+            total_votes_count = analysis['total_votes']
+
+            # Accept if 3+ total votes OR 2+ spatial votes
+            if total_votes_count >= MINIMUM_VOTES_REQUIRED:
+                should_keep = True
+                reason = f"sufficient total votes ({total_votes_count} >= {MINIMUM_VOTES_REQUIRED})"
+            elif spatial_votes_count >= (MINIMUM_VOTES_REQUIRED - 1):
+                should_keep = True
+                reason = f"sufficient spatial votes ({spatial_votes_count} >= {MINIMUM_VOTES_REQUIRED - 1})"
+            else:
+                should_keep = False
+                reason = f"insufficient votes (total: {total_votes_count}, spatial: {spatial_votes_count})"
+
+            # Add spatial details for debugging
+            if should_keep and analysis['bbox_data']:
+                bbox_data = analysis['bbox_data']
+                avg_confidence = bbox_data.get('avg_confidence', 0)
+                detection_count = bbox_data.get('detection_count', 0)
+                reason += f" - bbox consensus ({detection_count} detections, avg conf={avg_confidence:.3f})"
+
+            # Log the decision for debugging
+            action = "ACCEPT" if should_keep else "FILTER"
+            bbox_id = analysis.get('merged_id', 'non-spatial')
+            self.logger.debug(f"{action} {analysis['emoji']} (bbox:{bbox_id}): {reason}")
+
+            if should_keep:
+                analysis['filter_reason'] = reason
+                accepted_results.append(analysis)
+
+        kept_count = len(accepted_results)
+        total_count = len(bbox_analysis)
+        survival_rate = (kept_count / total_count * 100) if total_count > 0 else 0
+
+        self.logger.info(f"Bbox vote filtering: kept {kept_count}/{total_count} instances ({survival_rate:.1f}% survival rate)")
+
+        # Apply near-identical box conflict resolution
+        resolved_results = self.resolve_near_identical_conflicts(accepted_results)
+
+        return resolved_results
+
+    def resolve_near_identical_conflicts(self, bbox_results):
+        """Resolve conflicts between nearly identical bounding boxes with different emojis"""
+        if len(bbox_results) < 2:
+            return bbox_results
+
+        # Multi-criteria thresholds for near-identical boxes
+        IOU_THRESHOLD = 0.8   # 80% overlap required
+        CENTER_DISTANCE_THRESHOLD = 15  # pixels
+        SIZE_SIMILARITY_THRESHOLD = 0.9  # 90% size similarity
+
+        resolved_results = []
+        eliminated_indices = set()
+
+        for i, result1 in enumerate(bbox_results):
+            if i in eliminated_indices:
+                continue
+
+            # Only check boxes that have spatial evidence
+            if not result1.get('bbox_data') or not result1['bbox_data'].get('merged_bbox'):
+                resolved_results.append(result1)
+                continue
+
+            bbox1 = result1['bbox_data']['merged_bbox']
+
+            for j, result2 in enumerate(bbox_results[i+1:], i+1):
+                if j in eliminated_indices:
+                    continue
+
+                # Only check boxes that have spatial evidence and different emojis
+                if (not result2.get('bbox_data') or
+                    not result2['bbox_data'].get('merged_bbox') or
+                    result1['normalized_emoji'] == result2['normalized_emoji']):
+                    continue
+
+                bbox2 = result2['bbox_data']['merged_bbox']
+
+                # Check if boxes are near-identical using multiple criteria
+                if self.are_boxes_near_identical(bbox1, bbox2, IOU_THRESHOLD, CENTER_DISTANCE_THRESHOLD, SIZE_SIMILARITY_THRESHOLD):
+                    # Near-identical boxes with different emojis - resolve conflict
+                    votes1 = result1['total_votes']
+                    votes2 = result2['total_votes']
+
+                    # Get detailed metrics for logging
+                    iou = self.calculate_bbox_iou(bbox1, bbox2)
+                    center_dist = self.calculate_center_distance(bbox1, bbox2)
+                    size_sim = self.calculate_size_similarity(bbox1, bbox2)
+
+                    if votes1 > votes2:
+                        # result1 wins, eliminate result2
+                        eliminated_indices.add(j)
+                        self.logger.info(f"Conflict resolved: {result1['emoji']} ({votes1} votes) beats {result2['emoji']} ({votes2} votes) - IoU: {iou:.3f}, center_dist: {center_dist:.1f}px, size_sim: {size_sim:.3f}")
+                    elif votes2 > votes1:
+                        # result2 wins, eliminate result1
+                        eliminated_indices.add(i)
+                        self.logger.info(f"Conflict resolved: {result2['emoji']} ({votes2} votes) beats {result1['emoji']} ({votes1} votes) - IoU: {iou:.3f}, center_dist: {center_dist:.1f}px, size_sim: {size_sim:.3f}")
+                        break  # result1 is eliminated, stop checking
+                    else:
+                        # Tie - use confidence as tiebreaker
+                        conf1 = result1['bbox_data'].get('avg_confidence', 0)
+                        conf2 = result2['bbox_data'].get('avg_confidence', 0)
+
+                        if conf1 > conf2:
+                            eliminated_indices.add(j)
+                            self.logger.info(f"Conflict resolved by confidence: {result1['emoji']} (conf: {conf1:.3f}) beats {result2['emoji']} (conf: {conf2:.3f}) - IoU: {iou:.3f}, center_dist: {center_dist:.1f}px, size_sim: {size_sim:.3f}")
+                        elif conf2 > conf1:
+                            eliminated_indices.add(i)
+                            self.logger.info(f"Conflict resolved by confidence: {result2['emoji']} (conf: {conf2:.3f}) beats {result1['emoji']} (conf: {conf1:.3f}) - IoU: {iou:.3f}, center_dist: {center_dist:.1f}px, size_sim: {size_sim:.3f}")
+                            break
+                        # If still tied, keep both (very rare)
+
+            # Add result1 if it wasn't eliminated
+            if i not in eliminated_indices:
+                resolved_results.append(result1)
+
+        eliminated_count = len(eliminated_indices)
+        if eliminated_count > 0:
+            self.logger.info(f"Near-identical conflict resolution: eliminated {eliminated_count} conflicting boxes")
+
+        return resolved_results
+
+    def calculate_bbox_iou(self, bbox1, bbox2):
+        """Calculate Intersection over Union (IoU) between two bounding boxes"""
+        # Extract coordinates
+        x1_1, y1_1 = bbox1['x'], bbox1['y']
+        x2_1, y2_1 = x1_1 + bbox1['width'], y1_1 + bbox1['height']
+
+        x1_2, y1_2 = bbox2['x'], bbox2['y']
+        x2_2, y2_2 = x1_2 + bbox2['width'], y1_2 + bbox2['height']
+
+        # Calculate intersection
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+
+        if x1_i >= x2_i or y1_i >= y2_i:
+            return 0.0  # No intersection
+
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+
+        # Calculate areas
+        area1 = bbox1['width'] * bbox1['height']
+        area2 = bbox2['width'] * bbox2['height']
+        union = area1 + area2 - intersection
+
+        return intersection / union if union > 0 else 0.0
+
+    def are_boxes_near_identical(self, bbox1, bbox2, iou_threshold, center_distance_threshold, size_similarity_threshold):
+        """Check if two bounding boxes are near-identical using multiple criteria"""
+        # 1. IoU check
+        iou = self.calculate_bbox_iou(bbox1, bbox2)
+        if iou < iou_threshold:
+            return False
+
+        # 2. Center distance check
+        center_distance = self.calculate_center_distance(bbox1, bbox2)
+        if center_distance > center_distance_threshold:
+            return False
+
+        # 3. Size similarity check
+        size_similarity = self.calculate_size_similarity(bbox1, bbox2)
+        if size_similarity < size_similarity_threshold:
+            return False
+
+        return True
+
+    def calculate_center_distance(self, bbox1, bbox2):
+        """Calculate distance between bounding box centers"""
+        cx1 = bbox1['x'] + bbox1['width'] / 2
+        cy1 = bbox1['y'] + bbox1['height'] / 2
+        cx2 = bbox2['x'] + bbox2['width'] / 2
+        cy2 = bbox2['y'] + bbox2['height'] / 2
+
+        return ((cx2 - cx1) ** 2 + (cy2 - cy1) ** 2) ** 0.5
+
+    def calculate_size_similarity(self, bbox1, bbox2):
+        """Calculate size similarity between two bounding boxes"""
+        w1, h1 = bbox1['width'], bbox1['height']
+        w2, h2 = bbox2['width'], bbox2['height']
+
+        # Calculate similarity for both dimensions
+        width_similarity = min(w1, w2) / max(w1, w2) if max(w1, w2) > 0 else 0
+        height_similarity = min(h1, h2) / max(h1, h2) if max(h1, h2) > 0 else 0
+
+        # Return the minimum similarity (both dimensions must be similar)
+        return min(width_similarity, height_similarity)
 
     def calculate_consensus(self, service_results, image_id):
-        """Main consensus calculation with clear logic"""
+        """Main consensus calculation with per-bounding-box voting"""
         if not service_results:
             return None
 
@@ -384,57 +655,84 @@ class ConsensusWorkerV2(BaseWorker):
         # Extract all detections
         all_detections = self.extract_detections_from_services(service_results_dict)
 
-        # Get spatial evidence
+        # Get spatial evidence (bounding boxes) as primary voting units
         spatial_evidence = self.get_spatial_evidence_for_image(image_id)
 
-        # Group by emoji and analyze
-        emoji_groups = self.group_detections_by_emoji(all_detections)
-        emoji_analysis = []
+        # NEW: Calculate votes per bounding box instead of per emoji
+        bbox_analysis = self.analyze_per_bbox_consensus(all_detections, spatial_evidence)
 
-        for emoji, detections in emoji_groups.items():
-            analysis = self.analyze_emoji_consensus(emoji, detections, spatial_evidence)
-            emoji_analysis.append(analysis)
-
-        # Apply filtering
-        filtered_results = self.apply_consensus_filtering(emoji_analysis)
+        # Apply vote-based filtering per bounding box
+        accepted_results = self.apply_bbox_vote_filtering(bbox_analysis)
 
         # Sort by total votes (descending)
-        filtered_results.sort(key=lambda x: x['total_votes'], reverse=True)
+        accepted_results.sort(key=lambda x: x['total_votes'], reverse=True)
 
-        # Format final results
+        # Format final results per bounding box
         consensus_results = []
-        for analysis in filtered_results:
+        for analysis in accepted_results:
+            # Calculate evidence breakdown
+            non_spatial_votes = analysis['semantic_votes'] + analysis['classification_votes']
+
             result = {
                 'emoji': analysis['emoji'],
                 'votes': analysis['total_votes'],
-                'evidence': {},
-                'services': list(set(d['service'] for d in analysis['all_detections'])),
-                'filter_reason': analysis['filter_reason']
+                'merged_id': analysis.get('merged_id'),  # Include bounding box ID
+                'democratic_confidence': analysis.get('democratic_confidence', 0),
+                'evidence': {
+                    'total_votes': analysis['total_votes'],
+                    'spatial_votes': analysis['spatial_votes'],
+                    'semantic_votes': analysis['semantic_votes'],
+                    'classification_votes': analysis['classification_votes'],
+                    'non_spatial_votes': non_spatial_votes,
+                    'democratic_confidence': analysis.get('democratic_confidence', 0),
+                    'summary': f"{non_spatial_votes} non-spatial" if non_spatial_votes > 0 else "spatial only",
+                    'evidence_summary': f"{non_spatial_votes} non-spatial" if non_spatial_votes > 0 else "spatial only",
+                    'final_decision': "consensus",
+                    'total_evidence': non_spatial_votes
+                },
+                'services': list(set(d['service'] for d in analysis['supporting_detections'])),
+                'filter_reason': analysis['filter_reason'],
+                # Add top-level evidence fields in case frontend looks there
+                'total_votes': analysis['total_votes'],
+                'spatial_votes': analysis['spatial_votes'],
+                'semantic_votes': analysis['semantic_votes'],
+                'classification_votes': analysis['classification_votes'],
+                'non_spatial_evidence': f"{non_spatial_votes} non-spatial" if non_spatial_votes > 0 else "spatial only"
             }
 
-            # Add spatial evidence in the format the benchmark expects
-            if analysis['spatial_analysis']:
+            # Add spatial evidence for this specific bounding box
+            if analysis['bbox_data']:
+                bbox_data = analysis['bbox_data']
                 result['evidence']['spatial'] = {
-                    'max_services_per_box': analysis['spatial_analysis']['max_services_per_box'],
-                    'peak_confidence': round(analysis['spatial_analysis']['peak_confidence'], 3),
-                    'avg_confidence': round(analysis['spatial_analysis']['avg_confidence'], 3),
-                    'total_boxes': analysis['spatial_analysis']['total_boxes']
+                    'max_services_per_box': bbox_data.get('detection_count', 0),
+                    'peak_confidence': round(bbox_data.get('avg_confidence', 0), 3),
+                    'avg_confidence': round(bbox_data.get('avg_confidence', 0), 3),
+                    'total_boxes': 1,  # This is for a single bounding box
+                    'detection_count': bbox_data.get('detection_count', 0)
                 }
                 result['instances'] = {'type': 'spatial'}
 
-                # Add bounding box coordinates for mAP calculation
-                result['bounding_boxes'] = []
-                for box in analysis['spatial_boxes']:
-                    bbox = box.get('merged_bbox', {})
-                    if bbox and all(k in bbox for k in ['x', 'y', 'width', 'height']):
-                        result['bounding_boxes'].append({
-                            'merged_bbox': bbox,  # Keep the nested structure the benchmark expects
-                            'avg_confidence': box.get('avg_confidence', 0),
-                            'peak_confidence': box.get('avg_confidence', 0),  # Use same value for peak
-                            'detection_count': box.get('detection_count', 0)
-                        })
+                # Add bounding box coordinates for this specific box
+                bbox = bbox_data.get('merged_bbox', {})
+                if bbox and all(k in bbox for k in ['x', 'y', 'width', 'height']):
+                    result['bounding_boxes'] = [{
+                        'merged_bbox': bbox,
+                        'avg_confidence': bbox_data.get('avg_confidence', 0),
+                        'peak_confidence': bbox_data.get('avg_confidence', 0),
+                        'detection_count': bbox_data.get('detection_count', 0)
+                    }]
+                else:
+                    result['bounding_boxes'] = []
             else:
                 result['instances'] = {'type': 'non_spatial'}
+                # Add empty spatial evidence for non-spatial items
+                result['evidence']['spatial'] = {
+                    'detection_count': 0,
+                    'total_boxes': 0,
+                    'avg_confidence': 0,
+                    'peak_confidence': 0
+                }
+                result['bounding_boxes'] = []
 
             consensus_results.append(result)
 
@@ -444,14 +742,15 @@ class ConsensusWorkerV2(BaseWorker):
             'services_list': [row[0] for row in service_results],
             'total_processing_time': sum(row[2] or 0 for row in service_results),
             'latest_result_time': max(row[3] for row in service_results).isoformat(),
-            'consensus_algorithm': 'v2_clear_logic',
+            'consensus_algorithm': 'merge_focused_permissive',
             'votes': {
                 'consensus': consensus_results
             },
             'special': {},  # Placeholder for special detections
             'debug': {
                 'total_detections': len(all_detections),
-                'emoji_groups_analyzed': len(emoji_analysis)
+                'bbox_instances_analyzed': len(bbox_analysis),
+                'optimization': 'merge_over_filter'
             }
         }
 
@@ -498,7 +797,7 @@ class ConsensusWorkerV2(BaseWorker):
             cursor.close()
 
             action = "Updated" if deleted_count > 0 else "Created"
-            result_count = len(consensus_data.get('consensus_results', []))
+            result_count = len(consensus_data.get('votes', {}).get('consensus', []))
             self.logger.info(f"{action} consensus for {image_filename}: {result_count} emojis from {len(service_results)} services")
 
             return True
@@ -520,21 +819,21 @@ class ConsensusWorkerV2(BaseWorker):
             image_id = message_data['image_id']
             image_filename = message_data.get('image_filename', f'image_{image_id}')
 
-            self.logger.info(f"Processing consensus for: {image_filename}")
+            self.logger.info(f"Processing merge-focused consensus for: {image_filename}")
 
             # Update consensus for this specific image
             success = self.update_consensus_for_image(image_id, image_filename)
 
             if success:
-                self.logger.info(f"Completed consensus for {image_filename}")
+                self.logger.info(f"Completed merge-focused consensus for {image_filename}")
             else:
-                self.logger.warning(f"Failed to update consensus for {image_filename}")
+                self.logger.error(f"Failed to update merge-focused consensus for {image_filename}")
 
             # Acknowledge the message
             ch.basic_ack(delivery_tag=method.delivery_tag)
 
         except Exception as e:
-            self.logger.error(f"Error processing consensus queue message: {e}")
+            self.logger.error(f"Error processing merge-focused consensus queue message: {e}")
             # Reject and requeue for retry
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
@@ -546,10 +845,10 @@ class ConsensusWorkerV2(BaseWorker):
         if not self.connect_to_queue():
             return 1
 
-        self.logger.info(f"Starting consensus worker V2 ({self.worker_id})")
+        self.logger.info(f"Starting merge-focused consensus worker ({self.worker_id})")
         self.logger.info(f"Listening on queue: {self.queue_name}")
-        self.logger.info(f"Consensus thresholds: strong={STRONG_CONSENSUS_THRESHOLD}, very_strong={VERY_STRONG_CONSENSUS_THRESHOLD}")
-        self.logger.info(f"Confidence thresholds: high={MINIMUM_CONFIDENCE}, multi_service={MULTI_SERVICE_MINIMUM_CONFIDENCE}")
+        self.logger.info(f"SIMPLE VOTE MODE: Vote count based filtering")
+        self.logger.info(f"Minimum votes required: {MINIMUM_VOTES_REQUIRED}")
 
         # Setup message consumer
         self.channel.basic_consume(
@@ -557,12 +856,12 @@ class ConsensusWorkerV2(BaseWorker):
             on_message_callback=self.process_queue_message
         )
 
-        self.logger.info("Waiting for consensus messages. Press CTRL+C to exit")
+        self.logger.info("Waiting for merge-focused consensus messages. Press CTRL+C to exit")
 
         try:
             self.channel.start_consuming()
         except KeyboardInterrupt:
-            self.logger.info("Stopping consensus worker V2...")
+            self.logger.info("Stopping merge-focused consensus worker...")
             self.channel.stop_consuming()
         finally:
             if self.connection and not self.connection.is_closed:
@@ -571,21 +870,21 @@ class ConsensusWorkerV2(BaseWorker):
                 self.db_conn.close()
             if self.read_db_conn:
                 self.read_db_conn.close()
-            self.logger.info("Consensus worker V2 stopped")
+            self.logger.info("Merge-focused consensus worker stopped")
 
         return 0
 
 def main():
     """Main entry point"""
     try:
-        worker = ConsensusWorkerV2()
+        worker = ConsensusWorkerMergeFocused()
         return worker.run()
 
     except ValueError as e:
         print(f"Configuration error: {e}")
         return 1
     except Exception as e:
-        print(f"Consensus worker V2 error: {e}")
+        print(f"Merge-focused consensus worker error: {e}")
         return 1
 
 if __name__ == "__main__":
