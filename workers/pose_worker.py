@@ -28,7 +28,7 @@ class BboxPoseWorker(PostProcessingWorker):
             response = requests.post(
                 self.service_url,
                 files=files,
-                timeout=self.request_timeout
+                timeout=(5, 5)  # (connection timeout, read timeout)
             )
             
             if response.status_code == 200:
@@ -39,6 +39,9 @@ class BboxPoseWorker(PostProcessingWorker):
             self.logger.warning(f"Pose service returned status {response.status_code}: {response.text[:200]}")
             return None
             
+        except requests.exceptions.Timeout as e:
+            self.logger.error(f"Pose service timeout after 5 seconds: {e}")
+            return None
         except Exception as e:
             self.logger.error(f"Error processing pose estimation: {e}")
             return None
