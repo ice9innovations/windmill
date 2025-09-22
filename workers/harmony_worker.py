@@ -31,6 +31,12 @@ CONTAINMENT_MERGE_RULES = [
         'container_emoji': '💻',  # laptop
         'containment_threshold': 0.9,  # 90% of keyboard must be within laptop (almost entirely contained)
         'description': 'Merge keyboard into laptop when keyboard is entirely contained within laptop'
+    },
+    {
+        'contained_emoji': '🖥️',  # screen
+        'container_emoji': '💻',  # laptop
+        'containment_threshold': 0.9,  # 90% of screen must be within laptop (almost entirely contained)
+        'description': 'Merge screen into laptop when screen is entirely contained within laptop'
     }
     # Add more rules here as needed, e.g.:
     # {
