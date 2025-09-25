@@ -1,0 +1,81 @@
+---
+- name: Manage Windmill Workers
+  hosts: windmill_workers
+  gather_facts: yes
+
+  vars:
+    operation: "{{ op | default('status') }}"
+    worker: "{{ worker_name | default('') }}"
+    git_branch: "{{ branch | default('main') }}"
+
+  tasks:
+    - name: Check if windmill directory exists
+      stat:
+        path: "{{ windmill_path }}"
+      register: windmill_dir
+
+    - name: Fail if windmill directory not found
+      fail:
+        msg: "Windmill directory not found at {{ windmill_path }} on {{ inventory_hostname }}"
+      when: not windmill_dir.stat.exists
+
+    - name: Check if windmill.sh script exists
+      stat:
+        path: "{{ windmill_path }}/windmill.sh"
+      register: windmill_script
+
+    - name: Fail if windmill.sh script not found
+      fail:
+        msg: "windmill.sh script not found at {{ windmill_path }}/windmill.sh on {{ inventory_hostname }}"
+      when: not windmill_script.stat.exists
+
+    - name: Execute windmill command (all workers)
+      shell: |
+        cd {{ windmill_path }}
+        ./windmill.sh {{ operation }}
+      register: windmill_output
+      become_user: "{{ windmill_user }}"
+      when: worker == ""
+
+    - name: Execute windmill command (specific worker)
+      shell: |
+        cd {{ windmill_path }}
+        ./windmill.sh {{ operation }} {{ worker }}
+      register: windmill_output
+      become_user: "{{ windmill_user }}"
+      when: worker != "" and operation != "update"
+
+    - name: Git pull to update code
+      shell: |
+        cd {{ windmill_path }}
+        git fetch origin
+        git reset --hard origin/{{ git_branch }}
+        git clean -fd
+      register: git_output
+      become_user: "{{ windmill_user }}"
+      when: operation == "update"
+
+    - name: Display git update output
+      debug:
+        msg: |
+          === {{ inventory_hostname }} Git Update ===
+          {{ git_output.stdout }}
+          {% if git_output.stderr %}
+          STDERR: {{ git_output.stderr }}
+          {% endif %}
+      when: operation == "update"
+
+    - name: Display windmill output
+      debug:
+        msg: |
+          === {{ inventory_hostname }} ===
+          {{ windmill_output.stdout }}
+          {% if windmill_output.stderr %}
+          STDERR: {{ windmill_output.stderr }}
+          {% endif %}
+      when: operation != "update"
+
+    - name: Check for windmill errors
+      fail:
+        msg: "Command failed on {{ inventory_hostname }}: {{ windmill_output.stderr }}"
+      when: windmill_output is defined and windmill_output.rc != 0 and windmill_output.stderr != ""

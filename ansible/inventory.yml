@@ -1,0 +1,107 @@
+# Windmill Worker Inventory
+# Organized by hardware type and access patterns
+all:
+  children:
+    # Raspberry Pi cluster
+    raspberry_pis:
+      hosts:
+        k1.local:
+          ansible_host: 192.168.0.121
+          ansible_user: k3s
+          worker_types: []  # PostgreSQL
+        k2.local:
+          ansible_host: 192.168.0.122
+          ansible_user: k3s
+          worker_types: []  # RabbitMQ only
+        hailo.local:
+          ansible_host: 192.168.0.123
+          ansible_user: hailo
+          worker_types: ['harmony', 'face', 'pose', 'colors', 'colors_post']
+        peach.local:
+          ansible_host: 192.168.0.120
+          ansible_user: peach
+          worker_types: ['harmony', 'face', 'pose', 'colors', 'colors_post']
+      vars:
+        # Pi-specific settings
+        python_path: /usr/bin/python3
+
+    # NVIDIA Jetson nodes (ARM64 + GPU)
+    nvidia_jetsons:
+      hosts:
+        orin.local:
+          ansible_host: orin.local
+          ansible_user: orin
+          worker_types: ['harmony', 'ollama', 'colors', 'colors_post']
+        iron.local:
+          ansible_host: iron.local
+          ansible_user: iron
+          worker_types: ['harmony', 'ollama', 'colors', 'colors_post']
+      vars:
+        # Jetson-specific settings
+        gpu_enabled: true
+
+    # Ubuntu x86 machines
+    ubuntu_boxes:
+      hosts:
+        dorothy.local:
+          ansible_host: dorothy.local
+          ansible_user: sd
+          worker_types: ['harmony', 'blip', 'caption_score', 'colors', 'colors_post', 'consensus', 'detectron', 'face', 'metadata', 'nswf2', 'ocr', 'ollama', 'pose', 'rtdetr', 'rtmdet', 'yolo_v8', 'yolo_365', 'yolo_oi7']
+      vars:
+        # x86 Ubuntu settings
+        high_cpu: true
+        gpu_enabled: true
+
+    # Local control node (MacBook - not managed via SSH)
+    local_control:
+      hosts:
+        localhost:
+          ansible_connection: local
+          ansible_user: "{{ ansible_env.USER }}"
+          worker_types: []  # Control only, no workers
+      vars:
+        # Local execution only
+        control_node: true
+
+    # Logical groupings for worker deployment
+    gpu_capable:
+      children:
+        - nvidia_jetsons
+      hosts:
+        orin.local: # Jetson
+        iron.local:  # Jetson
+      vars:
+        worker_types: ['ollama', 'colors', 'colors_post']
+
+    light_processing:
+      children:
+        - raspberry_pis
+      hosts:
+        ubuntu1.local:
+      vars:
+        worker_types: ['harmony', 'face', 'pose', 'colors_post', 'colors', 'metadata']
+
+    ollama_nodes:
+      hosts:
+        orin.local:
+        iron.local:
+        dorothy.local:
+      vars:
+        worker_types: ['ollama']
+
+    # All compute nodes (excludes NAS and local control)
+    windmill_workers:
+      children:
+        - raspberry_pis
+        - nvidia_jetsons
+        - ubuntu_boxes
+
+      vars:
+        # Common connection settings
+        ansible_user: "{{ ansible_user | default('sd') }}"
+        ansible_ssh_private_key_file: ~/.ssh/id_rsa
+        ansible_python_interpreter: /usr/bin/python3
+
+        # Windmill project settings
+        windmill_path: /home/sd/windmill
+        windmill_user: sd

@@ -1,0 +1,174 @@
+#!/bin/bash
+# Windmill Distributed Control Script
+# Usage: ./windmill-ctl {start|stop|restart|status} [worker] [--host hostname]
+
+set -e
+
+ANSIBLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ANSIBLE_DIR"
+
+# Colors
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+show_usage() {
+    echo "Usage: $0 {start|stop|restart|status|update|deploy} [worker] [--host hostname|--group groupname] [--branch branchname]"
+    echo ""
+    echo "Operations:"
+    echo "  start     - Start all workers or specific worker"
+    echo "  stop      - Stop all workers or specific worker"
+    echo "  restart   - Restart all workers or specific worker"
+    echo "  status    - Show status of all workers"
+    echo "  update    - Git pull latest code on all nodes"
+    echo "  deploy    - Full deployment: stop → update → start"
+    echo ""
+    echo "Options:"
+    echo "  worker    - Name of specific worker (e.g., blip, yolo, consensus)"
+    echo "  --host    - Target specific host (e.g., k3.local)"
+    echo "  --group   - Target node group (gpu_nodes, light_processing, ollama_nodes, specialized_nodes)"
+    echo "  --branch  - Git branch to update to (default: main)"
+    echo ""
+    echo "Examples:"
+    echo "  $0 status                         # Check status on all nodes"
+    echo "  $0 deploy                         # Deploy to all nodes (stop → update → start)"
+    echo "  $0 deploy --branch dev            # Deploy dev branch to all nodes"
+    echo "  $0 deploy --group gpu_nodes       # Deploy only to GPU nodes"
+    echo "  $0 update                         # Update code on all nodes"
+    echo "  $0 update --branch dev            # Update to dev branch on all nodes"
+    echo "  $0 update --group gpu_nodes       # Update code only on GPU nodes"
+    echo "  $0 start                          # Start all workers on all nodes"
+    echo "  $0 start ollama                   # Start ollama worker on all nodes that support it"
+    echo "  $0 start --group ollama_nodes     # Start all workers on ollama-capable nodes"
+    echo "  $0 start colors_post --group light_processing  # Start colors_post on light processing nodes"
+    echo "  $0 restart consensus --host k1.local           # Restart consensus worker on k1.local only"
+    echo "  $0 stop --group gpu_nodes         # Stop all workers on GPU nodes"
+}
+
+# Parse arguments
+OPERATION=""
+WORKER=""
+HOST=""
+GROUP=""
+BRANCH=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        start|stop|restart|status|update|deploy)
+            OPERATION="$1"
+            shift
+            ;;
+        --host)
+            HOST="$2"
+            shift 2
+            ;;
+        --group)
+            GROUP="$2"
+            shift 2
+            ;;
+        --branch)
+            BRANCH="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        *)
+            if [[ -z "$WORKER" ]]; then
+                WORKER="$1"
+            else
+                echo -e "${RED}Error: Unknown argument '$1'${NC}"
+                show_usage
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$OPERATION" ]]; then
+    echo -e "${RED}Error: Operation required${NC}"
+    show_usage
+    exit 1
+fi
+
+# Validate mutually exclusive options
+if [[ -n "$HOST" && -n "$GROUP" ]]; then
+    echo -e "${RED}Error: Cannot specify both --host and --group${NC}"
+    exit 1
+fi
+
+# Build ansible command
+ANSIBLE_CMD="ansible-playbook windmill.yml -e op=$OPERATION"
+
+if [[ -n "$WORKER" ]]; then
+    ANSIBLE_CMD="$ANSIBLE_CMD -e worker_name=$WORKER"
+fi
+
+if [[ -n "$BRANCH" ]]; then
+    ANSIBLE_CMD="$ANSIBLE_CMD -e branch=$BRANCH"
+fi
+
+if [[ -n "$HOST" ]]; then
+    ANSIBLE_CMD="$ANSIBLE_CMD --limit $HOST"
+elif [[ -n "$GROUP" ]]; then
+    ANSIBLE_CMD="$ANSIBLE_CMD --limit $GROUP"
+fi
+
+# Handle deploy operation (stop → update → start)
+if [[ "$OPERATION" == "deploy" ]]; then
+    echo -e "${GREEN}🚀 Starting deployment...${NC}"
+    echo ""
+
+    # Step 1: Stop workers
+    echo -e "${YELLOW}Step 1/3: Stopping workers...${NC}"
+    STOP_CMD="ansible-playbook windmill.yml -e op=stop"
+    if [[ -n "$WORKER" ]]; then
+        STOP_CMD="$STOP_CMD -e worker_name=$WORKER"
+    fi
+    if [[ -n "$HOST" ]]; then
+        STOP_CMD="$STOP_CMD --limit $HOST"
+    elif [[ -n "$GROUP" ]]; then
+        STOP_CMD="$STOP_CMD --limit $GROUP"
+    fi
+    eval "$STOP_CMD"
+
+    echo ""
+    echo -e "${YELLOW}Step 2/3: Updating code...${NC}"
+    # Step 2: Update code
+    UPDATE_CMD="ansible-playbook windmill.yml -e op=update"
+    if [[ -n "$BRANCH" ]]; then
+        UPDATE_CMD="$UPDATE_CMD -e branch=$BRANCH"
+    fi
+    if [[ -n "$HOST" ]]; then
+        UPDATE_CMD="$UPDATE_CMD --limit $HOST"
+    elif [[ -n "$GROUP" ]]; then
+        UPDATE_CMD="$UPDATE_CMD --limit $GROUP"
+    fi
+    eval "$UPDATE_CMD"
+
+    echo ""
+    echo -e "${YELLOW}Step 3/3: Starting workers...${NC}"
+    # Step 3: Start workers
+    START_CMD="ansible-playbook windmill.yml -e op=start"
+    if [[ -n "$WORKER" ]]; then
+        START_CMD="$START_CMD -e worker_name=$WORKER"
+    fi
+    if [[ -n "$HOST" ]]; then
+        START_CMD="$START_CMD --limit $HOST"
+    elif [[ -n "$GROUP" ]]; then
+        START_CMD="$START_CMD --limit $GROUP"
+    fi
+    eval "$START_CMD"
+
+    echo ""
+    echo -e "${GREEN}✅ Deployment complete!${NC}"
+
+else
+    # Normal single operation
+    echo -e "${YELLOW}Executing: $ANSIBLE_CMD${NC}"
+    echo ""
+    eval "$ANSIBLE_CMD"
+fi

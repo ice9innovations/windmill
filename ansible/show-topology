@@ -1,0 +1,58 @@
+#!/bin/bash
+# Show Windmill worker topology and node assignments
+
+ANSIBLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ANSIBLE_DIR"
+
+# Colors
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+echo -e "${BLUE}=== Windmill Worker Topology ===${NC}"
+echo ""
+
+# Show hardware groups
+echo -e "${YELLOW}Hardware Groups:${NC}"
+echo -e "  ${CYAN}raspberry_pis${NC}     - 4 Raspberry Pi nodes (ARM, lightweight)"
+echo -e "  ${CYAN}nvidia_jetsons${NC}    - 2 NVIDIA Jetson nodes (ARM64 + GPU)"
+echo -e "  ${CYAN}ubuntu_boxes${NC}      - 1 Ubuntu x86 machine (high CPU)"
+echo -e "  ${CYAN}nas_boxes${NC}         - 2 NAS devices (storage/infrastructure)"
+echo -e "  ${CYAN}local_control${NC}     - MacBook (control node, no SSH)"
+echo ""
+
+echo -e "${YELLOW}Logical Worker Groups:${NC}"
+echo -e "  ${CYAN}gpu_capable${NC}       - GPU-intensive ML workers"
+echo -e "  ${CYAN}light_processing${NC}  - CPU-bound workers that can scale"
+echo -e "  ${CYAN}ollama_nodes${NC}      - Nodes capable of running ollama"
+echo -e "  ${CYAN}windmill_workers${NC}  - All compute nodes (excludes NAS/control)"
+echo ""
+
+# Show available commands
+echo -e "${YELLOW}Example Commands:${NC}"
+echo "  # Deploy to all Raspberry Pi nodes"
+echo -e "  ${GREEN}./windmill-ctl deploy --group raspberry_pis${NC}"
+echo ""
+echo "  # Start GPU workers on Jetson nodes"
+echo -e "  ${GREEN}./windmill-ctl start --group nvidia_jetsons${NC}"
+echo ""
+echo "  # Start ollama on capable nodes"
+echo -e "  ${GREEN}./windmill-ctl start ollama --group ollama_nodes${NC}"
+echo ""
+echo "  # Update only compute nodes (skip NAS/control)"
+echo -e "  ${GREEN}./windmill-ctl update --group windmill_workers${NC}"
+echo ""
+echo "  # Check infrastructure status (NAS boxes)"
+echo -e "  ${GREEN}./windmill-ctl status --group nas_boxes${NC}"
+echo ""
+
+# Query actual inventory
+echo -e "${YELLOW}Current Inventory:${NC}"
+ansible-inventory --list --yaml 2>/dev/null | grep -E "^  [a-z].*:" | sed 's/://' | sort | while read group; do
+    if [[ "$group" =~ ^[[:space:]]*(gpu_nodes|light_processing|ollama_nodes|specialized_nodes)[[:space:]]*$ ]]; then
+        echo -e "  ${CYAN}$group${NC}"
+        ansible-inventory --list --yaml 2>/dev/null | sed -n "/^  $group:/,/^  [a-z].*:/{//!p}" | grep -E "    [a-z].*:" | sed 's/:.*//; s/^    /    - /'
+    fi
+done
