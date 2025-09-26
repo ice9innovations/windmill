@@ -25,19 +25,20 @@
       register: windmill_script
       when: windmill_dir.stat.exists and (worker_types is defined and worker_types|length > 0)
 
-    - name: Execute windmill command (all workers)
+    - name: Execute windmill command (configured workers only)
       shell: |
         cd {{ windmill_path }}
-        ./windmill.sh {{ operation }}
-      register: windmill_all_output
+        ./windmill.sh {{ operation }} {{ item }}
+      register: windmill_worker_output
+      loop: "{{ worker_types }}"
       when: worker == "" and operation != "update" and windmill_dir.stat.exists and (worker_types is defined and worker_types|length > 0)
 
     - name: Execute windmill command (specific worker)
       shell: |
         cd {{ windmill_path }}
         ./windmill.sh {{ operation }} {{ worker }}
-      register: windmill_worker_output
-      when: worker != "" and operation != "update" and windmill_dir.stat.exists and (worker_types is defined and worker_types|length > 0)
+      register: windmill_specific_output
+      when: worker != "" and operation != "update" and windmill_dir.stat.exists and (worker_types is defined and worker in worker_types)
 
     - name: Git pull to update code
       shell: |
@@ -56,22 +57,24 @@
           {% endif %}
       when: operation == "update" and git_output is defined and git_output.stdout is defined
 
-    - name: Display windmill output (all workers)
+    - name: Display windmill output (configured workers)
       debug:
-        msg: "{{ windmill_all_output.stdout | regex_replace('\\x1b\\[[0-9;]*m', '') | split('\n') }}"
-      when: operation != "update" and windmill_all_output is defined and windmill_all_output.stdout is defined
+        msg: "{{ item.stdout | regex_replace('\\x1b\\[[0-9;]*m', '') | split('\n') }}"
+      loop: "{{ windmill_worker_output.results }}"
+      when: operation != "update" and worker == "" and windmill_worker_output is defined and item.stdout is defined
 
     - name: Display windmill output (specific worker)
       debug:
-        msg: "{{ windmill_worker_output.stdout | regex_replace('\\x1b\\[[0-9;]*m', '') | split('\n') }}"
-      when: operation != "update" and windmill_worker_output is defined and windmill_worker_output.stdout is defined
+        msg: "{{ windmill_specific_output.stdout | regex_replace('\\x1b\\[[0-9;]*m', '') | split('\n') }}"
+      when: operation != "update" and worker != "" and windmill_specific_output is defined and windmill_specific_output.stdout is defined
 
-    - name: Check for windmill errors (all workers)
+    - name: Check for windmill errors (configured workers)
       fail:
-        msg: "Command failed on {{ inventory_hostname }}: {{ windmill_all_output.stderr }}"
-      when: windmill_all_output is defined and windmill_all_output.rc is defined and windmill_all_output.rc != 0
+        msg: "Command failed on {{ inventory_hostname }}: {{ item.stderr }}"
+      loop: "{{ windmill_worker_output.results }}"
+      when: worker == "" and windmill_worker_output is defined and item.rc is defined and item.rc != 0
 
     - name: Check for windmill errors (specific worker)
       fail:
-        msg: "Command failed on {{ inventory_hostname }}: {{ windmill_worker_output.stderr }}"
-      when: windmill_worker_output is defined and windmill_worker_output.rc is defined and windmill_worker_output.rc != 0
+        msg: "Command failed on {{ inventory_hostname }}: {{ windmill_specific_output.stderr }}"
+      when: worker != "" and windmill_specific_output is defined and windmill_specific_output.rc is defined and windmill_specific_output.rc != 0
