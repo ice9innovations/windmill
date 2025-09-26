@@ -260,8 +260,7 @@ class BaseWorker:
                 # Declare main queue with dead letter exchange routing to DLQ
                 args = {
                     'x-dead-letter-exchange': '',
-                    'x-dead-letter-routing-key': dlq_name,
-                    'x-max-length': int(os.getenv('QUEUE_MAX_LENGTH', '100000'))
+                    'x-dead-letter-routing-key': dlq_name
                 }
                 ttl_env = os.getenv('QUEUE_MESSAGE_TTL_MS')
                 if ttl_env and ttl_env.isdigit() and int(ttl_env) > 0:

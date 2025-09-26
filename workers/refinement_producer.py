@@ -99,8 +99,7 @@ class RefinementProducer:
                 channel.queue_declare(queue=dlq_name, durable=True)
                 args = {
                     'x-dead-letter-exchange': '',
-                    'x-dead-letter-routing-key': dlq_name,
-                    'x-max-length': int(os.getenv('QUEUE_MAX_LENGTH', '100000'))
+                    'x-dead-letter-routing-key': dlq_name
                 }
                 # Only add TTL if environment variable is set and positive
                 ttl_env = os.getenv('QUEUE_MESSAGE_TTL_MS')
