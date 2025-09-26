@@ -33,26 +33,21 @@
       shell: |
         cd {{ windmill_path }}
         ./windmill.sh {{ operation }}
-      register: windmill_output
-      become_user: "{{ windmill_user }}"
-      when: worker == ""
+      register: windmill_all_output
+      when: worker == "" and operation != "update"
 
     - name: Execute windmill command (specific worker)
       shell: |
         cd {{ windmill_path }}
         ./windmill.sh {{ operation }} {{ worker }}
-      register: windmill_output
-      become_user: "{{ windmill_user }}"
+      register: windmill_worker_output
       when: worker != "" and operation != "update"
 
     - name: Git pull to update code
       shell: |
         cd {{ windmill_path }}
-        git fetch origin
-        git reset --hard origin/{{ git_branch }}
-        git clean -fd
+        git pull origin {{ git_branch }}
       register: git_output
-      become_user: "{{ windmill_user }}"
       when: operation == "update"
 
     - name: Display git update output
@@ -65,17 +60,22 @@
           {% endif %}
       when: operation == "update"
 
-    - name: Display windmill output
+    - name: Display windmill output (all workers)
       debug:
-        msg: |
-          === {{ inventory_hostname }} ===
-          {{ windmill_output.stdout }}
-          {% if windmill_output.stderr %}
-          STDERR: {{ windmill_output.stderr }}
-          {% endif %}
-      when: operation != "update"
+        msg: "{{ windmill_all_output.stdout | regex_replace('\\x1b\\[[0-9;]*m', '') | split('\n') }}"
+      when: operation != "update" and windmill_all_output is defined and windmill_all_output.stdout is defined
 
-    - name: Check for windmill errors
+    - name: Display windmill output (specific worker)
+      debug:
+        msg: "{{ windmill_worker_output.stdout | regex_replace('\\x1b\\[[0-9;]*m', '') | split('\n') }}"
+      when: operation != "update" and windmill_worker_output is defined and windmill_worker_output.stdout is defined
+
+    - name: Check for windmill errors (all workers)
       fail:
-        msg: "Command failed on {{ inventory_hostname }}: {{ windmill_output.stderr }}"
-      when: windmill_output is defined and windmill_output.rc != 0 and windmill_output.stderr != ""
+        msg: "Command failed on {{ inventory_hostname }}: {{ windmill_all_output.stderr }}"
+      when: windmill_all_output is defined and windmill_all_output.rc is defined and windmill_all_output.rc != 0
+
+    - name: Check for windmill errors (specific worker)
+      fail:
+        msg: "Command failed on {{ inventory_hostname }}: {{ windmill_worker_output.stderr }}"
+      when: windmill_worker_output is defined and windmill_worker_output.rc is defined and windmill_worker_output.rc != 0

@@ -8,19 +8,19 @@ all:
         k1.local:
           ansible_host: 192.168.0.121
           ansible_user: k3s
-          worker_types: []  # PostgreSQL
+          worker_types: [] # PostgreSQL
         k2.local:
           ansible_host: 192.168.0.122
           ansible_user: k3s
-          worker_types: []  # RabbitMQ only
+          worker_types: [] # RabbitMQ only
         hailo.local:
           ansible_host: 192.168.0.123
           ansible_user: hailo
-          worker_types: ['harmony', 'face', 'pose', 'colors', 'colors_post']
+          worker_types: ["harmony", "face", "pose", "colors", "colors_post"]
         peach.local:
           ansible_host: 192.168.0.120
           ansible_user: peach
-          worker_types: ['harmony', 'face', 'pose', 'colors', 'colors_post']
+          worker_types: ["harmony", "face", "pose", "colors", "colors_post"]
       vars:
         # Pi-specific settings
         python_path: /usr/bin/python3
@@ -31,11 +31,13 @@ all:
         orin.local:
           ansible_host: orin.local
           ansible_user: orin
-          worker_types: ['harmony', 'ollama', 'colors', 'colors_post']
+          worker_types: ["harmony", "ollama", "colors", "colors_post"]
+          windmill_path: /media/orin/nvme/windmill # Custom path for NVME drive
         iron.local:
           ansible_host: iron.local
           ansible_user: iron
-          worker_types: ['harmony', 'ollama', 'colors', 'colors_post']
+          worker_types: ["harmony", "ollama", "colors", "colors_post"]
+          windmill_path: /media/nvme/windmill # Custom path for NVME drive
       vars:
         # Jetson-specific settings
         gpu_enabled: true
@@ -46,40 +48,53 @@ all:
         dorothy.local:
           ansible_host: dorothy.local
           ansible_user: sd
-          worker_types: ['harmony', 'blip', 'caption_score', 'colors', 'colors_post', 'consensus', 'detectron', 'face', 'metadata', 'nswf2', 'ocr', 'ollama', 'pose', 'rtdetr', 'rtmdet', 'yolo_v8', 'yolo_365', 'yolo_oi7']
+          worker_types:
+            [
+              "harmony",
+              "blip",
+              "caption_score",
+              "colors",
+              "colors_post",
+              "consensus",
+              "detectron",
+              "face",
+              "metadata",
+              "nswf2",
+              "ocr",
+              "ollama",
+              "pose",
+              "rtdetr",
+              "rtmdet",
+              "yolo_v8",
+              "yolo_365",
+              "yolo_oi7",
+            ]
       vars:
         # x86 Ubuntu settings
         high_cpu: true
         gpu_enabled: true
 
     # Local control node (MacBook - not managed via SSH)
-    local_control:
-      hosts:
-        localhost:
-          ansible_connection: local
-          ansible_user: "{{ ansible_env.USER }}"
-          worker_types: []  # Control only, no workers
-      vars:
-        # Local execution only
-        control_node: true
+    # Removed localhost to avoid inventory parsing issues
 
     # Logical groupings for worker deployment
     gpu_capable:
       children:
-        - nvidia_jetsons
+        nvidia_jetsons: {}
       hosts:
         orin.local: # Jetson
-        iron.local:  # Jetson
+        iron.local: # Jetson
       vars:
-        worker_types: ['ollama', 'colors', 'colors_post']
+        worker_types: ["ollama", "colors", "colors_post"]
 
     light_processing:
       children:
-        - raspberry_pis
+        raspberry_pis: {}
       hosts:
         ubuntu1.local:
       vars:
-        worker_types: ['harmony', 'face', 'pose', 'colors_post', 'colors', 'metadata']
+        worker_types:
+          ["harmony", "face", "pose", "colors_post", "colors", "metadata"]
 
     ollama_nodes:
       hosts:
@@ -87,14 +102,14 @@ all:
         iron.local:
         dorothy.local:
       vars:
-        worker_types: ['ollama']
+        worker_types: ["ollama"]
 
     # All compute nodes (excludes NAS and local control)
     windmill_workers:
       children:
-        - raspberry_pis
-        - nvidia_jetsons
-        - ubuntu_boxes
+        raspberry_pis: {}
+        nvidia_jetsons: {}
+        ubuntu_boxes: {}
 
       vars:
         # Common connection settings
@@ -103,5 +118,5 @@ all:
         ansible_python_interpreter: /usr/bin/python3
 
         # Windmill project settings
-        windmill_path: /home/sd/windmill
-        windmill_user: sd
+        windmill_path: "/home/{{ ansible_user }}/windmill"
+        windmill_user: "{{ ansible_user }}"
