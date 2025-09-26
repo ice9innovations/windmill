@@ -160,3 +160,11 @@ services:
       category: infrastructure
       service_type: harmonization
       # prefetch: 1  # default; keep single in-flight message per worker
+
+    segmentation:
+      queue_name: refinement
+      category: infrastructure
+      service_type: segmentation
+      host: localhost
+      port: 7793
+      endpoint: /analyze
