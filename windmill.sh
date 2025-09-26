@@ -2,6 +2,8 @@
 # Simple, reliable worker management (no wrapper scripts)
 # Usage: ./windmill.sh {start|stop|restart|status}
 
+source windmill_venv/bin/activate
+
 ACTION="$1"
 
 # Colors
