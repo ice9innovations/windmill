@@ -54,7 +54,7 @@
           {% if git_output.stderr %}
           STDERR: {{ git_output.stderr }}
           {% endif %}
-      when: operation == "update" and git_output is defined
+      when: operation == "update" and git_output is defined and git_output.stdout is defined
 
     - name: Display windmill output (all workers)
       debug:
