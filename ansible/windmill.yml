@@ -14,41 +14,37 @@
         path: "{{ windmill_path }}"
       register: windmill_dir
 
-    - name: Fail if windmill directory not found
-      fail:
-        msg: "Windmill directory not found at {{ windmill_path }} on {{ inventory_hostname }}"
-      when: not windmill_dir.stat.exists
+    - name: Skip hosts without windmill directory or empty worker_types
+      debug:
+        msg: "Skipping {{ inventory_hostname }} - no windmill directory or no worker types defined"
+      when: not windmill_dir.stat.exists or (worker_types is not defined or worker_types|length == 0)
 
     - name: Check if windmill.sh script exists
       stat:
         path: "{{ windmill_path }}/windmill.sh"
       register: windmill_script
-
-    - name: Fail if windmill.sh script not found
-      fail:
-        msg: "windmill.sh script not found at {{ windmill_path }}/windmill.sh on {{ inventory_hostname }}"
-      when: not windmill_script.stat.exists
+      when: windmill_dir.stat.exists and (worker_types is defined and worker_types|length > 0)
 
     - name: Execute windmill command (all workers)
       shell: |
         cd {{ windmill_path }}
         ./windmill.sh {{ operation }}
       register: windmill_all_output
-      when: worker == "" and operation != "update"
+      when: worker == "" and operation != "update" and windmill_dir.stat.exists and (worker_types is defined and worker_types|length > 0)
 
     - name: Execute windmill command (specific worker)
       shell: |
         cd {{ windmill_path }}
         ./windmill.sh {{ operation }} {{ worker }}
       register: windmill_worker_output
-      when: worker != "" and operation != "update"
+      when: worker != "" and operation != "update" and windmill_dir.stat.exists and (worker_types is defined and worker_types|length > 0)
 
     - name: Git pull to update code
       shell: |
         cd {{ windmill_path }}
         git pull origin {{ git_branch }}
       register: git_output
-      when: operation == "update"
+      when: operation == "update" and windmill_dir.stat.exists and (worker_types is defined and worker_types|length > 0)
 
     - name: Display git update output
       debug:
@@ -58,7 +54,7 @@
           {% if git_output.stderr %}
           STDERR: {{ git_output.stderr }}
           {% endif %}
-      when: operation == "update"
+      when: operation == "update" and git_output is defined
 
     - name: Display windmill output (all workers)
       debug:
