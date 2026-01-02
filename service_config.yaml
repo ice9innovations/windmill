@@ -67,6 +67,13 @@ services:
       endpoint: /v3/analyze
       service_type: specialized
 
+    nudenet:
+      queue_name: nudenet
+      host: localhost
+      port: 7789
+      endpoint: /v3/analyze
+      service_type: spatial
+
     ollama:
       queue_name: ollama
       host: localhost
