@@ -456,13 +456,41 @@ class HarmonyWorker(BaseWorker):
                 if not prediction.get('bbox'):
                     self.logger.debug(f"Skipping {service} prediction - no bbox")
                     continue
-                
+
+                # Normalize bbox format (handle both dict and array formats)
+                try:
+                    bbox = prediction['bbox']
+                    if isinstance(bbox, list):
+                        # Array format [x, y, w, h] - convert to dict
+                        if len(bbox) != 4:
+                            self.logger.warning(f"Skipping {service} prediction - invalid bbox array length: {len(bbox)}")
+                            continue
+                        normalized_bbox = {
+                            'x': bbox[0],
+                            'y': bbox[1],
+                            'width': bbox[2],
+                            'height': bbox[3]
+                        }
+                        self.logger.debug(f"Normalized {service} bbox from array to dict format")
+                    elif isinstance(bbox, dict):
+                        # Already in dict format - validate required keys
+                        if not all(k in bbox for k in ['x', 'y', 'width', 'height']):
+                            self.logger.warning(f"Skipping {service} prediction - missing required bbox keys: {bbox.keys()}")
+                            continue
+                        normalized_bbox = bbox
+                    else:
+                        self.logger.warning(f"Skipping {service} prediction - unknown bbox format: {type(bbox)}")
+                        continue
+                except Exception as e:
+                    self.logger.warning(f"Skipping {service} prediction - error normalizing bbox: {e}")
+                    continue
+
                 # Extract detection with harmonized format
                 detection = {
                     'service': service,
                     'label': prediction.get('label', ''),
                     'emoji': prediction.get('emoji', ''),
-                    'bbox': prediction['bbox'],
+                    'bbox': normalized_bbox,
                     'confidence': prediction.get('confidence', 0.0),
                     'type': prediction.get('type', 'object_detection')
                 }
