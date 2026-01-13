@@ -30,6 +30,12 @@ class BaseWorker:
         self.channel = None
         self.jobs_completed = 0
         self.jobs_failed = 0
+
+        # Database resilience tracking
+        self.consecutive_db_failures = 0
+        self.max_db_failures_before_backoff = 3
+        self.db_backoff_delay = 1  # Start with 1 second
+        self.max_db_backoff_delay = 60  # Max 60 seconds
         
     def load_config(self, env_file):
         """Load configuration from .env and service_config.yaml"""
@@ -230,10 +236,76 @@ class BaseWorker:
             )
             self.db_conn.autocommit = True
             self.logger.info(f"Connected to PostgreSQL at {self.db_host}")
+
+            # Reset failure tracking on successful connection
+            self.consecutive_db_failures = 0
+            self.db_backoff_delay = 1
+
             return True
         except Exception as e:
             self.logger.error(f"Failed to connect to database: {e}")
             return False
+
+    def ensure_database_connection(self):
+        """
+        Ensure database connection is healthy, reconnect if needed.
+        Returns True if connection is healthy, False otherwise.
+        Implements exponential backoff on consecutive failures.
+        """
+        try:
+            # Check if connection exists and is open
+            if not self.db_conn or self.db_conn.closed:
+                self.logger.warning("Database connection is closed")
+                return self._reconnect_database()
+
+            # Validate connection with a test query
+            cursor = self.db_conn.cursor()
+            cursor.execute("SELECT 1")
+            cursor.close()
+
+            # Connection is healthy - reset failure tracking
+            if self.consecutive_db_failures > 0:
+                self.logger.info("Database connection restored")
+                self.consecutive_db_failures = 0
+                self.db_backoff_delay = 1
+
+            return True
+
+        except Exception as e:
+            self.logger.warning(f"Database health check failed: {e}")
+            return self._reconnect_database()
+
+    def _reconnect_database(self):
+        """
+        Attempt to reconnect to database with exponential backoff.
+        Returns True if reconnection successful, False otherwise.
+        """
+        self.consecutive_db_failures += 1
+
+        # Apply exponential backoff after consecutive failures
+        if self.consecutive_db_failures >= self.max_db_failures_before_backoff:
+            self.logger.warning(
+                f"Database connection failed {self.consecutive_db_failures} times, "
+                f"backing off for {self.db_backoff_delay}s"
+            )
+            time.sleep(self.db_backoff_delay)
+
+            # Increase backoff delay (exponential with cap)
+            self.db_backoff_delay = min(
+                self.db_backoff_delay * 2,
+                self.max_db_backoff_delay
+            )
+
+        # Attempt reconnection
+        self.logger.info("Attempting database reconnection...")
+        success = self.connect_to_database()
+
+        if not success:
+            self.logger.error(
+                f"Database reconnection failed (attempt {self.consecutive_db_failures})"
+            )
+
+        return success
     
     def connect_to_queue(self):
         """Connect to RabbitMQ queue"""
@@ -283,19 +355,31 @@ class BaseWorker:
     def process_message(self, ch, method, properties, body):
         """Process a queue message - common logic for all workers"""
         try:
+            # Ensure database connection is healthy before processing
+            if not self.ensure_database_connection():
+                self.logger.error(
+                    "Database connection unavailable, rejecting message without requeue. "
+                    "Worker will retry after backoff delay."
+                )
+                # Reject without requeue to prevent CPU spin during DB outage
+                # Message will go to DLQ after max retries
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                self.job_failed("Database unavailable")
+                return
+
             # Parse message
             message = json.loads(body)
             image_id = message['image_id']
             trace_id = message.get('trace_id')
-            
+
             if trace_id:
                 self.logger.debug(f"[{trace_id}] Processing {self.service_name} request for image {image_id}")
             else:
                 self.logger.debug(f"Processing {self.service_name} request for image {image_id}")
-            
+
             # Call ML service
             result = self.post_image_data(message['image_data'])
-            
+
             # Store result in database
             cursor = self.db_conn.cursor()
             cursor.execute("""
@@ -304,7 +388,7 @@ class BaseWorker:
             """, (image_id, self._get_clean_service_name(), json.dumps(result), 'success', datetime.now(), self.worker_id))
             self.db_conn.commit()  # CRITICAL: Commit the transaction!
             cursor.close()
-            
+
             # Trigger post-processing for bbox services
             if self.service_name in self.bbox_services and self.enable_triggers:
                 # Check if connection is healthy
@@ -313,7 +397,7 @@ class BaseWorker:
                     if not self.connect_to_queue():
                         self.logger.error("Failed to reconnect to RabbitMQ for consensus message")
                         raise Exception("RabbitMQ reconnection failed")
-                
+
                 bbox_message = {
                     'image_id': image_id,
                     'image_filename': message.get('image_filename', f'image_{image_id}'),
@@ -323,33 +407,40 @@ class BaseWorker:
                     'worker_id': self.worker_id,
                     'processed_at': datetime.now().isoformat()
                 }
-                
+
                 self.channel.basic_publish(
                     exchange='',
                     routing_key=self._get_queue_by_service_type('harmonization'),
                     body=json.dumps(bbox_message),
                     properties=pika.BasicProperties(delivery_mode=2)
                 )
-                
+
                 harmonization_queue = self._get_queue_by_service_type('harmonization')
                 self.logger.debug(f"Published bbox completion to {harmonization_queue}")
-            
+
             # Trigger caption scoring
             if self.enable_caption_scoring:
                 self.trigger_caption_scoring(image_id, message)
-            
+
             # Trigger consensus processing
             self.trigger_consensus(image_id, message)
 
             # Acknowledge message
             ch.basic_ack(delivery_tag=method.delivery_tag)
             self.job_completed_successfully()
-            
+
             self.logger.info(f"Successfully processed {self.service_name} request for image {image_id}")
-            
+
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            # Database connection errors - don't requeue to prevent CPU spin
+            self.logger.error(f"Database error processing {self.service_name} message: {e}")
+            self.logger.warning("Rejecting message without requeue due to database error")
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            self.job_failed(str(e))
         except Exception as e:
+            # Other errors (ML service, parsing, etc.) - requeue for retry
             self.logger.error(f"Error processing {self.service_name} message: {e}")
-            # Reject and requeue
+            # Reject and requeue for transient errors
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
             self.job_failed(str(e))
     

@@ -113,40 +113,30 @@ class HarmonyWorker(BaseWorker):
             return False
     
     def ensure_database_connection(self):
-        """Ensure database connections are healthy, reconnect if needed"""
-        reconnect_needed = False
-        
-        # Check main connection
-        try:
-            if not self.db_conn or self.db_conn.closed:
-                reconnect_needed = True
-            else:
-                # Test connection with simple query
-                cursor = self.db_conn.cursor()
-                cursor.execute("SELECT 1")
-                cursor.close()
-        except Exception as e:
-            self.logger.warning(f"Main database connection unhealthy: {e}")
-            reconnect_needed = True
-            
-        # Check read connection  
+        """
+        Ensure database connections are healthy, reconnect if needed.
+        Overrides base class to also check read connection.
+        """
+        # Check main connection using base class (includes backoff logic)
+        if not super().ensure_database_connection():
+            return False
+
+        # Also check read connection
         try:
             if not self.read_db_conn or self.read_db_conn.closed:
-                reconnect_needed = True
-            else:
-                # Test connection with simple query
-                cursor = self.read_db_conn.cursor()
-                cursor.execute("SELECT 1")
-                cursor.close()
+                self.logger.warning("Read database connection is closed")
+                return self.connect_to_database()
+
+            # Validate read connection with test query
+            cursor = self.read_db_conn.cursor()
+            cursor.execute("SELECT 1")
+            cursor.close()
+
+            return True
+
         except Exception as e:
             self.logger.warning(f"Read database connection unhealthy: {e}")
-            reconnect_needed = True
-            
-        if reconnect_needed:
-            self.logger.info("Reconnecting to database...")
             return self.connect_to_database()
-            
-        return True
     
     def connect_to_queue(self):
         """Connect to RabbitMQ for queue-based processing"""

@@ -36,9 +36,9 @@ def get_val_files(val_dir):
         print(f"❌ Directory not found: {val_dir}")
         return []
 
-    # Get common image formats
+    # Get JPG/JPEG files only
     image_files = []
-    for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp']:
+    for ext in ['*.jpg', '*.jpeg']:
         image_files.extend(val_path.glob(ext))
 
     print(f"📁 Found {len(image_files)} image files")

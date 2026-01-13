@@ -175,3 +175,8 @@ services:
       host: localhost
       port: 7793
       endpoint: /analyze
+
+    content_analysis:
+      queue_name: content_analysis
+      category: infrastructure
+      service_type: content_analysis

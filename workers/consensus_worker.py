@@ -34,6 +34,11 @@ class ConsensusWorkerMergeFocused(BaseWorker):
         self.special_emojis = ['🔞', '💬']
         self.default_confidence = float(os.getenv('DEFAULT_CONFIDENCE', '0.75'))
 
+        # NSFW-specific configuration
+        # Minimum confidence for nsfw2 when it's the ONLY voter (no NudeNet/VLM corroboration)
+        # NudeNet spatial evidence always accepted regardless of confidence
+        self.nsfw2_solo_confidence_threshold = float(os.getenv('NSFW2_SOLO_CONFIDENCE_THRESHOLD', '0.70'))
+
         # Dual database connections for read/write separation
         self.read_db_conn = None
 
@@ -62,38 +67,62 @@ class ConsensusWorkerMergeFocused(BaseWorker):
             return False
 
     def ensure_database_connection(self):
-        """Ensure database connections are healthy, reconnect if needed"""
-        reconnect_needed = False
+        """
+        Ensure database connections are healthy, reconnect if needed.
+        Overrides base class to also check read connection.
+        """
+        # Check main connection using base class (includes backoff logic)
+        if not super().ensure_database_connection():
+            return False
 
-        # Check main connection
-        try:
-            if not self.db_conn or self.db_conn.closed:
-                reconnect_needed = True
-            else:
-                cursor = self.db_conn.cursor()
-                cursor.execute("SELECT 1")
-                cursor.close()
-        except Exception as e:
-            self.logger.warning(f"Main database connection unhealthy: {e}")
-            reconnect_needed = True
-
-        # Check read connection
+        # Also check read connection
         try:
             if not self.read_db_conn or self.read_db_conn.closed:
-                reconnect_needed = True
-            else:
-                cursor = self.read_db_conn.cursor()
-                cursor.execute("SELECT 1")
-                cursor.close()
+                self.logger.warning("Read database connection is closed")
+                return self.connect_to_database()
+
+            # Validate read connection with test query
+            cursor = self.read_db_conn.cursor()
+            cursor.execute("SELECT 1")
+            cursor.close()
+
+            return True
+
         except Exception as e:
             self.logger.warning(f"Read database connection unhealthy: {e}")
-            reconnect_needed = True
-
-        if reconnect_needed:
-            self.logger.info("Reconnecting to database...")
             return self.connect_to_database()
 
-        return True
+    def trigger_content_analysis(self, image_id, image_filename):
+        """Trigger content analysis after consensus completes"""
+        try:
+            # Check if connection is healthy
+            if not self.channel or self.connection.is_closed:
+                self.logger.warning("RabbitMQ connection lost, reconnecting...")
+                if not self.connect_to_queue():
+                    self.logger.error("Failed to reconnect to RabbitMQ for content_analysis message")
+                    return False
+
+            content_analysis_message = {
+                'image_id': image_id,
+                'image_filename': image_filename,
+                'triggered_by': 'consensus',
+                'worker_id': self.worker_id,
+                'triggered_at': datetime.now().isoformat()
+            }
+
+            self.channel.basic_publish(
+                exchange='',
+                routing_key='content_analysis',
+                body=json.dumps(content_analysis_message),
+                properties=pika.BasicProperties(delivery_mode=2)
+            )
+
+            self.logger.debug(f"Triggered content analysis for image {image_id}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error triggering content analysis: {e}")
+            return False
 
     def get_service_results_for_image(self, image_id):
         """Get all successful service results for an image"""
@@ -638,6 +667,108 @@ class ConsensusWorkerMergeFocused(BaseWorker):
         # Return the minimum similarity (both dimensions must be similar)
         return min(width_similarity, height_similarity)
 
+    def handle_nsfw_special_case(self, bbox_analysis, accepted_results):
+        """
+        Special handling for NSFW (🔞) emoji - treat as image-level determination.
+
+        NSFW is different from other emojis because:
+        1. We're determining if the IMAGE is NSFW, not individual objects
+        2. Evidence comes from multiple incompatible sources:
+           - nsfw2: whole-image classification
+           - NudeNet: spatial bboxes showing explicit content
+           - VLMs: semantic mentions in captions
+        3. Only NudeNet provides spatial evidence, so can't reach 2+ spatial vote threshold
+
+        Logic:
+        - Aggregate ALL 🔞 evidence (regardless of filtering) into single image-level vote
+        - Accept if ANY 🔞 evidence exists (lower threshold for critical content)
+        - Prioritize spatial evidence (NudeNet) over classification (nsfw2)
+        """
+        # Find all 🔞 instances in bbox_analysis (including filtered ones)
+        nsfw_instances = [inst for inst in bbox_analysis if normalize_emoji(inst['emoji']) == '🔞']
+
+        if not nsfw_instances:
+            # No NSFW evidence at all
+            return accepted_results
+
+        # Remove any 🔞 entries that were already in accepted_results
+        # (from per-bbox processing) - we'll replace with aggregated version
+        accepted_results = [r for r in accepted_results if normalize_emoji(r['emoji']) != '🔞']
+
+        # Aggregate all NSFW evidence
+        all_spatial_votes = sum(inst['spatial_votes'] for inst in nsfw_instances)
+        all_semantic_votes = sum(inst['semantic_votes'] for inst in nsfw_instances)
+        all_classification_votes = sum(inst['classification_votes'] for inst in nsfw_instances)
+        total_votes = all_spatial_votes + all_semantic_votes + all_classification_votes
+
+        # Collect all supporting detections
+        all_supporting_detections = []
+        for inst in nsfw_instances:
+            all_supporting_detections.extend(inst['supporting_detections'])
+
+        # Check if nsfw2 is the only voter (no spatial/semantic corroboration)
+        if all_classification_votes > 0 and all_spatial_votes == 0 and all_semantic_votes == 0:
+            # nsfw2 is voting alone - check confidence threshold
+            # Find nsfw2 detection to get confidence
+            nsfw2_detections = [d for d in all_supporting_detections if d['service'] == 'nsfw2']
+            if nsfw2_detections:
+                nsfw2_confidence = nsfw2_detections[0].get('confidence', 0)
+                if nsfw2_confidence < self.nsfw2_solo_confidence_threshold:
+                    self.logger.info(f"NSFW (🔞) filtered: nsfw2 solo vote at {nsfw2_confidence:.1%} confidence "
+                                   f"below threshold ({self.nsfw2_solo_confidence_threshold:.1%})")
+                    return accepted_results
+
+        # Collect all bboxes (from NudeNet spatial evidence)
+        all_bboxes = []
+        for inst in nsfw_instances:
+            if inst.get('bbox_data'):
+                all_bboxes.append(inst['bbox_data'])
+
+        # Determine evidence type priority
+        if all_spatial_votes > 0:
+            primary_evidence = 'spatial (NudeNet bboxes)'
+            instances_type = 'spatial'
+        elif all_classification_votes > 0:
+            primary_evidence = 'classification (nsfw2)'
+            instances_type = 'classification'
+        else:
+            primary_evidence = 'semantic (VLM mentions)'
+            instances_type = 'semantic'
+
+        # Create aggregated NSFW consensus entry
+        nsfw_aggregated = {
+            'emoji': '🔞',
+            'normalized_emoji': '🔞',
+            'total_votes': total_votes,
+            'spatial_votes': all_spatial_votes,
+            'semantic_votes': all_semantic_votes,
+            'classification_votes': all_classification_votes,
+            'merged_id': None,  # Image-level, not tied to specific bbox
+            'bbox_data': None,  # Will be handled separately
+            'supporting_detections': all_supporting_detections,
+            'contributing_services': list(set(d['service'] for d in all_supporting_detections)),
+            'filter_reason': f"NSFW special case: {total_votes} total votes ({primary_evidence}), image-level determination",
+            'instances_type': instances_type,
+            'all_bboxes': all_bboxes  # Store all NudeNet bboxes for evidence
+        }
+
+        # Log the NSFW determination
+        confidence_note = ""
+        if all_classification_votes > 0 and all_spatial_votes == 0 and all_semantic_votes == 0:
+            nsfw2_detections = [d for d in all_supporting_detections if d['service'] == 'nsfw2']
+            if nsfw2_detections:
+                nsfw2_confidence = nsfw2_detections[0].get('confidence', 0)
+                confidence_note = f" - nsfw2 solo at {nsfw2_confidence:.1%} (threshold: {self.nsfw2_solo_confidence_threshold:.1%})"
+
+        self.logger.info(f"NSFW (🔞) image-level determination: {total_votes} votes "
+                        f"(spatial: {all_spatial_votes}, classification: {all_classification_votes}, "
+                        f"semantic: {all_semantic_votes}) - {len(all_bboxes)} bboxes from NudeNet{confidence_note}")
+
+        # Add to accepted results
+        accepted_results.append(nsfw_aggregated)
+
+        return accepted_results
+
     def calculate_consensus(self, service_results, image_id):
         """Main consensus calculation with per-bounding-box voting"""
         if not service_results:
@@ -663,6 +794,9 @@ class ConsensusWorkerMergeFocused(BaseWorker):
 
         # Apply vote-based filtering per bounding box
         accepted_results = self.apply_bbox_vote_filtering(bbox_analysis)
+
+        # SPECIAL: Handle NSFW (🔞) as image-level determination
+        accepted_results = self.handle_nsfw_special_case(bbox_analysis, accepted_results)
 
         # Sort by total votes (descending)
         accepted_results.sort(key=lambda x: x['total_votes'], reverse=True)
@@ -700,8 +834,47 @@ class ConsensusWorkerMergeFocused(BaseWorker):
                 'non_spatial_evidence': f"{non_spatial_votes} non-spatial" if non_spatial_votes > 0 else "spatial only"
             }
 
+            # Handle NSFW special case with multiple bboxes
+            if analysis.get('all_bboxes'):
+                # NSFW special case: aggregate all NudeNet bboxes
+                all_bboxes = analysis['all_bboxes']
+                if all_bboxes:
+                    avg_confidence = sum(b.get('avg_confidence', 0) for b in all_bboxes) / len(all_bboxes)
+                    peak_confidence = max(b.get('avg_confidence', 0) for b in all_bboxes)
+                    total_detection_count = sum(b.get('detection_count', 0) for b in all_bboxes)
+
+                    result['evidence']['spatial'] = {
+                        'max_services_per_box': max(b.get('detection_count', 0) for b in all_bboxes),
+                        'peak_confidence': round(peak_confidence, 3),
+                        'avg_confidence': round(avg_confidence, 3),
+                        'total_boxes': len(all_bboxes),
+                        'detection_count': total_detection_count
+                    }
+                    result['instances'] = {'type': analysis.get('instances_type', 'spatial')}
+
+                    # Add all bounding boxes
+                    result['bounding_boxes'] = []
+                    for bbox_data in all_bboxes:
+                        bbox = bbox_data.get('merged_bbox', {})
+                        if bbox and all(k in bbox for k in ['x', 'y', 'width', 'height']):
+                            result['bounding_boxes'].append({
+                                'merged_bbox': bbox,
+                                'avg_confidence': bbox_data.get('avg_confidence', 0),
+                                'peak_confidence': bbox_data.get('avg_confidence', 0),
+                                'detection_count': bbox_data.get('detection_count', 0)
+                            })
+                else:
+                    # No bboxes even though this is NSFW (classification only)
+                    result['instances'] = {'type': analysis.get('instances_type', 'non_spatial')}
+                    result['evidence']['spatial'] = {
+                        'detection_count': 0,
+                        'total_boxes': 0,
+                        'avg_confidence': 0,
+                        'peak_confidence': 0
+                    }
+                    result['bounding_boxes'] = []
             # Add spatial evidence for this specific bounding box
-            if analysis['bbox_data']:
+            elif analysis['bbox_data']:
                 bbox_data = analysis['bbox_data']
                 result['evidence']['spatial'] = {
                     'max_services_per_box': bbox_data.get('detection_count', 0),
@@ -826,6 +999,9 @@ class ConsensusWorkerMergeFocused(BaseWorker):
 
             if success:
                 self.logger.info(f"Completed merge-focused consensus for {image_filename}")
+
+                # Trigger content analysis after consensus completes
+                self.trigger_content_analysis(image_id, image_filename)
             else:
                 self.logger.error(f"Failed to update merge-focused consensus for {image_filename}")
 
