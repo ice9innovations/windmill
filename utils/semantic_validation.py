@@ -301,6 +301,118 @@ def detect_gender_hallucination(captions, spatial_gender_inference):
     return hallucinations
 
 
+def vote_on_gender(spatial_gender_inference, captions):
+    """
+    Combine NudeNet spatial evidence with VLM caption mentions to vote on gender.
+
+    When NudeNet and VLMs agree, confidence increases.
+    When they disagree, we note the conflict but don't blindly trust either.
+
+    Args:
+        spatial_gender_inference: dict from infer_gender_from_anatomy()
+        captions: list of VLM caption dicts with 'service' and 'text'
+
+    Returns:
+        dict: {
+            'gender': str,
+            'confidence': float,
+            'votes': {
+                'nudenet': {'gender': str, 'confidence': float},
+                'vlm_votes': [{'service': str, 'gender': str}],
+                'agreement_count': int,
+                'disagreement_count': int
+            },
+            'reasoning': str
+        }
+    """
+    import re
+
+    spatial_gender = spatial_gender_inference['gender']
+    spatial_confidence = spatial_gender_inference['confidence']
+
+    # Count VLM votes
+    vlm_votes = []
+    male_votes = 0
+    female_votes = 0
+
+    for caption in captions:
+        service = caption.get('service', 'unknown')
+        text = caption.get('text', '').lower()
+
+        # Check for gender mentions using word boundaries
+        male_mentioned = any(re.search(r'\b' + re.escape(kw) + r'\b', text) for kw in GENDER_KEYWORDS['male'])
+        female_mentioned = any(re.search(r'\b' + re.escape(kw) + r'\b', text) for kw in GENDER_KEYWORDS['female'])
+
+        if male_mentioned and not female_mentioned:
+            vlm_votes.append({'service': service, 'gender': 'male'})
+            male_votes += 1
+        elif female_mentioned and not male_mentioned:
+            vlm_votes.append({'service': service, 'gender': 'female'})
+            female_votes += 1
+        elif male_mentioned and female_mentioned:
+            vlm_votes.append({'service': service, 'gender': 'mixed'})
+        # else: no gender mentioned, no vote
+
+    # Calculate agreement/disagreement with spatial evidence
+    agreement_count = 0
+    disagreement_count = 0
+
+    for vote in vlm_votes:
+        if vote['gender'] == spatial_gender:
+            agreement_count += 1
+        elif vote['gender'] != 'mixed' and spatial_gender != 'mixed' and spatial_gender != 'unknown':
+            disagreement_count += 1
+
+    # Determine final gender and confidence
+    final_gender = spatial_gender
+    final_confidence = spatial_confidence
+    reasoning = 'spatial_only'
+
+    if spatial_gender == 'unknown':
+        # No spatial evidence - rely on VLM consensus
+        if female_votes > male_votes and female_votes > 0:
+            final_gender = 'female'
+            final_confidence = min(0.5 + (female_votes * 0.1), 0.75)  # Cap at 0.75 without spatial
+            reasoning = 'vlm_consensus_only'
+        elif male_votes > female_votes and male_votes > 0:
+            final_gender = 'male'
+            final_confidence = min(0.5 + (male_votes * 0.1), 0.75)
+            reasoning = 'vlm_consensus_only'
+    else:
+        # Have spatial evidence - use VLMs to adjust confidence
+        if agreement_count > 0 and disagreement_count == 0:
+            # VLMs agree with spatial - boost confidence
+            boost = min(agreement_count * 0.02, 0.04)  # Max 4% boost
+            final_confidence = min(spatial_confidence + boost, 0.99)
+            reasoning = 'spatial_vlm_agreement'
+        elif disagreement_count > 0 and agreement_count == 0:
+            # VLMs disagree with spatial - reduce confidence slightly
+            # But spatial evidence is generally more reliable
+            penalty = min(disagreement_count * 0.05, 0.1)  # Max 10% penalty
+            final_confidence = max(spatial_confidence - penalty, 0.7)
+            reasoning = 'spatial_vlm_conflict'
+        elif agreement_count > 0 and disagreement_count > 0:
+            # Mixed signals - slight confidence reduction
+            final_confidence = spatial_confidence - 0.03
+            reasoning = 'spatial_vlm_mixed'
+
+    return {
+        'gender': final_gender,
+        'confidence': final_confidence,
+        'votes': {
+            'nudenet': {
+                'gender': spatial_gender,
+                'confidence': spatial_confidence,
+                'markers': spatial_gender_inference.get('spatial_markers', 0)
+            },
+            'vlm_votes': vlm_votes,
+            'agreement_count': agreement_count,
+            'disagreement_count': disagreement_count
+        },
+        'reasoning': reasoning
+    }
+
+
 def classify_female_solo_nudity(anatomy, captions, context_objects):
     """
     Distinguish artistic nudity from softcore pornography.

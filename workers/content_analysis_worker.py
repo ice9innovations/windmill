@@ -20,6 +20,7 @@ from utils.semantic_validation import (
     validate_category_with_captions,
     infer_gender_from_anatomy,
     detect_gender_hallucination,
+    vote_on_gender,
     classify_female_solo_nudity
 )
 from utils.spatial_analysis import (
@@ -29,7 +30,7 @@ from utils.spatial_analysis import (
 from utils.framing_analysis import classify_framing
 from utils.face_correlation import correlate_faces, get_face_gender_attribution
 
-ANALYSIS_VERSION = '1.1.0'
+ANALYSIS_VERSION = '1.2.0'
 
 
 class ContentAnalysisWorker(BaseWorker):
@@ -251,10 +252,13 @@ class ContentAnalysisWorker(BaseWorker):
             deduplicated_person_bboxes = [p for p in person_bboxes if p['id'] not in contained_ids]
             person_bboxes_deduplicated = len(deduplicated_person_bboxes)
 
-            # Infer gender from anatomy
+            # Infer gender from anatomy (spatial evidence)
             spatial_gender = infer_gender_from_anatomy(nudenet_detections)
 
-            # Detect VLM gender hallucinations
+            # Vote on gender using both NudeNet and VLM evidence
+            gender_vote = vote_on_gender(spatial_gender, captions)
+
+            # Detect VLM gender hallucinations (for flagging, not confidence)
             vlm_hallucinations = detect_gender_hallucination(captions, spatial_gender)
 
             # Correlate face detections from NudeNet and face service
@@ -304,28 +308,31 @@ class ContentAnalysisWorker(BaseWorker):
             # Extract anatomy exposed
             anatomy_exposed = list(set([d['label'] for d in nudenet_detections]))
 
-            # Gender breakdown with confidence
+            # Gender breakdown with voted confidence (NudeNet + VLM corroboration)
             gender_breakdown = {
                 'female_nudity': female_nudity,
                 'male_nudity': male_nudity,
                 'mixed_gender': mixed_gender,
                 'confidence': {
-                    'female': spatial_gender['confidence'] if spatial_gender['gender'] == 'female' else 0.0,
-                    'male': spatial_gender['confidence'] if spatial_gender['gender'] == 'male' else 0.0
-                }
+                    'female': gender_vote['confidence'] if gender_vote['gender'] == 'female' else 0.0,
+                    'male': gender_vote['confidence'] if gender_vote['gender'] == 'male' else 0.0
+                },
+                'vote_details': gender_vote['votes'],
+                'reasoning': gender_vote['reasoning']
             }
 
-            # Person attributions
+            # Person attributions using voted gender
             person_attributions = []
             if person_bboxes_deduplicated > 0:
-                # For now, simple attribution based on overall gender inference
-                # More sophisticated per-person attribution would require bbox overlap analysis
+                # Use voted gender (combines NudeNet + VLM evidence)
                 person_attributions.append({
                     'bbox_ids': [p['id'] for p in deduplicated_person_bboxes],
-                    'gender': spatial_gender['gender'],
+                    'gender': gender_vote['gender'],
+                    'confidence': gender_vote['confidence'],
                     'spatial_markers': anatomy_exposed,
-                    'semantic_agreement': [c['service'] for c in captions],
-                    'semantic_conflict': [h['vlm'] for h in vlm_hallucinations]
+                    'vlm_agreement': gender_vote['votes']['agreement_count'],
+                    'vlm_disagreement': gender_vote['votes']['disagreement_count'],
+                    'reasoning': gender_vote['reasoning']
                 })
 
             # Semantic validation summary
@@ -343,6 +350,7 @@ class ContentAnalysisWorker(BaseWorker):
                 'keyword_extraction': extracted_keywords,
                 'semantic_validations': semantic_validations,
                 'spatial_gender_inference': spatial_gender,
+                'gender_vote': gender_vote,
                 'vlm_hallucinations': vlm_hallucinations,
                 'activity_analysis': activity_analysis,
                 'framing_analysis': framing_analysis,
