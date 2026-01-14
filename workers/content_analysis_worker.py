@@ -27,8 +27,9 @@ from utils.spatial_analysis import (
     detect_sexual_activities
 )
 from utils.framing_analysis import classify_framing
+from utils.face_correlation import correlate_faces, get_face_gender_attribution
 
-ANALYSIS_VERSION = '1.0.0'
+ANALYSIS_VERSION = '1.1.0'
 
 
 class ContentAnalysisWorker(BaseWorker):
@@ -173,6 +174,26 @@ class ContentAnalysisWorker(BaseWorker):
             if row:
                 consensus_data = row[0]
 
+            # Get face service results from postprocessing
+            cursor.execute("""
+                SELECT data
+                FROM postprocessing
+                WHERE image_id = %s AND service = 'face' AND status = 'success'
+            """, (image_id,))
+
+            face_service_detections = []
+            for row in cursor.fetchall():
+                face_data = row[0]
+                if face_data and face_data.get('predictions'):
+                    for pred in face_data['predictions']:
+                        if pred.get('bbox'):
+                            face_service_detections.append({
+                                'bbox': pred['bbox'],
+                                'keypoints': pred.get('keypoints'),
+                                'confidence': pred.get('confidence', 0.0),
+                                'label': pred.get('label', 'face')
+                            })
+
             cursor.close()
 
             return {
@@ -181,6 +202,7 @@ class ContentAnalysisWorker(BaseWorker):
                 'consensus': consensus_data,
                 'captions': captions,
                 'nudenet_detections': nudenet_detections,
+                'face_service_detections': face_service_detections,
                 'image_width': image_width,
                 'image_height': image_height
             }
@@ -234,6 +256,19 @@ class ContentAnalysisWorker(BaseWorker):
 
             # Detect VLM gender hallucinations
             vlm_hallucinations = detect_gender_hallucination(captions, spatial_gender)
+
+            # Correlate face detections from NudeNet and face service
+            nudenet_face_detections = [
+                d for d in nudenet_detections
+                if 'FACE' in d['label']
+            ]
+            face_service_detections = image_data.get('face_service_detections', [])
+
+            face_correlations = correlate_faces(
+                nudenet_face_detections,
+                face_service_detections,
+                iou_threshold=0.3
+            )
 
             # Validate NudeNet categories with captions
             semantic_validations = []
@@ -311,6 +346,7 @@ class ContentAnalysisWorker(BaseWorker):
                 'vlm_hallucinations': vlm_hallucinations,
                 'activity_analysis': activity_analysis,
                 'framing_analysis': framing_analysis,
+                'face_correlations': face_correlations,
                 'person_deduplication': {
                     'raw_count': person_bboxes_raw,
                     'deduplicated_count': person_bboxes_deduplicated,
@@ -334,6 +370,7 @@ class ContentAnalysisWorker(BaseWorker):
                 'people_count': person_bboxes_deduplicated,
                 'person_attributions': person_attributions,
                 'framing_analysis': framing_analysis,
+                'face_correlations': face_correlations,
                 'full_analysis': full_analysis,
                 'analysis_version': ANALYSIS_VERSION
             }
@@ -356,9 +393,9 @@ class ContentAnalysisWorker(BaseWorker):
                     activities_detected, spatial_relationships, person_bboxes_raw,
                     person_bboxes_deduplicated, containment_relationships, semantic_validation,
                     vlm_hallucinations, people_count, person_attributions, framing_analysis,
-                    full_analysis, analysis_version, created
+                    face_correlations, full_analysis, analysis_version, created
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (image_id) DO UPDATE SET
                     gender_breakdown = EXCLUDED.gender_breakdown,
@@ -375,6 +412,7 @@ class ContentAnalysisWorker(BaseWorker):
                     people_count = EXCLUDED.people_count,
                     person_attributions = EXCLUDED.person_attributions,
                     framing_analysis = EXCLUDED.framing_analysis,
+                    face_correlations = EXCLUDED.face_correlations,
                     full_analysis = EXCLUDED.full_analysis,
                     analysis_version = EXCLUDED.analysis_version,
                     created = EXCLUDED.created
@@ -394,6 +432,7 @@ class ContentAnalysisWorker(BaseWorker):
                 analysis['people_count'],
                 json.dumps(analysis['person_attributions']),
                 json.dumps(analysis['framing_analysis']),
+                json.dumps(analysis['face_correlations']),
                 json.dumps(analysis['full_analysis']),
                 analysis['analysis_version'],
                 datetime.now()
