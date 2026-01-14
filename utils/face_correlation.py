@@ -4,10 +4,48 @@ Face Correlation Utility
 Correlates NudeNet face detections (with gender) with face service detections (with keypoints)
 to create higher-confidence, gender-attributed face detections.
 """
+import math
 from utils.spatial_analysis import calculate_bbox_iou, normalize_bbox
 
 
-def correlate_faces(nudenet_faces, face_service_faces, iou_threshold=0.3):
+def fix_negative_bbox(bbox):
+    """
+    Fix bboxes with negative dimensions (data quality issue from NudeNet).
+    Negative width/height means the bbox coordinates were swapped.
+    """
+    bbox = normalize_bbox(bbox)
+
+    x, y = bbox['x'], bbox['y']
+    w, h = bbox['width'], bbox['height']
+
+    # Fix negative width
+    if w < 0:
+        x = x + w  # Move x left by |w|
+        w = abs(w)
+
+    # Fix negative height
+    if h < 0:
+        y = y + h  # Move y up by |h|
+        h = abs(h)
+
+    return {'x': x, 'y': y, 'width': w, 'height': h}
+
+
+def calculate_center_distance(bbox1, bbox2):
+    """Calculate Euclidean distance between bbox centers."""
+    bbox1 = fix_negative_bbox(bbox1)
+    bbox2 = fix_negative_bbox(bbox2)
+
+    center1_x = bbox1['x'] + bbox1['width'] / 2
+    center1_y = bbox1['y'] + bbox1['height'] / 2
+
+    center2_x = bbox2['x'] + bbox2['width'] / 2
+    center2_y = bbox2['y'] + bbox2['height'] / 2
+
+    return math.sqrt((center2_x - center1_x)**2 + (center2_y - center1_y)**2)
+
+
+def correlate_faces(nudenet_faces, face_service_faces, iou_threshold=0.2, center_distance_threshold=50):
     """
     Correlate face detections from NudeNet and face service.
 
@@ -22,7 +60,8 @@ def correlate_faces(nudenet_faces, face_service_faces, iou_threshold=0.3):
     Args:
         nudenet_faces: list of dicts with {label, bbox, confidence}
         face_service_faces: list of dicts with {bbox, keypoints, confidence, ...}
-        iou_threshold: minimum IoU to consider same face (default 0.3)
+        iou_threshold: minimum IoU to consider same face (default 0.2)
+        center_distance_threshold: max pixel distance between centers (fallback when IoU low)
 
     Returns:
         dict: {
@@ -39,45 +78,62 @@ def correlate_faces(nudenet_faces, face_service_faces, iou_threshold=0.3):
 
     # Find correlations
     for nn_idx, nn_face in enumerate(nudenet_faces):
-        nn_bbox = normalize_bbox(nn_face['bbox'])
+        nn_bbox = fix_negative_bbox(nn_face['bbox'])
         nn_gender = extract_gender_from_label(nn_face['label'])
+
+        best_match = None
+        best_match_idx = None
+        best_iou = 0
+        best_center_dist = float('inf')
 
         for fs_idx, fs_face in enumerate(face_service_faces):
             if fs_idx in used_face_service_indices:
                 continue
 
-            fs_bbox = normalize_bbox(fs_face['bbox'])
+            fs_bbox = fix_negative_bbox(fs_face['bbox'])
             iou = calculate_bbox_iou(nn_bbox, fs_bbox)
+            center_dist = calculate_center_distance(nn_bbox, fs_bbox)
 
-            if iou >= iou_threshold:
-                # Found a correlation
-                correlated_face = {
-                    'face_id': len(correlated_faces),
-                    'source': 'both',
-                    'gender': nn_gender,
-                    'gender_source': 'nudenet',
-                    'bbox': {
-                        'nudenet': nn_face['bbox'],
-                        'face_service': fs_face['bbox'],
-                        'averaged': average_bboxes(nn_bbox, fs_bbox)
-                    },
-                    'keypoints': fs_face.get('keypoints'),
-                    'confidence': {
-                        'nudenet': nn_face.get('confidence', 0.0),
-                        'face_service': fs_face.get('confidence', 0.0),
-                        'combined': calculate_combined_confidence(
-                            nn_face.get('confidence', 0.0),
-                            fs_face.get('confidence', 0.0)
-                        )
-                    },
-                    'iou': iou,
-                    'vote_count': 2,
-                    'correlation_strength': 'strong' if iou > 0.5 else 'moderate'
-                }
-                correlated_faces.append(correlated_face)
-                used_nudenet_indices.add(nn_idx)
-                used_face_service_indices.add(fs_idx)
-                break  # Move to next nudenet face
+            # Match if IoU is good OR if centers are close (fallback for different box sizes)
+            is_match = iou >= iou_threshold or center_dist < center_distance_threshold
+
+            if is_match:
+                # Prefer higher IoU, then lower center distance
+                if iou > best_iou or (iou == best_iou and center_dist < best_center_dist):
+                    best_match = fs_face
+                    best_match_idx = fs_idx
+                    best_iou = iou
+                    best_center_dist = center_dist
+
+        if best_match is not None:
+            fs_bbox = fix_negative_bbox(best_match['bbox'])
+            correlated_face = {
+                'face_id': len(correlated_faces),
+                'source': 'both',
+                'gender': nn_gender,
+                'gender_source': 'nudenet',
+                'bbox': {
+                    'nudenet': nn_face['bbox'],
+                    'face_service': best_match['bbox'],
+                    'averaged': average_bboxes(nn_bbox, fs_bbox)
+                },
+                'keypoints': best_match.get('keypoints'),
+                'confidence': {
+                    'nudenet': nn_face.get('confidence', 0.0),
+                    'face_service': best_match.get('confidence', 0.0),
+                    'combined': calculate_combined_confidence(
+                        nn_face.get('confidence', 0.0),
+                        best_match.get('confidence', 0.0)
+                    )
+                },
+                'iou': best_iou,
+                'center_distance': best_center_dist,
+                'vote_count': 2,
+                'correlation_strength': 'strong' if best_iou > 0.5 else ('moderate' if best_iou > 0.2 else 'weak')
+            }
+            correlated_faces.append(correlated_face)
+            used_nudenet_indices.add(nn_idx)
+            used_face_service_indices.add(best_match_idx)
 
     # Collect unmatched faces
     nudenet_only_faces = []

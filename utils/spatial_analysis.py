@@ -205,8 +205,9 @@ def detect_sexual_activities(anatomy_bboxes, person_bboxes, captions_text):
     anatomy_labels = [d['label'] for d in anatomy_bboxes]
 
     # Detect genital-to-genital overlap (sexual intercourse)
-    male_genitals = [d for d in anatomy_bboxes if 'MALE_GENITALIA' in d['label']]
-    female_genitals = [d for d in anatomy_bboxes if 'FEMALE_GENITALIA' in d['label']]
+    # Use startswith() to avoid 'MALE_GENITALIA' matching 'FEMALE_GENITALIA' (substring issue)
+    male_genitals = [d for d in anatomy_bboxes if d['label'].startswith('MALE_GENITALIA')]
+    female_genitals = [d for d in anatomy_bboxes if d['label'].startswith('FEMALE_GENITALIA')]
     buttocks = [d for d in anatomy_bboxes if 'BUTTOCKS' in d['label']]
 
     for mg in male_genitals:
@@ -290,8 +291,8 @@ def detect_sexual_activities(anatomy_bboxes, person_bboxes, captions_text):
 
     # Threesome detection
     deduplicated_people_count = len(person_bboxes)
-    female_count = sum(1 for label in anatomy_labels if 'FEMALE_BREAST' in label or 'FEMALE_GENITALIA' in label)
-    male_count = sum(1 for label in anatomy_labels if 'MALE_GENITALIA' in label)
+    female_count = sum(1 for label in anatomy_labels if 'FEMALE_BREAST' in label or label.startswith('FEMALE_GENITALIA'))
+    male_count = sum(1 for label in anatomy_labels if label.startswith('MALE_GENITALIA'))
 
     if deduplicated_people_count == 3:
         if female_count >= 2 and male_count >= 1:
