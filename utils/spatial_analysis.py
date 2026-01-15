@@ -267,24 +267,20 @@ def detect_sexual_activities(anatomy_bboxes, person_bboxes, captions_text):
                         'proximity': overlap['proximity']
                     })
 
-    # Breast-to-mouth (sexual activity or breastfeeding)
+    # Breastfeeding detection (face-to-breast with baby/infant keywords)
+    # NOTE: breast_play detection removed - face-to-breast proximity is natural anatomy
+    # and creates false positives. Will re-add when pose service provides hand keypoints
+    # to detect actual hand-to-breast contact.
     female_breasts = [d for d in anatomy_bboxes if 'FEMALE_BREAST' in d['label']]
     for face in face_bboxes:
         for breast in female_breasts:
             overlap = detect_bbox_overlap(face, breast, iou_threshold=0.1, proximity_threshold=50)
             if overlap['overlaps']:
-                # Check for breastfeeding
+                # Only flag breastfeeding if keywords suggest it
                 if any(kw in captions_text for kw in ['baby', 'infant', 'breastfeeding', 'nursing']):
                     activities.append('breastfeeding')
                     spatial_relationships.append({
                         'type': 'breastfeeding',
-                        'bbox1': face['label'],
-                        'bbox2': breast['label']
-                    })
-                else:
-                    activities.append('breast_play')
-                    spatial_relationships.append({
-                        'type': 'face_to_breast',
                         'bbox1': face['label'],
                         'bbox2': breast['label']
                     })
