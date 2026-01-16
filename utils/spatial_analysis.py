@@ -304,7 +304,14 @@ def detect_sexual_activities(anatomy_bboxes, person_bboxes, captions_text):
         activities.append('orgy')
 
     # Determine scene type based on anatomical evidence
-    scene_type = 'simple_nudity'
+    # Check for actual exposed anatomy (not just COVERED or FACE)
+    exposed_labels = [label for label in anatomy_labels if 'EXPOSED' in label]
+    has_exposed_anatomy = len(exposed_labels) > 0
+    has_genitalia = any(label.startswith('FEMALE_GENITALIA') or label.startswith('MALE_GENITALIA')
+                        for label in exposed_labels)
+    has_exposed_breasts = any('BREAST_EXPOSED' in label for label in exposed_labels)
+    has_exposed_buttocks = any('BUTTOCKS_EXPOSED' in label for label in exposed_labels)
+
     intimacy_level = 'solo' if deduplicated_people_count == 1 else 'multiple_people'
 
     if activities:
@@ -318,11 +325,16 @@ def detect_sexual_activities(anatomy_bboxes, person_bboxes, captions_text):
             intimacy_level = 'explicit_sexual'
             if deduplicated_people_count >= 3:
                 intimacy_level = 'group'
+    elif not has_exposed_anatomy:
+        # No exposed anatomy detected - not nudity
+        scene_type = 'sfw'
+        intimacy_level = 'none'
+    elif has_genitalia:
+        # Exposed genitalia = softcore
+        scene_type = 'softcore_pornography'
     else:
-        # No sexual activity - classify based on anatomy exposed
-        has_genitalia = any('GENITALIA' in label for label in anatomy_labels)
-        if has_genitalia:
-            scene_type = 'softcore_pornography'
+        # Exposed breasts/buttocks but no genitalia = simple nudity
+        scene_type = 'simple_nudity'
 
     return {
         'activities': list(set(activities)),  # Deduplicate
