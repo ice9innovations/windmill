@@ -30,7 +30,7 @@ from utils.spatial_analysis import (
 from utils.framing_analysis import classify_framing
 from utils.face_correlation import correlate_faces, get_face_gender_attribution
 
-ANALYSIS_VERSION = '1.3.2'
+ANALYSIS_VERSION = '1.4.1'
 
 
 class ContentAnalysisWorker(BaseWorker):
@@ -116,6 +116,7 @@ class ContentAnalysisWorker(BaseWorker):
             results = []
             captions = []
             nudenet_detections = []
+            nsfw2_result = None
             image_width = 0
             image_height = 0
 
@@ -140,6 +141,16 @@ class ContentAnalysisWorker(BaseWorker):
                                 'bbox': pred['bbox'],
                                 'confidence': pred.get('confidence', 0.0)
                             })
+
+                # Extract NSFW2 result
+                if service == 'nsfw2':
+                    predictions = data.get('predictions', [])
+                    if predictions:
+                        nsfw2_result = {
+                            'nsfw': predictions[0].get('nsfw', False),
+                            'confidence': predictions[0].get('confidence', 0.0),
+                            'emoji': predictions[0].get('emoji', '')
+                        }
 
                 # Extract image dimensions from metadata service
                 if service == 'metadata':
@@ -203,6 +214,7 @@ class ContentAnalysisWorker(BaseWorker):
                 'consensus': consensus_data,
                 'captions': captions,
                 'nudenet_detections': nudenet_detections,
+                'nsfw2_result': nsfw2_result,
                 'face_service_detections': face_service_detections,
                 'image_width': image_width,
                 'image_height': image_height
@@ -211,6 +223,103 @@ class ContentAnalysisWorker(BaseWorker):
         except Exception as e:
             self.logger.error(f"Error fetching image data: {e}")
             return None
+
+    def correlate_with_nsfw2(self, scene_type, nsfw2_result):
+        """
+        Correlate our scene classification with NSFW2's verdict.
+
+        When we classify as 'sfw' but NSFW2 says NSFW, we defer to NSFW2's judgment
+        since it may have detected something we missed (e.g., suggestive poses,
+        partial nudity, or context we didn't capture).
+
+        Confidence thresholds:
+        - High (>0.9): Override to 'nsfw2_flagged' - NSFW2 is very confident
+        - Medium (0.7-0.9): Override to 'suggestive' - likely suggestive content
+        - Lower (0.5-0.7): Keep as sfw but flag disagreement
+
+        Args:
+            scene_type: Our current scene classification
+            nsfw2_result: NSFW2 service result dict with 'nsfw', 'confidence', 'emoji'
+
+        Returns:
+            dict: {
+                'agreement': bool - whether we agree with NSFW2,
+                'nsfw2_verdict': str - 'nsfw', 'sfw', or 'unknown',
+                'nsfw2_confidence': float,
+                'override_scene_type': bool,
+                'new_scene_type': str or None,
+                'new_intimacy_level': str or None,
+                'reasoning': str
+            }
+        """
+        # Default result - no NSFW2 data available
+        if not nsfw2_result:
+            return {
+                'agreement': None,
+                'nsfw2_verdict': 'unknown',
+                'nsfw2_confidence': 0.0,
+                'override_scene_type': False,
+                'new_scene_type': None,
+                'new_intimacy_level': None,
+                'reasoning': 'no_nsfw2_data'
+            }
+
+        nsfw2_says_nsfw = nsfw2_result.get('nsfw', False)
+        nsfw2_confidence = nsfw2_result.get('confidence', 0.0)
+        nsfw2_verdict = 'nsfw' if nsfw2_says_nsfw else 'sfw'
+
+        # Determine agreement
+        # Our NSFW categories: sexually_explicit, softcore_pornography, simple_nudity
+        # Our SFW categories: sfw, breastfeeding
+        our_nsfw = scene_type in ['sexually_explicit', 'softcore_pornography', 'simple_nudity']
+        agreement = our_nsfw == nsfw2_says_nsfw
+
+        # Only consider overrides when we say SFW but NSFW2 says NSFW
+        if scene_type != 'sfw' or not nsfw2_says_nsfw:
+            return {
+                'agreement': agreement,
+                'nsfw2_verdict': nsfw2_verdict,
+                'nsfw2_confidence': nsfw2_confidence,
+                'override_scene_type': False,
+                'new_scene_type': None,
+                'new_intimacy_level': None,
+                'reasoning': 'agreement' if agreement else 'no_override_needed'
+            }
+
+        # We classified as SFW but NSFW2 says NSFW - apply confidence thresholds
+        if nsfw2_confidence > 0.9:
+            # High confidence: NSFW2 is very sure, override to nsfw2_flagged
+            return {
+                'agreement': False,
+                'nsfw2_verdict': nsfw2_verdict,
+                'nsfw2_confidence': nsfw2_confidence,
+                'override_scene_type': True,
+                'new_scene_type': 'nsfw2_flagged',
+                'new_intimacy_level': 'suggestive',
+                'reasoning': 'nsfw2_high_confidence_override'
+            }
+        elif nsfw2_confidence > 0.7:
+            # Medium confidence: likely suggestive content
+            return {
+                'agreement': False,
+                'nsfw2_verdict': nsfw2_verdict,
+                'nsfw2_confidence': nsfw2_confidence,
+                'override_scene_type': True,
+                'new_scene_type': 'suggestive',
+                'new_intimacy_level': 'suggestive',
+                'reasoning': 'nsfw2_medium_confidence_override'
+            }
+        else:
+            # Lower confidence: keep as sfw but flag the disagreement
+            return {
+                'agreement': False,
+                'nsfw2_verdict': nsfw2_verdict,
+                'nsfw2_confidence': nsfw2_confidence,
+                'override_scene_type': False,
+                'new_scene_type': None,
+                'new_intimacy_level': None,
+                'reasoning': 'nsfw2_low_confidence_disagreement'
+            }
 
     def analyze_content(self, image_id, image_data):
         """
@@ -291,6 +400,20 @@ class ContentAnalysisWorker(BaseWorker):
             scene_type = activity_analysis['scene_type']
             intimacy_level = activity_analysis['intimacy_level']
 
+            # NSFW2 correlation: when we classify as sfw, check NSFW2's verdict
+            nsfw2_result = image_data.get('nsfw2_result')
+            nsfw2_correlation = self.correlate_with_nsfw2(scene_type, nsfw2_result)
+
+            # Override scene_type if NSFW2 disagrees with high confidence
+            if nsfw2_correlation['override_scene_type']:
+                original_scene_type = scene_type
+                scene_type = nsfw2_correlation['new_scene_type']
+                intimacy_level = nsfw2_correlation['new_intimacy_level']
+                self.logger.debug(
+                    f"NSFW2 override: {original_scene_type} -> {scene_type} "
+                    f"(nsfw2_confidence={nsfw2_correlation['nsfw2_confidence']:.3f})"
+                )
+
             # Analyze framing based on bbox sizes
             framing_analysis = classify_framing(
                 nudenet_detections,
@@ -355,6 +478,7 @@ class ContentAnalysisWorker(BaseWorker):
                 'activity_analysis': activity_analysis,
                 'framing_analysis': framing_analysis,
                 'face_correlations': face_correlations,
+                'nsfw2_correlation': nsfw2_correlation,
                 'person_deduplication': {
                     'raw_count': person_bboxes_raw,
                     'deduplicated_count': person_bboxes_deduplicated,
@@ -379,6 +503,7 @@ class ContentAnalysisWorker(BaseWorker):
                 'person_attributions': person_attributions,
                 'framing_analysis': framing_analysis,
                 'face_correlations': face_correlations,
+                'nsfw2_correlation': nsfw2_correlation,
                 'full_analysis': full_analysis,
                 'analysis_version': ANALYSIS_VERSION
             }
@@ -401,9 +526,9 @@ class ContentAnalysisWorker(BaseWorker):
                     activities_detected, spatial_relationships, person_bboxes_raw,
                     person_bboxes_deduplicated, containment_relationships, semantic_validation,
                     vlm_hallucinations, people_count, person_attributions, framing_analysis,
-                    face_correlations, full_analysis, analysis_version, created
+                    face_correlations, nsfw2_correlation, full_analysis, analysis_version, created
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (image_id) DO UPDATE SET
                     gender_breakdown = EXCLUDED.gender_breakdown,
@@ -421,6 +546,7 @@ class ContentAnalysisWorker(BaseWorker):
                     person_attributions = EXCLUDED.person_attributions,
                     framing_analysis = EXCLUDED.framing_analysis,
                     face_correlations = EXCLUDED.face_correlations,
+                    nsfw2_correlation = EXCLUDED.nsfw2_correlation,
                     full_analysis = EXCLUDED.full_analysis,
                     analysis_version = EXCLUDED.analysis_version,
                     created = EXCLUDED.created
@@ -441,6 +567,7 @@ class ContentAnalysisWorker(BaseWorker):
                 json.dumps(analysis['person_attributions']),
                 json.dumps(analysis['framing_analysis']),
                 json.dumps(analysis['face_correlations']),
+                json.dumps(analysis['nsfw2_correlation']),
                 json.dumps(analysis['full_analysis']),
                 analysis['analysis_version'],
                 datetime.now()
@@ -449,10 +576,18 @@ class ContentAnalysisWorker(BaseWorker):
             self.db_conn.commit()
             cursor.close()
 
+            # Build log message
+            nsfw2_info = ""
+            nsfw2_corr = analysis.get('nsfw2_correlation', {})
+            if nsfw2_corr.get('override_scene_type'):
+                nsfw2_info = f", nsfw2_override={nsfw2_corr.get('reasoning', 'unknown')}"
+            elif nsfw2_corr.get('reasoning') == 'nsfw2_low_confidence_disagreement':
+                nsfw2_info = f", nsfw2_disagrees_low_conf"
+
             self.logger.info(f"Stored content analysis for image {analysis['image_id']}: "
                            f"scene={analysis['scene_type']}, "
                            f"activities={len(analysis['activities_detected'])}, "
-                           f"people={analysis['people_count']}")
+                           f"people={analysis['people_count']}{nsfw2_info}")
 
             return True
 

@@ -212,7 +212,9 @@ def detect_sexual_activities(anatomy_bboxes, person_bboxes, captions_text):
 
     for mg in male_genitals:
         for fg in female_genitals:
-            overlap = detect_bbox_overlap(mg, fg, iou_threshold=0.3)
+            # Use higher proximity threshold (100px) for genital interactions
+            # 50px was too strict and missed clear cases of sexual contact
+            overlap = detect_bbox_overlap(mg, fg, iou_threshold=0.15, proximity_threshold=100)
             if overlap['overlaps']:
                 activities.append('sexual_intercourse')
                 activities.append('heterosexual_activity')
@@ -226,7 +228,8 @@ def detect_sexual_activities(anatomy_bboxes, person_bboxes, captions_text):
 
         # Genital-to-buttocks (anal sex)
         for bt in buttocks:
-            overlap = detect_bbox_overlap(mg, bt, iou_threshold=0.2)
+            # Use higher proximity threshold (100px) for genital interactions
+            overlap = detect_bbox_overlap(mg, bt, iou_threshold=0.15, proximity_threshold=100)
             if overlap['overlaps']:
                 activities.append('anal_intercourse')
                 spatial_relationships.append({
