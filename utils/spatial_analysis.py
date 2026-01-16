@@ -252,12 +252,13 @@ def detect_sexual_activities(anatomy_bboxes, person_bboxes, captions_text):
         spatial_relationships.append({'type': 'female_female_genital_overlap'})
 
     # Face-to-genital overlap (oral sex)
+    # Use 100px proximity threshold consistent with other genital interactions
     face_bboxes = [d for d in anatomy_bboxes if 'FACE' in d['label']]
     all_genitals = male_genitals + female_genitals
 
     for face in face_bboxes:
         for genital in all_genitals:
-            overlap = detect_bbox_overlap(face, genital, iou_threshold=0.1, proximity_threshold=50)
+            overlap = detect_bbox_overlap(face, genital, iou_threshold=0.05, proximity_threshold=100)
             if overlap['overlaps']:
                 # Check for breastfeeding exception
                 if 'baby' not in captions_text and 'infant' not in captions_text and 'breastfeeding' not in captions_text:

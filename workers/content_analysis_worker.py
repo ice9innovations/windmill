@@ -30,7 +30,7 @@ from utils.spatial_analysis import (
 from utils.framing_analysis import classify_framing
 from utils.face_correlation import correlate_faces, get_face_gender_attribution
 
-ANALYSIS_VERSION = '1.4.1'
+ANALYSIS_VERSION = '1.4.2'
 
 
 class ContentAnalysisWorker(BaseWorker):
