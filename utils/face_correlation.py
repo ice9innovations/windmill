@@ -45,6 +45,54 @@ def calculate_center_distance(bbox1, bbox2):
     return math.sqrt((center2_x - center1_x)**2 + (center2_y - center1_y)**2)
 
 
+def deduplicate_face_detections(faces, iou_threshold=0.7):
+    """
+    Deduplicate face detections that likely represent the same face.
+
+    The face service sometimes returns multiple detections for the same face
+    with slightly different bboxes. This merges them, keeping the highest
+    confidence detection.
+
+    Args:
+        faces: list of face dicts with {bbox, confidence, ...}
+        iou_threshold: IoU above which faces are considered duplicates
+
+    Returns:
+        list: deduplicated faces, keeping highest confidence for each group
+    """
+    if not faces:
+        return []
+
+    # Sort by confidence descending - we'll keep higher confidence ones
+    sorted_faces = sorted(faces, key=lambda f: f.get('confidence', 0), reverse=True)
+
+    kept_faces = []
+    used_indices = set()
+
+    for i, face in enumerate(sorted_faces):
+        if i in used_indices:
+            continue
+
+        face_bbox = fix_negative_bbox(face['bbox'])
+
+        # Mark any overlapping faces as duplicates
+        for j, other_face in enumerate(sorted_faces[i+1:], i+1):
+            if j in used_indices:
+                continue
+
+            other_bbox = fix_negative_bbox(other_face['bbox'])
+            iou = calculate_bbox_iou(face_bbox, other_bbox)
+
+            if iou >= iou_threshold:
+                # This is a duplicate - mark it as used
+                used_indices.add(j)
+
+        kept_faces.append(face)
+        used_indices.add(i)
+
+    return kept_faces
+
+
 def correlate_faces(nudenet_faces, face_service_faces, iou_threshold=0.2, center_distance_threshold=50):
     """
     Correlate face detections from NudeNet and face service.
@@ -72,6 +120,9 @@ def correlate_faces(nudenet_faces, face_service_faces, iou_threshold=0.2, center
             'correlation_stats': summary statistics
         }
     """
+    # Deduplicate face service detections first (it sometimes returns duplicates)
+    face_service_faces = deduplicate_face_detections(face_service_faces, iou_threshold=0.7)
+
     correlated_faces = []
     used_nudenet_indices = set()
     used_face_service_indices = set()
