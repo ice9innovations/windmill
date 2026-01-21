@@ -45,17 +45,18 @@ def calculate_center_distance(bbox1, bbox2):
     return math.sqrt((center2_x - center1_x)**2 + (center2_y - center1_y)**2)
 
 
-def deduplicate_face_detections(faces, iou_threshold=0.7):
+def deduplicate_face_detections(faces, iou_threshold=0.7, center_distance_threshold=30):
     """
     Deduplicate face detections that likely represent the same face.
 
     The face service sometimes returns multiple detections for the same face
-    with slightly different bboxes. This merges them, keeping the highest
-    confidence detection.
+    with slightly different bboxes (e.g., from different person crops).
+    This merges them, keeping the highest confidence detection.
 
     Args:
         faces: list of face dicts with {bbox, confidence, ...}
         iou_threshold: IoU above which faces are considered duplicates
+        center_distance_threshold: center distance (px) below which faces are duplicates
 
     Returns:
         list: deduplicated faces, keeping highest confidence for each group
@@ -82,9 +83,10 @@ def deduplicate_face_detections(faces, iou_threshold=0.7):
 
             other_bbox = fix_negative_bbox(other_face['bbox'])
             iou = calculate_bbox_iou(face_bbox, other_bbox)
+            center_dist = calculate_center_distance(face_bbox, other_bbox)
 
-            if iou >= iou_threshold:
-                # This is a duplicate - mark it as used
+            # Duplicate if high IoU OR centers very close (handles different box sizes)
+            if iou >= iou_threshold or center_dist < center_distance_threshold:
                 used_indices.add(j)
 
         kept_faces.append(face)
