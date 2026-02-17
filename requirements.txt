@@ -6,3 +6,4 @@ python-dotenv>=1.0.0  # Environment variable loading
 requests>=2.31.0      # HTTP client for ML service calls
 PyYAML>=6.0           # YAML configuration file parsing
 Pillow>=10.0.0        # PIL/Pillow for image manipulation and cropping
+Flask>=3.0.0          # HTTP API for single image submission

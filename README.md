@@ -141,7 +141,77 @@ DB_PASSWORD=your_secure_db_password
 
 ## Usage
 
-### 1. Submit Jobs - Complete ML Pipeline
+### 1. Single Image API
+
+A Flask API for submitting individual images and retrieving progressive results.
+
+```bash
+# Start the API server (default port 9999, configurable via API_PORT)
+python api.py
+```
+
+#### Submit an image
+
+File upload:
+```bash
+curl -X POST -F "image=@photo.jpg" http://localhost:9999/analyze
+```
+
+URL-based:
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"image_url": "http://example.com/photo.jpg"}' \
+  http://localhost:9999/analyze
+```
+
+Response (202):
+```json
+{
+  "image_id": 391978,
+  "trace_id": "a1b2c3d4-...",
+  "services_submitted": ["blip", "colors", "detectron2", "..."]
+}
+```
+
+Optional parameters:
+- `services` - comma-separated list (default: all primary services)
+- `image_group` - group tag (default: `"api"`)
+
+#### Poll for status and progressive results
+
+```bash
+curl http://localhost:9999/status/391978
+```
+
+Returns status metadata and full results as they arrive. Clients can start using partial results immediately (e.g. show captions while waiting for object detection):
+
+```json
+{
+  "image_id": 391978,
+  "progress": "10/14",
+  "is_complete": false,
+  "services_pending": ["clip", "nsfw2", "ollama", "rtmdet"],
+  "services_completed": {"blip": {"status": "success", "..."}, "..."},
+  "harmony_complete": true,
+  "consensus_complete": true,
+  "content_analysis_complete": true,
+  "service_results": {"blip": {"data": {"..."}, "..."}, "..."},
+  "merged_boxes": ["..."],
+  "consensus": {"..."},
+  "content_analysis": {"..."},
+  "postprocessing": ["..."]
+}
+```
+
+#### Fetch final results
+
+```bash
+curl http://localhost:9999/results/391978
+```
+
+Returns the full analysis output without status metadata. Use this when processing is complete and you just need the data.
+
+### 2. Batch Processing
 ```bash
 # Submit jobs to all PRIMARY services (safe default)
 ./producer.sh --limit 100000

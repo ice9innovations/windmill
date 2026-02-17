@@ -17,6 +17,7 @@ CREATE TABLE images (
     image_path TEXT,
     image_url TEXT,
     image_group VARCHAR(255),
+    services_submitted TEXT[],
     image_created TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
 );
 
