@@ -96,6 +96,14 @@ services:
       endpoint: /v3/analyze
       service_type: spatial
 
+    speciesnet:
+      queue_name: speciesnet
+      host: localhost
+      port: 7794
+      endpoint: /analyze
+      service_type: spatial
+      consensus: false
+
     yolo_v8:
       queue_name: yolo_v8
       host: localhost
