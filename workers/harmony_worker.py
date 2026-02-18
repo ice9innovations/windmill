@@ -1209,9 +1209,15 @@ class HarmonyWorker(BaseWorker):
                 
                 # Safe atomic DELETE + INSERT with foreign key handling
                 cursor = self.db_conn.cursor()
-                
+
+                # Acquire per-image advisory lock to serialize concurrent harmony workers.
+                # The lock is transaction-scoped: automatically released on commit/rollback.
+                # This prevents two workers from simultaneously deleting and reinserting
+                # merged_boxes for the same image, which would produce duplicate rows.
+                cursor.execute("SELECT pg_advisory_xact_lock(%s)", (image_id,))
+
                 # Progressive harmonization: always reharmonize with latest bbox results
-                
+
                 # Step 1: Clear postprocessing references to avoid FK constraint violation
                 cursor.execute("""
                     DELETE FROM postprocessing 
