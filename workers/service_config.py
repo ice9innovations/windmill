@@ -153,10 +153,15 @@ class ServiceConfig:
         return service_full_name in services
     
     def is_semantic_service(self, service_full_name: str) -> bool:
-        """Check if service is a semantic (captioning) service"""  
+        """Check if service is a semantic (captioning) service"""
         services = self.get_services_by_type('semantic')
         return service_full_name in services
-    
+
+    def is_vlm_service(self, service_full_name: str) -> bool:
+        """Check if service is a VLM service that produces noun lists"""
+        services = self.get_services_by_type('vlm')
+        return service_full_name in services
+
     def get_spatial_services(self) -> List[str]:
         """Get list of all spatial service names"""
         return list(self.get_services_by_type('spatial').keys())

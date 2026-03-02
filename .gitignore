@@ -3,6 +3,9 @@
 pids/
 issues/
 del/
+windmill_venv/
+workers/conceptnet_cache.pkl
+workers/mwe.txt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -6,7 +6,8 @@ Triggers content analysis re-processing for all images with consensus data.
 Use this after updating spatial_analysis.py or content_analysis_worker.py.
 
 Usage:
-    python utils/rerun_content_analysis.py [--limit N] [--reason "description"]
+    python utils/rerun_content_analysis.py
+    python utils/rerun_content_analysis.py --limit 1000
 """
 import os
 import sys

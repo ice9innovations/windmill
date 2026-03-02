@@ -104,8 +104,10 @@ stop_worker() {
             worker_file="workers/pose_worker.py"
             ;;
         *)
-            # For service workers, use the standard pattern
-            if [ -f "workers/${worker}_worker.py" ]; then
+            # Accept both full name (noun_consensus_worker) and short name (noun_consensus)
+            if [ -f "workers/${worker}.py" ]; then
+                worker_file="workers/${worker}.py"
+            elif [ -f "workers/${worker}_worker.py" ]; then
                 worker_file="workers/${worker}_worker.py"
             else
                 echo "❌ ERROR: Unknown worker '$worker'"
@@ -160,8 +162,10 @@ start_worker() {
             worker_file="workers/pose_worker.py"
             ;;
         *)
-            # For service workers, use the standard pattern
-            if [ -f "workers/${worker}_worker.py" ]; then
+            # Accept both full name (noun_consensus_worker) and short name (noun_consensus)
+            if [ -f "workers/${worker}.py" ]; then
+                worker_file="workers/${worker}.py"
+            elif [ -f "workers/${worker}_worker.py" ]; then
                 worker_file="workers/${worker}_worker.py"
             else
                 echo "❌ ERROR: Unknown worker '$worker'"

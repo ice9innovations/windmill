@@ -2,6 +2,9 @@
 -- PostgreSQL schema for Animal Farm distributed ML processing pipeline
 -- Exported from production database 2025-09-07
 
+-- Enable pgvector extension for CLIP embedding storage and similarity search
+CREATE EXTENSION IF NOT EXISTS vector;
+
 -- Drop existing tables in dependency order (for clean reinstalls)
 DROP TABLE IF EXISTS content_analysis CASCADE;
 DROP TABLE IF EXISTS postprocessing CASCADE;
@@ -18,11 +21,23 @@ CREATE TABLE images (
     image_url TEXT,
     image_group VARCHAR(255),
     services_submitted TEXT[],
-    image_created TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+    image_created TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+    -- CLIP image embedding (ViT-L/14, 768-dimensional, normalized)
+    -- Written once on first caption score; used for image similarity search
+    image_clip_embedding vector(768),
+    -- Perceptual hash (pHash) for duplicate detection across formats/resolutions
+    -- 16-char hex string; compare via Hamming distance (0-4 bits = same image)
+    image_phash VARCHAR(16)
 );
 
 -- Create indexes for images table
 CREATE INDEX idx_images_group ON images(image_group);
+CREATE INDEX idx_images_filename ON images(image_filename);
+
+-- HNSW index for fast approximate cosine similarity search across image embeddings
+CREATE INDEX idx_images_clip_embedding ON images USING hnsw (image_clip_embedding vector_cosine_ops);
+-- Index for fast exact pHash lookups
+CREATE INDEX idx_images_phash ON images(image_phash);
 
 -- Results table: ML service results for each image
 CREATE TABLE results (
@@ -162,3 +177,53 @@ CREATE INDEX idx_content_analysis_created ON content_analysis(created);
 -- Create foreign key constraint for content_analysis
 ALTER TABLE content_analysis ADD CONSTRAINT content_analysis_image_id_fkey
     FOREIGN KEY (image_id) REFERENCES images(image_id);
+
+-- Verb Consensus table: Cross-VLM verb agreement and per-service SVO triples
+-- No SAM3 integration — verbs have no spatial grounding.
+CREATE TABLE IF NOT EXISTS verb_consensus (
+    verb_consensus_id BIGSERIAL PRIMARY KEY,
+    image_id          BIGINT NOT NULL REFERENCES images(image_id),
+    verbs             JSONB  NOT NULL DEFAULT '[]', -- array of collapsed verb objects
+    svo_triples       JSONB  NOT NULL DEFAULT '{}', -- {service: [[s,v,o], ...]} per-service reference
+    services_present  TEXT[] NOT NULL DEFAULT '{}', -- which VLMs contributed
+    service_count     INTEGER NOT NULL DEFAULT 0,
+    created_at        TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+    updated_at        TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+    CONSTRAINT verb_consensus_image_id_unique UNIQUE (image_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_verb_consensus_image ON verb_consensus(image_id);
+
+-- Caption Summary table: LLM-synthesized single caption from all VLM outputs
+-- Triggered by SAM3 completion; requires >= 2 VLM captions to write a row.
+CREATE TABLE IF NOT EXISTS caption_summary (
+    caption_summary_id BIGSERIAL PRIMARY KEY,
+    image_id           BIGINT  NOT NULL REFERENCES images(image_id),
+    summary_caption    TEXT    NOT NULL,
+    model              TEXT    NOT NULL,
+    services_present   TEXT[]  NOT NULL DEFAULT '{}',
+    service_count      INTEGER NOT NULL DEFAULT 0,
+    created_at         TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+    updated_at         TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+    CONSTRAINT caption_summary_image_id_unique UNIQUE (image_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_caption_summary_image ON caption_summary(image_id);
+
+-- Rembg Results table: Alpha mattes produced by the rembg background removal service
+-- Written on-demand when a consumer requests a matte via ice9-api.
+-- premasked=true means the SAM3 _subject mask was applied before rembg ran.
+CREATE TABLE IF NOT EXISTS rembg_results (
+    rembg_id        BIGSERIAL PRIMARY KEY,
+    image_id        BIGINT NOT NULL REFERENCES images(image_id),
+    png_b64         TEXT NOT NULL,           -- base64-encoded grayscale alpha matte PNG
+    shape           JSONB NOT NULL,          -- [height, width]
+    model           TEXT,                    -- model name reported by the rembg service
+    premasked       BOOLEAN NOT NULL DEFAULT FALSE,
+    processing_time DOUBLE PRECISION,
+    created_at      TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+    updated_at      TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+    CONSTRAINT rembg_results_image_id_unique UNIQUE (image_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rembg_results_image ON rembg_results(image_id);

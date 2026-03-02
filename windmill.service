@@ -1,0 +1,15 @@
+[Unit]
+Description=Windmill API
+After=network.target
+
+[Service]
+Type=simple
+User=sd
+WorkingDirectory=/home/sd/windmill
+ExecStart=/home/sd/windmill/windmill_venv/bin/python api.py
+Restart=on-failure
+RestartSec=10
+EnvironmentFile=/home/sd/windmill/.env
+
+[Install]
+WantedBy=multi-user.target

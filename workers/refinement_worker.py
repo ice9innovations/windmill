@@ -28,6 +28,12 @@ class RefinementWorker(BaseWorker):
 
     def connect_to_database(self):
         """Connect to PostgreSQL database with dual connections"""
+        if hasattr(self, 'read_db_conn') and self.read_db_conn:
+            try:
+                self.read_db_conn.close()
+            except Exception:
+                pass
+
         # Call parent to set up main connection
         if not super().connect_to_database():
             return False
@@ -37,13 +43,7 @@ class RefinementWorker(BaseWorker):
             self.db_conn.autocommit = False
 
             # Create separate read connection for queries
-            self.read_db_conn = psycopg2.connect(
-                host=self.db_host,
-                database=self.db_name,
-                user=self.db_user,
-                password=self.db_password
-            )
-            self.read_db_conn.autocommit = True  # Auto-commit for read queries
+            self.read_db_conn = self._new_db_connection(autocommit=True)
 
             return True
 
@@ -234,17 +234,17 @@ class RefinementWorker(BaseWorker):
 
             if self.process_refinement_request(message):
                 # Acknowledge successful processing
-                ch.basic_ack(delivery_tag=method.delivery_tag)
+                self._safe_ack(ch, method.delivery_tag)
                 self.jobs_completed += 1
             else:
                 # Reject and requeue for retry
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.jobs_failed += 1
 
         except Exception as e:
             self.logger.error(f"Error processing refinement queue message: {e}")
             # Reject and requeue for retry
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            self._safe_nack(ch, method.delivery_tag, requeue=True)
             self.jobs_failed += 1
 
     def run(self):
@@ -258,24 +258,33 @@ class RefinementWorker(BaseWorker):
 
         self.logger.info(f"Listening on queue: {self.queue_name}")
 
-        try:
-            # Set up message consumption
-            self.channel.basic_qos(prefetch_count=self.worker_prefetch_count)
-            self.channel.basic_consume(
-                queue=self.queue_name,
-                on_message_callback=self.process_queue_message
-            )
+        # Consume with reconnect loop
+        while True:
+            try:
+                self.channel.basic_qos(prefetch_count=self.worker_prefetch_count)
+                self.channel.basic_consume(
+                    queue=self.queue_name,
+                    on_message_callback=self.process_queue_message
+                )
+                self.logger.info("Waiting for refinement messages. Press CTRL+C to exit")
+                self.channel.start_consuming()
+            except KeyboardInterrupt:
+                self.logger.info("Received interrupt signal, shutting down...")
+                try:
+                    self.channel.stop_consuming()
+                except Exception:
+                    pass
+                break
+            except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
+                    pika.exceptions.StreamLostError) as e:
+                self.logger.warning(f"Queue connection lost: {e}. Reconnecting...")
+                time.sleep(self.retry_delay)
+                if not self.connect_to_queue():
+                    self.logger.warning("Reconnect failed, retrying...")
+                    time.sleep(self.retry_delay)
+                    continue
 
-            # Start consuming
-            self.channel.start_consuming()
-
-        except KeyboardInterrupt:
-            self.logger.info("Received interrupt signal, shutting down...")
-            self.channel.stop_consuming()
-        except Exception as e:
-            self.logger.error(f"Error in main processing loop: {e}")
-        finally:
-            self.close_connections()
+        self.close_connections()
 
 if __name__ == "__main__":
     worker = RefinementWorker()

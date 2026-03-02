@@ -89,22 +89,23 @@ class HarmonyWorker(BaseWorker):
     
     def connect_to_database(self):
         """Connect to PostgreSQL database with dual connections"""
+        # Close existing read connection to prevent leaks on reconnect
+        if hasattr(self, 'read_db_conn') and self.read_db_conn:
+            try:
+                self.read_db_conn.close()
+            except Exception:
+                pass
+
         # Call parent to set up main connection
         if not super().connect_to_database():
             return False
-            
+
         try:
             # Set up transaction mode for main connection
             self.db_conn.autocommit = False
-            
+
             # Create separate read connection for queries
-            self.read_db_conn = psycopg2.connect(
-                host=self.db_host,
-                database=self.db_name,
-                user=self.db_user,
-                password=self.db_password
-            )
-            self.read_db_conn.autocommit = True  # Auto-commit for read queries
+            self.read_db_conn = self._new_db_connection(autocommit=True)
             
             return True
             
@@ -141,18 +142,7 @@ class HarmonyWorker(BaseWorker):
     def connect_to_queue(self):
         """Connect to RabbitMQ for queue-based processing"""
         try:
-            credentials = pika.PlainCredentials(self.queue_user, self.queue_password)
-            self.queue_connection = pika.BlockingConnection(
-                pika.ConnectionParameters(
-                    host=self.queue_host,
-                    credentials=credentials,
-                    heartbeat=60,
-                    blocked_connection_timeout=300,
-                    connection_attempts=10,
-                    retry_delay=5,
-                    socket_timeout=10
-                )
-            )
+            self.queue_connection = pika.BlockingConnection(self._build_queue_params())
             self.queue_channel = self.queue_connection.channel()
             
             # Also set BaseWorker's expected connection variables for trigger_consensus()
@@ -179,25 +169,23 @@ class HarmonyWorker(BaseWorker):
             colors_queue = self._get_queue_name('postprocessing.colors')
             face_queue = self._get_queue_name('postprocessing.face')
             pose_queue = self._get_queue_name('postprocessing.pose')
-            
             declare_with_dlq(self.queue_channel, colors_queue)
             declare_with_dlq(self.queue_channel, face_queue)
             declare_with_dlq(self.queue_channel, pose_queue)
-            
+
             # Store queue names for later use
             self.postprocessing_queues = {
                 'colors': colors_queue,
-                'face': face_queue, 
-                'pose': pose_queue
+                'face': face_queue,
+                'pose': pose_queue,
             }
-            
+
             # Set prefetch count for fair distribution
             self.queue_channel.basic_qos(prefetch_count=1)
-            
+
             self.logger.info(f"Connected to RabbitMQ at {self.queue_host}")
             self.logger.info(f"Consuming from: {self.queue_name}")
-            queue_names = ', '.join([self.postprocessing_queues['colors'], self.postprocessing_queues['face'], self.postprocessing_queues['pose']])
-            self.logger.info(f"Publishing to postprocessing queues: {queue_names}")
+            self.logger.info(f"Publishing to postprocessing queues: {colors_queue}, {face_queue}, {pose_queue}")
             return True
             
         except Exception as e:
@@ -249,19 +237,21 @@ class HarmonyWorker(BaseWorker):
                     if hasattr(self, 'current_trace_id') and self.current_trace_id:
                         base_message['trace_id'] = self.current_trace_id
                     
-                    # Dispatch colors only for boxes >= 24x24 pixels (filter out tiny icons)
+                    # Dispatch postprocessing for boxes >= 24x24 pixels (filter out tiny icons)
                     width = merged_bbox.get('width', 0)
                     height = merged_bbox.get('height', 0)
                     if width >= 24 and height >= 24:
                         self.publish_bbox_message(self.postprocessing_queues['colors'], base_message)
                         self.logger.debug(f"Dispatched colors for {width}x{height} box")
+
+                        # Dispatch face and pose for person-emoji boxes
+                        box_emoji = normalize_person_emoji(instance.get('emoji', ''))
+                        if box_emoji == '🧑':
+                            self.publish_bbox_message(self.postprocessing_queues['face'], base_message)
+                            self.publish_bbox_message(self.postprocessing_queues['pose'], base_message)
+                            self.logger.debug(f"Dispatched face/pose for {width}x{height} person box")
                     else:
-                        self.logger.debug(f"Skipped colors for {width}x{height} box (too small)")
-                    
-                    # Dispatch face/pose for person boxes
-                    if self.is_person_box(instance):
-                        self.publish_bbox_message(self.postprocessing_queues['face'], base_message)
-                        self.publish_bbox_message(self.postprocessing_queues['pose'], base_message)
+                        self.logger.debug(f"Skipped postprocessing for {width}x{height} box (too small)")
                     
         except Exception as e:
             self.logger.error(f"Error in dispatch_bbox_postprocessing: {e}")
@@ -295,15 +285,6 @@ class HarmonyWorker(BaseWorker):
         except Exception as e:
             self.logger.error(f"Failed to crop bbox from image data: {e}")
             return None
-    
-    def is_person_box(self, instance):
-        """Check if a bounding box should trigger face/pose processing"""
-        emoji = instance.get('emoji', '')
-        
-        # Only trigger face/pose for specific person emojis
-        face_pose_emojis = ['🧑', '🙂', '👩', '🧒']
-        
-        return emoji in face_pose_emojis
     
     def publish_bbox_message(self, queue_name, message):
         """Publish message to bbox postprocessing queue"""
@@ -367,17 +348,17 @@ class HarmonyWorker(BaseWorker):
                 self.trigger_consensus(image_id, message)
                 
                 # Acknowledge the message
-                ch.basic_ack(delivery_tag=method.delivery_tag)
+                self._safe_ack(ch, method.delivery_tag)
                 
             else:
                 # Reject and requeue for retry
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.logger.error(f"Failed to process harmony for {image_filename}, requeuing")
                 
         except Exception as e:
             self.logger.error(f"Error processing queue message: {e}")
             # Reject and requeue for retry
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            self._safe_nack(ch, method.delivery_tag, requeue=True)
     
     
     def get_bbox_results_for_image(self, image_id):
@@ -1072,109 +1053,6 @@ class HarmonyWorker(BaseWorker):
 
         return True
 
-    def add_clip_fallback_boxes(self, image_id, image_filename, existing_merged_data):
-        """Add CLIP bounding boxes as fallback for emojis with no spatial evidence"""
-        try:
-            # Get CLIP results for this image
-            clip_results = self.get_clip_results_for_image(image_id)
-            if not clip_results:
-                return 0
-
-            # Get existing emojis that already have spatial evidence
-            existing_emojis = set()
-            if existing_merged_data:
-                self.logger.debug(f"CLIP fallback: existing_merged_data keys: {list(existing_merged_data.keys())}")
-                grouped_objects = existing_merged_data.get('grouped_objects', {})
-                self.logger.debug(f"CLIP fallback: grouped_objects keys: {list(grouped_objects.keys())}")
-                for group_key, group_data in grouped_objects.items():
-                    normalized_key = normalize_person_emoji(group_key)
-                    existing_emojis.add(normalized_key)
-                    self.logger.debug(f"CLIP fallback: added existing emoji {group_key} -> {normalized_key}")
-
-            self.logger.debug(f"CLIP fallback: existing_emojis = {existing_emojis}")
-
-            fallback_count = 0
-            cursor = self.db_conn.cursor()
-
-            # Process CLIP predictions for fallback opportunities
-            for service, data, result_id in clip_results:
-                if not isinstance(data, dict) or 'predictions' not in data:
-                    continue
-
-                predictions = data.get('predictions', [])
-                for prediction in predictions:
-                    if not prediction.get('bbox') or not prediction.get('emoji'):
-                        continue
-
-                    original_emoji = prediction['emoji']
-                    emoji = normalize_person_emoji(original_emoji)
-
-                    self.logger.debug(f"CLIP fallback: checking {original_emoji} -> {emoji}, existing: {emoji in existing_emojis}")
-
-                    # Only use as fallback if this emoji has no existing spatial evidence
-                    if emoji not in existing_emojis:
-                        # Create a merged box entry for this CLIP detection
-                        merged_box_data = {
-                            'cluster_id': f"{emoji}_clip_fallback",
-                            'emoji': emoji,
-                            'labels': [prediction.get('label', '')],
-                            'merged_bbox': prediction['bbox'],
-                            'detection_count': 1,
-                            'avg_confidence': prediction.get('confidence', 0.5),
-                            'max_confidence': prediction.get('confidence', 0.5),
-                            'contributing_services': ['clip'],
-                            'detections': [{'service': 'clip', 'confidence': prediction.get('confidence', 0.5)}],
-                            'harmonization_algorithm': 'clip_fallback',
-                            'source_result_ids': [result_id],
-                            'fallback_source': 'clip_spatial_fallback'
-                        }
-
-                        cursor.execute("""
-                            INSERT INTO merged_boxes (image_id, source_result_ids, merged_data, worker_id, status)
-                            VALUES (%s, %s, %s, %s, %s)
-                        """, (
-                            image_id,
-                            [result_id],
-                            json.dumps({k: v for k, v in merged_box_data.items() if k != 'source_result_ids'}),
-                            self.worker_id,
-                            'success'
-                        ))
-
-                        fallback_count += 1
-                        existing_emojis.add(emoji)  # Prevent duplicates
-                        self.logger.debug(f"Added CLIP fallback box for {emoji} with confidence {prediction.get('confidence', 0.5):.3f}")
-
-            cursor.close()
-            return fallback_count
-
-        except Exception as e:
-            self.logger.error(f"Error adding CLIP fallback boxes for image {image_id}: {e}")
-            return 0
-
-    def get_clip_results_for_image(self, image_id):
-        """Get CLIP results for an image"""
-        try:
-            cursor = self.read_db_conn.cursor()
-
-            query = """
-                SELECT service, data, result_id
-                FROM results
-                WHERE image_id = %s
-                AND service = 'clip'
-                AND status = 'success'
-                ORDER BY service
-            """
-
-            cursor.execute(query, (image_id,))
-            results = cursor.fetchall()
-            cursor.close()
-
-            return results
-
-        except Exception as e:
-            self.logger.error(f"Error getting CLIP results for image {image_id}: {e}")
-            return []
-
     def update_merged_boxes_for_image(self, image_id, image_filename, image_data=None):
         """Update merged boxes for a single image using safe DELETE+INSERT pattern"""
         max_retries = 2
@@ -1272,12 +1150,6 @@ class HarmonyWorker(BaseWorker):
                 else:
                     self.logger.info(f"Harmonized boxes for {image_filename} ({detection_count} detections → {merged_box_count} merged boxes from {services})")
                 
-                # Check for CLIP fallback spatial evidence before finalizing
-                clip_fallback_count = self.add_clip_fallback_boxes(image_id, image_filename, merged_data)
-                if clip_fallback_count > 0:
-                    merged_box_count += clip_fallback_count
-                    self.logger.info(f"Added {clip_fallback_count} CLIP fallback bounding boxes for {image_filename}")
-
                 # Dispatch bbox postprocessing jobs for each merged box
                 if merged_box_count > 0 and image_data:
                     try:
@@ -1333,22 +1205,33 @@ class HarmonyWorker(BaseWorker):
         if not self.connect_to_queue():
             return 1
         
-        # Setup queue consumer
-        self.queue_channel.basic_consume(
-            queue=self.queue_name,
-            on_message_callback=self.process_queue_message
-        )
-        
-        self.logger.info("Waiting for harmony messages. Press CTRL+C to exit")
-        
-        try:
-            self.queue_channel.start_consuming()
-        except KeyboardInterrupt:
-            self.logger.info("Stopping harmony worker...")
-            self.queue_channel.stop_consuming()
-        finally:
-            self.cleanup_connections()
-            
+        # Consume with reconnect loop
+        while True:
+            try:
+                self.queue_channel.basic_consume(
+                    queue=self.queue_name,
+                    on_message_callback=self.process_queue_message
+                )
+                self.logger.info("Waiting for harmony messages. Press CTRL+C to exit")
+                self.queue_channel.start_consuming()
+            except KeyboardInterrupt:
+                self.logger.info("Stopping harmony worker...")
+                try:
+                    self.queue_channel.stop_consuming()
+                except Exception:
+                    pass
+                break
+            except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
+                    pika.exceptions.StreamLostError) as e:
+                self.logger.warning(f"Queue connection lost: {e}. Reconnecting...")
+                time.sleep(self.retry_delay)
+                if not self.connect_to_queue():
+                    self.logger.warning("Reconnect failed, retrying...")
+                    time.sleep(self.retry_delay)
+                    continue
+
+        self.cleanup_connections()
+
         return 0
     
     def cleanup_connections(self):

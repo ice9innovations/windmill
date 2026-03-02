@@ -82,10 +82,12 @@ def extract_keywords_from_captions(captions):
             if kw in combined_text:
                 all_negative.add(kw)
 
-    # Extract gender mentions
+    # Extract gender mentions - use word boundaries to avoid substring false positives
+    # (e.g. "he" matching inside "the", "her" inside "there")
+    import re
     gender_mentions = {
-        'male': any(kw in combined_text for kw in GENDER_KEYWORDS['male']),
-        'female': any(kw in combined_text for kw in GENDER_KEYWORDS['female'])
+        'male': any(re.search(r'\b' + re.escape(kw) + r'\b', combined_text) for kw in GENDER_KEYWORDS['male']),
+        'female': any(re.search(r'\b' + re.escape(kw) + r'\b', combined_text) for kw in GENDER_KEYWORDS['female'])
     }
 
     # Extract scene context keywords
@@ -301,16 +303,21 @@ def detect_gender_hallucination(captions, spatial_gender_inference):
     return hallucinations
 
 
-def vote_on_gender(spatial_gender_inference, captions):
+def vote_on_gender(spatial_gender_inference, captions, validated_gendered_nouns=None):
     """
-    Combine NudeNet spatial evidence with VLM caption mentions to vote on gender.
+    Combine NudeNet spatial evidence with VLM caption mentions and SAM3-validated
+    gendered nouns to vote on gender.
 
     When NudeNet and VLMs agree, confidence increases.
     When they disagree, we note the conflict but don't blindly trust either.
+    SAM3-validated gendered nouns (e.g. 'man', 'woman' physically located in the
+    image) each count as 2 VLM votes and are the strongest non-anatomy signal.
 
     Args:
         spatial_gender_inference: dict from infer_gender_from_anatomy()
         captions: list of VLM caption dicts with 'service' and 'text'
+        validated_gendered_nouns: optional list of {canonical, gender, vote_count}
+            from noun_consensus where sam3_validated=True
 
     Returns:
         dict: {
@@ -334,6 +341,22 @@ def vote_on_gender(spatial_gender_inference, captions):
     vlm_votes = []
     male_votes = 0
     female_votes = 0
+
+    # SAM3-validated gendered nouns — each counts as 2 VLM votes.
+    # These are the strongest non-anatomy signal: SAM3 physically located
+    # an instance of 'man' or 'woman' in the image.
+    SAM3_VOTE_WEIGHT = 2
+    if validated_gendered_nouns:
+        for entry in validated_gendered_nouns:
+            gender = entry['gender']
+            if gender == 'male':
+                male_votes += SAM3_VOTE_WEIGHT
+                vlm_votes.append({'service': 'sam3_validated', 'gender': 'male',
+                                   'noun': entry['canonical']})
+            elif gender == 'female':
+                female_votes += SAM3_VOTE_WEIGHT
+                vlm_votes.append({'service': 'sam3_validated', 'gender': 'female',
+                                   'noun': entry['canonical']})
 
     for caption in captions:
         service = caption.get('service', 'unknown')
@@ -368,32 +391,45 @@ def vote_on_gender(spatial_gender_inference, captions):
     final_confidence = spatial_confidence
     reasoning = 'spatial_only'
 
+    total_vlm_votes = male_votes + female_votes
+
     if spatial_gender == 'unknown':
         # No spatial evidence - rely on VLM consensus
         if female_votes > male_votes and female_votes > 0:
             final_gender = 'female'
-            final_confidence = min(0.5 + (female_votes * 0.1), 0.75)  # Cap at 0.75 without spatial
+            final_confidence = min(0.5 + (female_votes * 0.1), 0.85)
             reasoning = 'vlm_consensus_only'
         elif male_votes > female_votes and male_votes > 0:
             final_gender = 'male'
-            final_confidence = min(0.5 + (male_votes * 0.1), 0.75)
+            final_confidence = min(0.5 + (male_votes * 0.1), 0.85)
             reasoning = 'vlm_consensus_only'
     else:
         # Have spatial evidence - use VLMs to adjust confidence
-        if agreement_count > 0 and disagreement_count == 0:
+        if disagreement_count > 0 and agreement_count == 0:
+            # All VLMs that voted contradict NudeNet.
+            # Unanimous VLM contradiction overrides spatial — five independent
+            # models seeing "man" outweighs one FACE_FEMALE detection.
+            if disagreement_count >= 3:
+                vlm_gender = 'male' if male_votes > female_votes else 'female'
+                final_gender = vlm_gender
+                final_confidence = min(0.55 + (disagreement_count * 0.07), 0.85)
+                reasoning = 'vlm_unanimous_override'
+            else:
+                # Fewer than 3 VLMs disagree - penalise spatial but keep it
+                penalty = disagreement_count * 0.08
+                final_confidence = max(spatial_confidence - penalty, 0.5)
+                reasoning = 'spatial_vlm_conflict'
+        elif agreement_count > 0 and disagreement_count == 0:
             # VLMs agree with spatial - boost confidence
-            boost = min(agreement_count * 0.02, 0.04)  # Max 4% boost
+            boost = min(agreement_count * 0.04, 0.12)
             final_confidence = min(spatial_confidence + boost, 0.99)
             reasoning = 'spatial_vlm_agreement'
-        elif disagreement_count > 0 and agreement_count == 0:
-            # VLMs disagree with spatial - reduce confidence slightly
-            # But spatial evidence is generally more reliable
-            penalty = min(disagreement_count * 0.05, 0.1)  # Max 10% penalty
-            final_confidence = max(spatial_confidence - penalty, 0.7)
-            reasoning = 'spatial_vlm_conflict'
         elif agreement_count > 0 and disagreement_count > 0:
-            # Mixed signals - slight confidence reduction
-            final_confidence = spatial_confidence - 0.03
+            # Mixed signals - weight by majority
+            if agreement_count > disagreement_count:
+                final_confidence = min(spatial_confidence + 0.02, 0.99)
+            else:
+                final_confidence = max(spatial_confidence - 0.05, 0.5)
             reasoning = 'spatial_vlm_mixed'
 
     return {

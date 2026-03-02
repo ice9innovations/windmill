@@ -69,17 +69,21 @@ class PostProcessingWorker(BaseWorker):
         try:
             cursor = self.db_conn.cursor()
             
+            # Store cluster_id in data so the API can look up the source bbox
+            stored = dict(result_data) if result_data else {}
+            if cluster_id:
+                stored['cluster_id'] = cluster_id
+
             # Insert postprocessing result
             cursor.execute("""
-                INSERT INTO postprocessing (merged_box_id, image_id, service, data, status, result_created)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO postprocessing (merged_box_id, image_id, service, data, status)
+                VALUES (%s, %s, %s, %s, %s)
             """, (
-                merged_box_id, 
-                image_id, 
+                merged_box_id,
+                image_id,
                 self._get_clean_service_name(),
-                json.dumps(result_data) if result_data else json.dumps({}),
-                'success',
-                datetime.now()
+                json.dumps(stored),
+                'success'
             ))
             
             self.db_conn.commit()
@@ -122,16 +126,16 @@ class PostProcessingWorker(BaseWorker):
                     merged_box_id, image_id, result_data, bbox, cluster_id
                 )
                 if success:
-                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    self._safe_ack(ch, method.delivery_tag)
                     self.logger.info(f"Successfully processed {self.service_name} for {cluster_id}")
                 else:
-                    ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                    self._safe_nack(ch, method.delivery_tag, requeue=True)
             else:
                 # Save empty result to avoid reprocessing
                 self.save_postprocessing_result(
                     merged_box_id, image_id, None, bbox, cluster_id
                 )
-                ch.basic_ack(delivery_tag=method.delivery_tag)
+                self._safe_ack(ch, method.delivery_tag)
                 self.logger.warning(f"No {self.service_name} data for {cluster_id}, saved empty result")
                 
         except Exception as e:
@@ -139,7 +143,7 @@ class PostProcessingWorker(BaseWorker):
             if 'postprocessing_merged_box_id_fkey' in error_str:
                 # FK violation means merged_box was superseded by reharmonization - silently skip
                 self.logger.info(f"Merged_box_id {merged_box_id} no longer exists (superseded by reharmonization) - skipping")
-                ch.basic_ack(delivery_tag=method.delivery_tag)  # Acknowledge to remove from queue
+                self._safe_ack(ch, method.delivery_tag)  # Acknowledge to remove from queue
             else:
                 self.logger.error(f"Error processing {self.service_name} message: {e}")
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                self._safe_nack(ch, method.delivery_tag, requeue=True)

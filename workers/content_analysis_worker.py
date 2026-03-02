@@ -44,6 +44,12 @@ class ContentAnalysisWorker(BaseWorker):
 
     def connect_to_database(self):
         """Connect to PostgreSQL database with dual connections"""
+        if hasattr(self, 'read_db_conn') and self.read_db_conn:
+            try:
+                self.read_db_conn.close()
+            except Exception:
+                pass
+
         if not super().connect_to_database():
             return False
 
@@ -52,13 +58,7 @@ class ContentAnalysisWorker(BaseWorker):
             self.db_conn.autocommit = False
 
             # Create separate read connection for queries
-            self.read_db_conn = psycopg2.connect(
-                host=self.db_host,
-                database=self.db_name,
-                user=self.db_user,
-                password=self.db_password
-            )
-            self.read_db_conn.autocommit = True
+            self.read_db_conn = self._new_db_connection(autocommit=True)
 
             return True
 
@@ -124,8 +124,8 @@ class ContentAnalysisWorker(BaseWorker):
                 service, data, status = row
                 results.append({'service': service, 'data': data, 'status': status})
 
-                # Extract captions from VLM services
-                if service in ['blip', 'ollama', 'cogvlm']:
+                # Extract captions from all VLM services
+                if service in ['blip', 'ollama', 'cogvlm', 'haiku', 'moondream', 'qwen']:
                     predictions = data.get('predictions', [])
                     for pred in predictions:
                         if 'text' in pred:
@@ -206,6 +206,32 @@ class ContentAnalysisWorker(BaseWorker):
                                 'label': pred.get('label', 'face')
                             })
 
+            # Fetch SAM3-validated gendered nouns from noun_consensus
+            GENDERED_NOUNS = {
+                'male':   {'man', 'men', 'boy', 'boys', 'gentleman', 'father',
+                           'son', 'brother', 'husband', 'male'},
+                'female': {'woman', 'women', 'girl', 'girls', 'lady', 'mother',
+                           'daughter', 'sister', 'wife', 'female'},
+            }
+            validated_gendered_nouns = []
+            cursor.execute("""
+                SELECT nouns FROM noun_consensus WHERE image_id = %s
+            """, (image_id,))
+            nc_row = cursor.fetchone()
+            if nc_row and nc_row[0]:
+                for entry in nc_row[0]:
+                    if not entry.get('sam3_validated'):
+                        continue
+                    canonical = entry.get('canonical', '')
+                    for gender, terms in GENDERED_NOUNS.items():
+                        if canonical in terms:
+                            validated_gendered_nouns.append({
+                                'canonical': canonical,
+                                'gender': gender,
+                                'vote_count': entry.get('vote_count', 1),
+                            })
+                            break
+
             cursor.close()
 
             return {
@@ -217,7 +243,8 @@ class ContentAnalysisWorker(BaseWorker):
                 'nsfw2_result': nsfw2_result,
                 'face_service_detections': face_service_detections,
                 'image_width': image_width,
-                'image_height': image_height
+                'image_height': image_height,
+                'validated_gendered_nouns': validated_gendered_nouns,
             }
 
         except Exception as e:
@@ -332,6 +359,7 @@ class ContentAnalysisWorker(BaseWorker):
             nudenet_detections = image_data['nudenet_detections']
             merged_boxes = image_data['merged_boxes']
             consensus_data = image_data.get('consensus')
+            validated_gendered_nouns = image_data.get('validated_gendered_nouns', [])
 
             # Extract consensus emojis if available
             consensus_emojis = []
@@ -364,8 +392,8 @@ class ContentAnalysisWorker(BaseWorker):
             # Infer gender from anatomy (spatial evidence)
             spatial_gender = infer_gender_from_anatomy(nudenet_detections)
 
-            # Vote on gender using both NudeNet and VLM evidence
-            gender_vote = vote_on_gender(spatial_gender, captions)
+            # Vote on gender using NudeNet, VLM captions, and SAM3-validated nouns
+            gender_vote = vote_on_gender(spatial_gender, captions, validated_gendered_nouns)
 
             # Detect VLM gender hallucinations (for flagging, not confidence)
             vlm_hallucinations = detect_gender_hallucination(captions, spatial_gender)
@@ -526,9 +554,9 @@ class ContentAnalysisWorker(BaseWorker):
                     activities_detected, spatial_relationships, person_bboxes_raw,
                     person_bboxes_deduplicated, containment_relationships, semantic_validation,
                     vlm_hallucinations, people_count, person_attributions, framing_analysis,
-                    face_correlations, nsfw2_correlation, full_analysis, analysis_version, created
+                    face_correlations, nsfw2_correlation, full_analysis, analysis_version
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (image_id) DO UPDATE SET
                     gender_breakdown = EXCLUDED.gender_breakdown,
@@ -548,8 +576,7 @@ class ContentAnalysisWorker(BaseWorker):
                     face_correlations = EXCLUDED.face_correlations,
                     nsfw2_correlation = EXCLUDED.nsfw2_correlation,
                     full_analysis = EXCLUDED.full_analysis,
-                    analysis_version = EXCLUDED.analysis_version,
-                    created = EXCLUDED.created
+                    analysis_version = EXCLUDED.analysis_version
             """, (
                 analysis['image_id'],
                 json.dumps(analysis['gender_breakdown']),
@@ -569,8 +596,7 @@ class ContentAnalysisWorker(BaseWorker):
                 json.dumps(analysis['face_correlations']),
                 json.dumps(analysis['nsfw2_correlation']),
                 json.dumps(analysis['full_analysis']),
-                analysis['analysis_version'],
-                datetime.now()
+                analysis['analysis_version']
             ))
 
             self.db_conn.commit()
@@ -607,7 +633,7 @@ class ContentAnalysisWorker(BaseWorker):
                     "Database connection unavailable, rejecting message without requeue. "
                     "Worker will retry after backoff delay."
                 )
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                self._safe_nack(ch, method.delivery_tag, requeue=False)
                 self.job_failed("Database unavailable")
                 return
 
@@ -625,7 +651,7 @@ class ContentAnalysisWorker(BaseWorker):
             image_data = self.get_image_data(image_id)
             if not image_data:
                 self.logger.error(f"Failed to fetch image data for {image_id}")
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Failed to fetch image data")
                 return
 
@@ -633,19 +659,19 @@ class ContentAnalysisWorker(BaseWorker):
             analysis = self.analyze_content(image_id, image_data)
             if not analysis:
                 self.logger.error(f"Failed to analyze content for {image_id}")
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Analysis failed")
                 return
 
             # Store analysis
             if not self.store_analysis(analysis):
                 self.logger.error(f"Failed to store analysis for {image_id}")
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Storage failed")
                 return
 
             # Acknowledge message
-            ch.basic_ack(delivery_tag=method.delivery_tag)
+            self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
 
             self.logger.info(f"Successfully completed content analysis for image {image_id}")
@@ -654,14 +680,14 @@ class ContentAnalysisWorker(BaseWorker):
             # Database connection errors - don't requeue to prevent CPU spin
             self.logger.error(f"Database error processing content analysis message: {e}")
             self.logger.warning("Rejecting message without requeue due to database error")
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            self._safe_nack(ch, method.delivery_tag, requeue=False)
             self.job_failed(str(e))
         except Exception as e:
             # Other errors - requeue for retry
             self.logger.error(f"Error processing content analysis message: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            self._safe_nack(ch, method.delivery_tag, requeue=True)
             self.job_failed(str(e))
 
 

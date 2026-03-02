@@ -21,9 +21,9 @@ class CaptionScoreWorker(BaseWorker):
         # Initialize with caption score service type
         super().__init__('postprocessing.caption_score')
         
-        # CLIP score service configuration - find by service_type
-        caption_score_services = self.config.get_service_group('postprocessing.caption_score[]')
-        service_config = self.config.get_service_config(caption_score_services[0])
+        # CLIP score service configuration - image-text similarity at clip_score endpoint
+        clip_score_services = self.config.get_service_group('postprocessing.clip_score[]')
+        service_config = self.config.get_service_config(clip_score_services[0])
         self.clip_score_url = f"http://{service_config['host']}:{service_config['port']}{service_config['endpoint']}"
         
         # Services that trigger caption scoring - use actual service names from database
@@ -37,22 +37,22 @@ class CaptionScoreWorker(BaseWorker):
     
     def connect_to_database(self):
         """Connect to PostgreSQL database with dual connections"""
+        if hasattr(self, 'read_db_conn') and self.read_db_conn:
+            try:
+                self.read_db_conn.close()
+            except Exception:
+                pass
+
         # Call parent to set up main connection
         if not super().connect_to_database():
             return False
-            
+
         try:
             # Set up transaction mode for main connection
             self.db_conn.autocommit = False
-            
+
             # Create separate read connection for queries
-            self.read_db_conn = psycopg2.connect(
-                host=self.db_host,
-                database=self.db_name,
-                user=self.db_user,
-                password=self.db_password
-            )
-            self.read_db_conn.autocommit = True  # Auto-commit for read queries
+            self.read_db_conn = self._new_db_connection(autocommit=True)
             
             return True
             
@@ -130,7 +130,7 @@ class CaptionScoreWorker(BaseWorker):
                     result_data = json.loads(row[0])
                 else:
                     result_data = row[0]
-                
+
                 # Extract predictions
                 predictions = result_data.get('predictions', [])
                 if predictions:
@@ -141,7 +141,6 @@ class CaptionScoreWorker(BaseWorker):
                         return {
                             'service': service_name,
                             'caption': caption_text,
-                            'original_confidence': predictions[0].get('confidence', 1.0)
                         }
             except (json.JSONDecodeError, KeyError, IndexError) as e:
                 self.logger.warning(f"Failed to parse {service_name} data for image {image_id}: {e}")
@@ -153,45 +152,56 @@ class CaptionScoreWorker(BaseWorker):
             return None
 
     def score_caption_against_image(self, image_data, caption):
-        """Score a caption against an image using CLIP"""
+        """Score a caption against an image using CLIP.
+
+        Returns a dict with:
+            similarity_score  - cosine similarity float
+            image_embedding   - 768-dim normalized float list (ViT-L/14)
+            caption_embedding - 768-dim normalized float list for the caption text
+        Returns None on failure.
+        """
         try:
             import base64
             import io
-            
+
             # Decode base64 image data to bytes
             image_bytes = base64.b64decode(image_data)
-            
+
             # Call CLIP score endpoint using multipart file upload + form data
             files = {'file': ('image.jpg', io.BytesIO(image_bytes), 'image/jpeg')}
             data = {'caption': caption}
-            
+
             response = requests.post(
                 self.clip_score_url,
                 files=files,
                 data=data,
                 timeout=self.request_timeout
             )
-            
+
             if response.status_code == 200:
                 result = response.json()
                 if result.get('status') == 'success':
-                    return result.get('similarity_score', 0.0)
+                    return {
+                        'similarity_score': result.get('similarity_score', 0.0),
+                        'image_embedding': result.get('image_embedding'),
+                        'caption_embedding': result.get('text_embedding'),
+                    }
                 else:
                     self.logger.warning(f"CLIP score API error: {result.get('error', {}).get('message', 'Unknown error')}")
                     return None
             else:
                 self.logger.error(f"CLIP score API returned {response.status_code}: {response.text}")
                 return None
-            
+
         except Exception as e:
             self.logger.error(f"Error calling CLIP score API: {e}")
             return None
     
 
     def save_individual_caption_score(self, image_id, caption_score):
-        """Save individual caption score to database"""
+        """Save individual caption score and caption embedding to postprocessing table"""
         max_retries = 3
-        
+
         for attempt in range(max_retries):
             try:
                 # Ensure healthy database connection
@@ -202,16 +212,18 @@ class CaptionScoreWorker(BaseWorker):
                         time.sleep(2)
                         continue
                     return False
-                
+
                 cursor = self.db_conn.cursor()
-                
-                # Insert caption score for this specific service
+
+                # Store caption embedding alongside the score so it travels with the caption
                 score_data = {
                     'caption_score': caption_score,
                     'processing_algorithm': 'clip_similarity_v1',
                     'processed_at': datetime.now().isoformat()
                 }
-                
+                if caption_score.get('caption_embedding') is not None:
+                    score_data['caption_embedding'] = caption_score['caption_embedding']
+
                 cursor.execute("""
                     INSERT INTO postprocessing (image_id, service, data, status)
                     VALUES (%s, %s, %s, %s)
@@ -221,31 +233,78 @@ class CaptionScoreWorker(BaseWorker):
                     json.dumps(score_data),
                     'success'
                 ))
-                
+
                 self.db_conn.commit()
                 cursor.close()
-                
+
                 if attempt > 0:
                     self.logger.info(f"Successfully saved caption score after {attempt + 1} attempts")
-                
+
                 return True
-                
+
             except Exception as e:
                 self.logger.error(f"Error saving caption score (attempt {attempt + 1}/{max_retries}): {e}")
-                
-                # Rollback transaction on error
+
                 try:
                     if self.db_conn:
                         self.db_conn.rollback()
                 except:
                     pass
-                
-                # If not the last attempt, wait and retry
+
                 if attempt < max_retries - 1:
                     self.logger.info(f"Will retry database save after 2 seconds...")
                     time.sleep(2)
                     continue
-                    
+
+        return False
+
+    def save_image_embedding(self, image_id, image_embedding):
+        """Write the CLIP image embedding to the images table, once per image.
+
+        Uses an idempotent UPDATE that only fires when image_clip_embedding is NULL,
+        so concurrent caption score workers for the same image are safe.
+        The embedding list is serialized to pgvector's text format and cast in SQL.
+        """
+        max_retries = 3
+
+        for attempt in range(max_retries):
+            try:
+                if not self.ensure_database_connection():
+                    self.logger.error("Could not establish database connection for image embedding save")
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+                        continue
+                    return False
+
+                cursor = self.db_conn.cursor()
+
+                # json.dumps produces '[1.0, 2.0, ...]' — valid pgvector text input
+                embedding_str = json.dumps(image_embedding)
+
+                cursor.execute("""
+                    UPDATE images
+                    SET image_clip_embedding = %s::vector
+                    WHERE image_id = %s AND image_clip_embedding IS NULL
+                """, (embedding_str, image_id))
+
+                self.db_conn.commit()
+                cursor.close()
+
+                return True
+
+            except Exception as e:
+                self.logger.error(f"Error saving image embedding (attempt {attempt + 1}/{max_retries}): {e}")
+
+                try:
+                    if self.db_conn:
+                        self.db_conn.rollback()
+                except:
+                    pass
+
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                    continue
+
         return False
     
     def process_queue_message(self, ch, method, properties, body):
@@ -263,7 +322,7 @@ class CaptionScoreWorker(BaseWorker):
             # Validate image data is present
             if not image_data:
                 self.logger.error(f"No image_data in message for image {image_id}")
-                ch.basic_ack(delivery_tag=method.delivery_tag)
+                self._safe_ack(ch, method.delivery_tag)
                 return
             
             # Get caption from the specific service that triggered this - extract just service name from hierarchical name
@@ -272,43 +331,53 @@ class CaptionScoreWorker(BaseWorker):
             
             if not caption_data:
                 self.logger.debug(f"No caption found from {service_name} for {image_filename}")
-                ch.basic_ack(delivery_tag=method.delivery_tag)
+                self._safe_ack(ch, method.delivery_tag)
                 return
             
             # Score the individual caption against the image
             caption = caption_data['caption']
             service = caption_data['service']
-            
-            similarity_score = self.score_caption_against_image(image_data, caption)
-            
-            if similarity_score is None:
+
+            clip_result = self.score_caption_against_image(image_data, caption)
+
+            if clip_result is None:
                 self.logger.error(f"CLIP service failed to score caption from {service} for {image_filename}")
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
                 return
-            
+
+            similarity_score = clip_result['similarity_score']
+            self.logger.info(f"{service} caption score: {similarity_score:.3f} for '{caption[:50]}...'")
+
             caption_score = {
                 'service': service,
                 'caption': caption,
-                'original_confidence': caption_data['original_confidence'],
                 'similarity_score': similarity_score,
+                'caption_embedding': clip_result.get('caption_embedding'),
                 'scored_at': datetime.now().isoformat()
             }
-            
-            self.logger.info(f"{service} caption score: {similarity_score:.3f} for '{caption[:50]}...'")
-            
-            # Save individual caption score - only acknowledge if database save succeeds
-            if self.save_individual_caption_score(image_id, caption_score):
-                self.logger.info(f"Saved caption score for {service}: {image_filename}")
-                # Only acknowledge message when EVERYTHING succeeds
-                ch.basic_ack(delivery_tag=method.delivery_tag)
-            else:
-                self.logger.error(f"Database save failed for {service}: {image_filename}")
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+
+            # Save caption score (includes caption embedding) — only ack if this succeeds
+            if not self.save_individual_caption_score(image_id, caption_score):
+                self.logger.error(f"Caption score database save failed for {service}: {image_filename}")
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
+                return
+
+            self.logger.info(f"Saved caption score for {service}: {image_filename}")
+
+            # Save image embedding once — idempotent, so safe to call on every message
+            image_embedding = clip_result.get('image_embedding')
+            if image_embedding is not None:
+                if not self.save_image_embedding(image_id, image_embedding):
+                    # Non-fatal: caption score is already committed; log and continue
+                    self.logger.warning(f"Image embedding save failed for {image_filename} (image_id={image_id}); will be written on next caption score")
+
+            # Only acknowledge message when caption score is durably saved
+            self._safe_ack(ch, method.delivery_tag)
             
         except Exception as e:
             self.logger.error(f"Error processing queue message: {e}")
             # Reject and requeue for retry
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            self._safe_nack(ch, method.delivery_tag, requeue=True)
     
     def run(self):
         """Main entry point - queue-based processing"""
@@ -323,28 +392,39 @@ class CaptionScoreWorker(BaseWorker):
         self.logger.info(f"CLIP score endpoint: {self.clip_score_url}")
         self.logger.info(f"Trigger services: {', '.join(self.trigger_services)}")
         
-        # Setup message consumer
-        self.channel.basic_consume(
-            queue=self.queue_name,
-            on_message_callback=self.process_queue_message
-        )
-        
-        self.logger.info("Waiting for caption scoring messages. Press CTRL+C to exit")
-        
-        try:
-            self.channel.start_consuming()
-        except KeyboardInterrupt:
-            self.logger.info("Stopping caption score worker...")
-            self.channel.stop_consuming()
-        finally:
-            if self.connection and not self.connection.is_closed:
-                self.connection.close()
-            if self.db_conn:
-                self.db_conn.close()
-            if self.read_db_conn:
-                self.read_db_conn.close()
-            self.logger.info("Caption score worker stopped")
-        
+        # Consume with reconnect loop
+        while True:
+            try:
+                self.channel.basic_consume(
+                    queue=self.queue_name,
+                    on_message_callback=self.process_queue_message
+                )
+                self.logger.info("Waiting for caption scoring messages. Press CTRL+C to exit")
+                self.channel.start_consuming()
+            except KeyboardInterrupt:
+                self.logger.info("Stopping caption score worker...")
+                try:
+                    self.channel.stop_consuming()
+                except Exception:
+                    pass
+                break
+            except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
+                    pika.exceptions.StreamLostError) as e:
+                self.logger.warning(f"Queue connection lost: {e}. Reconnecting...")
+                time.sleep(self.retry_delay)
+                if not self.connect_to_queue():
+                    self.logger.warning("Reconnect failed, retrying...")
+                    time.sleep(self.retry_delay)
+                    continue
+
+        if self.connection and not self.connection.is_closed:
+            self.connection.close()
+        if self.db_conn:
+            self.db_conn.close()
+        if self.read_db_conn:
+            self.read_db_conn.close()
+        self.logger.info("Caption score worker stopped")
+
         return 0
 
 def main():

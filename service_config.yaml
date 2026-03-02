@@ -15,14 +15,14 @@ services:
       host: localhost
       port: 7777
       endpoint: /v3/analyze
-      service_type: semantic
+      service_type: semantic, vlm
 
-    clip:
+#    clip:
       # queue_name: clip # queue name commented out to prove that this works
-      host: localhost
-      port: 7788
-      endpoint: /v3/analyze
-      service_type: classification # some services can be in multiple categories 
+#      host: localhost
+#      port: 7788
+#      endpoint: /v3/analyze
+#      service_type: classification # some services can be in multiple categories 
 
     colors:
       queue_name: colors
@@ -32,12 +32,12 @@ services:
       service_type: colors
       consensus: false
 
-    detectron2:
-      queue_name: detectron # not hardcoded
-      host: localhost
-      port: 7771
-      endpoint: /v3/analyze
-      service_type: spatial
+#    detectron2:
+#      queue_name: detectron # not hardcoded
+#      host: localhost
+#      port: 7771
+#      endpoint: /v3/analyze
+#      service_type: spatial
 
     # xception:
     #   queue_name: xception
@@ -60,70 +60,91 @@ services:
       endpoint: /v3/analyze
       service_type: specialized
 
-    nsfw2:
-      queue_name: nsfw
-      host: localhost
-      port: 7774
-      endpoint: /v3/analyze
-      service_type: specialized
+#    nsfw2:
+#      queue_name: nsfw
+#      host: localhost
+#      port: 7774
+#      endpoint: /v3/analyze
+#      service_type: specialized
 
     nudenet:
       queue_name: nudenet
       host: localhost
       port: 7789
       endpoint: /v3/analyze
-      service_type: spatial
+      service_type: specialized
+
+    moondream:
+      queue_name: moondream
+      host: localhost
+      port: 7795
+      endpoint: /v3/analyze
+      service_type: semantic, vlm
 
     ollama:
       queue_name: ollama
       host: localhost
       port: 7782
       endpoint: /v3/analyze
-      service_type: semantic
+      service_type: semantic, vlm
       # caption_scoring: true # all semantic services trigger caption scoring
 
-    rtdetr:
-      queue_name: rtdetr
+    haiku:
+      queue_name: haiku
       host: localhost
-      port: 7780
+      port: 7797
       endpoint: /v3/analyze
-      service_type: spatial
+      service_type: semantic, vlm
 
-    rtmdet:
-      queue_name: rtmdet
+    qwen:
+      queue_name: qwen
       host: localhost
-      port: 7792
+      port: 7796
       endpoint: /v3/analyze
-      service_type: spatial
+      service_type: semantic, vlm
 
-    speciesnet:
-      queue_name: speciesnet
-      host: localhost
-      port: 7794
-      endpoint: /analyze
-      service_type: spatial
-      consensus: false
+#    rtdetr:
+#      queue_name: rtdetr
+#      host: localhost
+#      port: 7780
+#      endpoint: /v3/analyze
+#      service_type: spatial
+
+#    rtmdet:
+#      queue_name: rtmdet
+#      host: localhost
+#      port: 7792
+#      endpoint: /v3/analyze
+#      service_type: spatial
+
+#    speciesnet:
+#      queue_name: speciesnet
+#      host: localhost
+#      port: 7794
+#      endpoint: /analyze
+#      service_type: spatial
+#      consensus: false
 
     yolo_v8:
       queue_name: yolo_v8
-      host: localhost
+      host: hailo.local
       port: 7773
       endpoint: /v3/analyze
       service_type: spatial
 
-    yolo_365:
-      queue_name: yolo_365
-      host: localhost
-      port: 7790
-      endpoint: /v3/analyze
-      service_type: spatial
+#    yolo_365:
+#      queue_name: yolo_365
+#      host: localhost
+#      port: 7790
+#      endpoint: /v3/analyze
+#      service_type: spatial
 
-    yolo_oi7:
-      queue_name: yolo_oi7
-      host: localhost
-      port: 7791
-      endpoint: /v3/analyze
-      service_type: spatial
+#    yolo_oi7:
+#      queue_name: yolo_oi7
+#      host: localhost
+#      port: 7791
+#      endpoint: /v3/analyze
+#      service_type: spatial
 
   postprocessing:
     # Postprocessing Services - Run on cropped bbox regions or captions
@@ -158,6 +179,13 @@ services:
       service_type: caption_score
       consensus: false
 
+    clip_score:
+      host: localhost
+      port: 7798
+      endpoint: /v3/score
+      service_type: clip_score
+      consensus: false
+
   system:
 
     # Infrastructure Services - Queue processing and harmonization
@@ -176,15 +204,49 @@ services:
       service_type: harmonization
       # prefetch: 1  # default; keep single in-flight message per worker
 
-    segmentation:
-      queue_name: refinement
-      category: infrastructure
-      service_type: segmentation
-      host: localhost
-      port: 7793
-      endpoint: /analyze
+#    segmentation:
+#      queue_name: refinement
+#      category: infrastructure
+#      service_type: segmentation
+#      host: localhost
+#      port: 7793
+#      endpoint: /analyze
 
     content_analysis:
       queue_name: content_analysis
       category: infrastructure
       service_type: content_analysis
+
+    noun_consensus:
+      queue_name: noun_consensus
+      category: infrastructure
+      service_type: noun_consensus
+
+    verb_consensus:
+      queue_name: verb_consensus
+      category: infrastructure
+      service_type: verb_consensus
+
+    sam3:
+      queue_name: sam3
+      category: infrastructure
+      service_type: sam3
+      host: localhost
+      port: 9779
+      endpoint: /analyze
+
+    caption_summary:
+      queue_name: caption_summary
+      category: infrastructure
+      service_type: caption_summary
+      host: localhost
+      port: 7799
+      endpoint: /summarize
+
+    rembg:
+      queue_name: rembg
+      category: infrastructure
+      service_type: rembg
+      host: localhost
+      port: 7768
+      endpoint: /analyze

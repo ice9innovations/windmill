@@ -11,6 +11,9 @@ import logging
 import socket
 import base64
 import io
+import threading
+import queue as stdlib_queue
+import ssl
 import pika
 import psycopg2
 import requests
@@ -36,6 +39,14 @@ class BaseWorker:
         self.max_db_failures_before_backoff = 3
         self.db_backoff_delay = 1  # Start with 1 second
         self.max_db_backoff_delay = 60  # Max 60 seconds
+
+        # Background publish thread — decouples downstream trigger publishes
+        # from the consume loop so they don't block ML throughput
+        self._publish_queue = stdlib_queue.Queue(maxsize=1000)
+        self._publish_thread = None
+        self._publish_connection = None
+        self._publish_channel = None
+        self._running = False
         
     def load_config(self, env_file):
         """Load configuration from .env and service_config.yaml"""
@@ -57,14 +68,17 @@ class BaseWorker:
         # Queue configuration
         self.queue_name = self.config.get_queue_name(self.service_name)
         self.queue_host = self._get_required('QUEUE_HOST')
+        self.queue_port = int(os.getenv('QUEUE_PORT', '5672'))
+        self.queue_ssl = os.getenv('QUEUE_SSL', '').lower() in ('true', '1', 'yes')
         self.queue_user = self._get_required('QUEUE_USER')
         self.queue_password = self._get_required('QUEUE_PASSWORD')
-        
+
         # Database configuration
         self.db_host = self._get_required('DB_HOST')
         self.db_name = self._get_required('DB_NAME')
         self.db_user = self._get_required('DB_USER')
         self.db_password = self._get_required('DB_PASSWORD')
+        self.db_sslmode = os.getenv('DB_SSLMODE')
         
         # Worker configuration
         self.worker_id = f"worker_{self.service_name}_{int(time.time())}"
@@ -82,12 +96,16 @@ class BaseWorker:
         # Determine triggers based on service type and YAML rules
         self.is_spatial = self.config.is_spatial_service(self.service_name)
         self.is_semantic = self.config.is_semantic_service(self.service_name)
+        self.is_vlm = self.config.is_vlm_service(self.service_name)
         self.enable_consensus_triggers = self.config.should_trigger_consensus(self.service_name)
-        
+
         # Enable triggers for spatial services (for bbox harmonization)
         self.enable_triggers = self.is_spatial
         # Enable caption scoring for semantic services
         self.enable_caption_scoring = self.is_semantic
+        # Enable noun and verb consensus for VLM services
+        self.enable_noun_consensus = self.is_vlm
+        self.enable_verb_consensus = self.is_vlm
         
         # Performance configuration
         self.processing_delay = float(os.getenv('PROCESSING_DELAY', '0.0'))
@@ -130,6 +148,161 @@ class BaseWorker:
         console_handler.setFormatter(formatter)
         self.logger.addHandler(console_handler)
     
+    def _build_queue_params(self, **overrides):
+        """Build pika ConnectionParameters with optional TLS support."""
+        credentials = pika.PlainCredentials(self.queue_user, self.queue_password)
+        kwargs = dict(
+            host=self.queue_host,
+            port=self.queue_port,
+            credentials=credentials,
+            heartbeat=60,
+            blocked_connection_timeout=300,
+            connection_attempts=10,
+            retry_delay=5,
+            socket_timeout=10,
+        )
+        if self.queue_ssl:
+            ssl_context = ssl.create_default_context()
+            kwargs['ssl_options'] = pika.SSLOptions(ssl_context, self.queue_host)
+        kwargs.update(overrides)
+        return pika.ConnectionParameters(**kwargs)
+
+    def _connect_publish_channel(self):
+        """Create a separate RabbitMQ connection and channel for background publishing.
+        This connection is owned by the publish thread and never touched by the consume thread."""
+        self._publish_connection = pika.BlockingConnection(self._build_queue_params())
+        self._publish_channel = self._publish_connection.channel()
+
+        # Declare all downstream queues this worker might publish to
+        def declare_with_dlq(channel, queue_name):
+            dlq_name = f"{queue_name}.dlq"
+            channel.queue_declare(queue=dlq_name, durable=True)
+            args = {
+                'x-dead-letter-exchange': '',
+                'x-dead-letter-routing-key': dlq_name
+            }
+            ttl_env = os.getenv('QUEUE_MESSAGE_TTL_MS')
+            if ttl_env and ttl_env.isdigit() and int(ttl_env) > 0:
+                args['x-message-ttl'] = int(ttl_env)
+            channel.queue_declare(queue=queue_name, durable=True, arguments=args)
+
+        # Declare downstream queues based on what this worker triggers
+        if self.enable_triggers:
+            declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('harmonization'))
+        if self.enable_consensus_triggers:
+            declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('consensus'))
+        if self.enable_caption_scoring:
+            declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('caption_score'))
+        if self.enable_noun_consensus:
+            declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('noun_consensus'))
+        if self.enable_verb_consensus:
+            declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('verb_consensus'))
+        if self.enable_noun_consensus:
+            declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('sam3'))
+
+        self.logger.info("Publish thread connected to RabbitMQ")
+
+    def _publish_loop(self):
+        """Background thread target: drains the publish queue and sends messages
+        on its own dedicated pika connection."""
+        try:
+            self._connect_publish_channel()
+        except Exception as e:
+            self.logger.error(f"Publish thread failed to connect: {e}")
+            return
+
+        while self._running:
+            try:
+                routing_key, body = self._publish_queue.get(timeout=0.5)
+            except stdlib_queue.Empty:
+                # Process pika heartbeats during idle periods to prevent
+                # the broker from closing the connection
+                try:
+                    self._publish_connection.process_data_events()
+                except Exception as e:
+                    self.logger.warning(f"Publish connection heartbeat failed: {e}. Reconnecting...")
+                    try:
+                        self._connect_publish_channel()
+                    except Exception as reconnect_e:
+                        self.logger.error(f"Publish thread reconnect failed: {reconnect_e}")
+                continue
+
+            try:
+                self._publish_channel.basic_publish(
+                    exchange='',
+                    routing_key=routing_key,
+                    body=body,
+                    properties=pika.BasicProperties(delivery_mode=2)
+                )
+            except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
+                    pika.exceptions.StreamLostError) as e:
+                self.logger.warning(f"Publish connection lost: {e}. Reconnecting...")
+                try:
+                    self._connect_publish_channel()
+                    # Retry the failed publish after reconnecting
+                    self._publish_channel.basic_publish(
+                        exchange='',
+                        routing_key=routing_key,
+                        body=body,
+                        properties=pika.BasicProperties(delivery_mode=2)
+                    )
+                except Exception as retry_e:
+                    self.logger.error(f"Publish retry failed after reconnect: {retry_e}")
+            except Exception as e:
+                self.logger.error(f"Publish error: {e}")
+
+        # Drain remaining messages on shutdown
+        drained = 0
+        while not self._publish_queue.empty():
+            try:
+                routing_key, body = self._publish_queue.get_nowait()
+                self._publish_channel.basic_publish(
+                    exchange='',
+                    routing_key=routing_key,
+                    body=body,
+                    properties=pika.BasicProperties(delivery_mode=2)
+                )
+                drained += 1
+            except Exception:
+                break
+        if drained:
+            self.logger.info(f"Publish thread drained {drained} remaining messages on shutdown")
+
+        try:
+            self._publish_connection.close()
+        except Exception:
+            pass
+        self.logger.info("Publish thread stopped")
+
+    def _enqueue_publish(self, routing_key, body):
+        """Enqueue a message for background publishing. Non-blocking — returns immediately."""
+        try:
+            self._publish_queue.put_nowait((routing_key, body))
+        except stdlib_queue.Full:
+            self.logger.error(
+                f"Publish queue full ({self._publish_queue.maxsize}), "
+                f"dropping message to {routing_key}"
+            )
+
+    def _safe_ack(self, ch, delivery_tag):
+        """Ack a message, logging instead of raising if the channel is dead."""
+        try:
+            ch.basic_ack(delivery_tag=delivery_tag)
+        except (pika.exceptions.AMQPChannelError, pika.exceptions.AMQPConnectionError,
+                pika.exceptions.StreamLostError) as e:
+            self.logger.warning(f"Channel dead during ack (message will be redelivered): {e}")
+            raise  # Let it propagate to start()'s reconnect loop
+
+    def _safe_nack(self, ch, delivery_tag, requeue=True):
+        """Nack a message, swallowing channel errors since we're already in an error path."""
+        try:
+            ch.basic_nack(delivery_tag=delivery_tag, requeue=requeue)
+        except (pika.exceptions.AMQPChannelError, pika.exceptions.AMQPConnectionError,
+                pika.exceptions.StreamLostError) as e:
+            self.logger.warning(
+                f"Channel dead during nack (broker will redeliver unacked message): {e}"
+            )
+
     def job_completed_successfully(self):
         """Call this after successfully completing a job"""
         self.jobs_completed += 1
@@ -162,79 +335,132 @@ class BaseWorker:
         return response.json()
     
     def trigger_consensus(self, image_id, message):
-        """Trigger consensus processing"""
+        """Trigger consensus processing (async via background publish thread)"""
         if self.enable_consensus_triggers:
             try:
-                # Check if connection is healthy
-                if not self.channel or self.connection.is_closed:
-                    self.logger.warning("RabbitMQ connection lost, reconnecting...")
-                    if not self.connect_to_queue():
-                        self.logger.error("Failed to reconnect to RabbitMQ for consensus message")
-                        raise Exception("RabbitMQ reconnection failed")
-                
                 consensus_message = {
                     'image_id': image_id,
                     'image_filename': message.get('image_filename', f'image_{image_id}'),
-                    'image_data': message['image_data'],  # Pass through base64 image data
                     'service': self.service_name,
                     'worker_id': self.worker_id,
                     'processed_at': datetime.now().isoformat()
                 }
-                
-                self.channel.basic_publish(
-                    exchange='',
-                    routing_key=self._get_queue_by_service_type('consensus'),
-                    body=json.dumps(consensus_message),
-                    properties=pika.BasicProperties(delivery_mode=2)
+
+                self._enqueue_publish(
+                    self._get_queue_by_service_type('consensus'),
+                    json.dumps(consensus_message)
                 )
-                
-                self.logger.debug(f"Published consensus trigger for {self.service_name} image {image_id}")
-                
+
+                self.logger.debug(f"Enqueued consensus trigger for {self.service_name} image {image_id}")
+
             except Exception as e:
-                self.logger.error(f"Failed to publish consensus message: {e}")
+                self.logger.error(f"Failed to enqueue consensus message: {e}")
     
     def trigger_caption_scoring(self, image_id, message):
-        """Trigger caption scoring for caption generation services"""
+        """Trigger caption scoring for caption generation services (async via background publish thread)"""
         if self.enable_caption_scoring:
             try:
-                # Check if connection is healthy
-                if not self.channel or self.connection.is_closed:
-                    self.logger.warning("RabbitMQ connection lost, reconnecting...")
-                    if not self.connect_to_queue():
-                        self.logger.error("Failed to reconnect to RabbitMQ for consensus message")
-                        raise Exception("RabbitMQ reconnection failed")
-                
                 caption_score_message = {
                     'image_id': image_id,
                     'image_filename': message.get('image_filename', f'image_{image_id}'),
-                    'image_data': message['image_data'],  # Pass through base64 image data
+                    'image_data': message['image_data'],
                     'service': self.service_name,
                     'worker_id': self.worker_id,
                     'processed_at': datetime.now().isoformat()
                 }
-                
-                self.channel.basic_publish(
-                    exchange='',
-                    routing_key=self._get_queue_by_service_type('caption_score'),
-                    body=json.dumps(caption_score_message),
-                    properties=pika.BasicProperties(delivery_mode=2)
+
+                self._enqueue_publish(
+                    self._get_queue_by_service_type('caption_score'),
+                    json.dumps(caption_score_message)
                 )
-                
-                self.logger.debug(f"Published caption scoring trigger for {self.service_name} image {image_id}")
-                
+
+                self.logger.debug(f"Enqueued caption scoring trigger for {self.service_name} image {image_id}")
+
             except Exception as e:
-                self.logger.error(f"Failed to publish caption score message: {e}")
+                self.logger.error(f"Failed to enqueue caption score message: {e}")
     
+    def trigger_noun_consensus(self, image_id, message):
+        """Trigger noun consensus for VLM services (async via background publish thread)"""
+        if not self.enable_noun_consensus:
+            return
+        try:
+            noun_consensus_message = {
+                'image_id': image_id,
+                'image_filename': message.get('image_filename', f'image_{image_id}'),
+                'image_data': message.get('image_data'),
+                'service': self.service_name,
+                'worker_id': self.worker_id,
+                'processed_at': datetime.now().isoformat()
+            }
+
+            self._enqueue_publish(
+                self._get_queue_by_service_type('noun_consensus'),
+                json.dumps(noun_consensus_message)
+            )
+
+            self.logger.debug(f"Enqueued noun_consensus trigger for {self.service_name} image {image_id}")
+
+        except Exception as e:
+            self.logger.error(f"Failed to enqueue noun_consensus message: {e}")
+
+    def trigger_verb_consensus(self, image_id, message):
+        """Trigger verb consensus for VLM services (async via background publish thread)"""
+        if not self.enable_verb_consensus:
+            return
+        try:
+            verb_consensus_message = {
+                'image_id': image_id,
+                'image_filename': message.get('image_filename', f'image_{image_id}'),
+                'service': self.service_name,
+                'worker_id': self.worker_id,
+                'processed_at': datetime.now().isoformat()
+            }
+
+            self._enqueue_publish(
+                self._get_queue_by_service_type('verb_consensus'),
+                json.dumps(verb_consensus_message)
+            )
+
+            self.logger.debug(f"Enqueued verb_consensus trigger for {self.service_name} image {image_id}")
+
+        except Exception as e:
+            self.logger.error(f"Failed to enqueue verb_consensus message: {e}")
+
+    def after_result_stored(self, image_id, result, message):
+        """Hook called after storing the ML result. Override in subclasses for
+        in-place extrapolation that belongs to the same service."""
+        pass
+
+    def _new_db_connection(self, autocommit=True):
+        """Create a new PostgreSQL connection using the worker's config.
+        Subclasses should use this for any additional connections (e.g. read replicas)."""
+        kwargs = dict(
+            host=self.db_host,
+            database=self.db_name,
+            user=self.db_user,
+            password=self.db_password,
+            connect_timeout=10,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=3,
+        )
+        if self.db_sslmode:
+            kwargs['sslmode'] = self.db_sslmode
+        conn = psycopg2.connect(**kwargs)
+        conn.autocommit = autocommit
+        return conn
+
     def connect_to_database(self):
         """Connect to PostgreSQL database"""
         try:
-            self.db_conn = psycopg2.connect(
-                host=self.db_host,
-                database=self.db_name,
-                user=self.db_user,
-                password=self.db_password
-            )
-            self.db_conn.autocommit = True
+            # Close existing connection to prevent leaks on reconnect
+            if self.db_conn:
+                try:
+                    self.db_conn.close()
+                except Exception:
+                    pass
+            self.db_conn = self._new_db_connection(autocommit=True)
             self.logger.info(f"Connected to PostgreSQL at {self.db_host}")
 
             # Reset failure tracking on successful connection
@@ -308,42 +534,24 @@ class BaseWorker:
         return success
     
     def connect_to_queue(self):
-        """Connect to RabbitMQ queue"""
+        """Connect to RabbitMQ for consuming. Only declares this worker's own queue.
+        Downstream queues are declared by the background publish thread."""
         try:
-            credentials = pika.PlainCredentials(self.queue_user, self.queue_password)
-            self.connection = pika.BlockingConnection(
-                pika.ConnectionParameters(
-                    host=self.queue_host,
-                    credentials=credentials,
-                    heartbeat=60,
-                    blocked_connection_timeout=300,
-                    connection_attempts=10,
-                    retry_delay=5,
-                    socket_timeout=10
-                )
-            )
+            self.connection = pika.BlockingConnection(self._build_queue_params())
             self.channel = self.connection.channel()
-            
-            # Declare queues with DLQ (TTL optional/opt-in)
-            def declare_with_dlq(channel, queue_name):
-                dlq_name = f"{queue_name}.dlq"
-                # Declare DLQ first
-                channel.queue_declare(queue=dlq_name, durable=True)
-                # Declare main queue with dead letter exchange routing to DLQ
-                args = {
-                    'x-dead-letter-exchange': '',
-                    'x-dead-letter-routing-key': dlq_name
-                }
-                ttl_env = os.getenv('QUEUE_MESSAGE_TTL_MS')
-                if ttl_env and ttl_env.isdigit() and int(ttl_env) > 0:
-                    args['x-message-ttl'] = int(ttl_env)
-                channel.queue_declare(queue=queue_name, durable=True, arguments=args)
-            
-            declare_with_dlq(self.channel, self.queue_name)
-            if self.enable_triggers:
-                declare_with_dlq(self.channel, self._get_queue_by_service_type('harmonization'))
-                declare_with_dlq(self.channel, self._get_queue_by_service_type('consensus'))
-            
+
+            # Declare this worker's consume queue with DLQ
+            dlq_name = f"{self.queue_name}.dlq"
+            self.channel.queue_declare(queue=dlq_name, durable=True)
+            args = {
+                'x-dead-letter-exchange': '',
+                'x-dead-letter-routing-key': dlq_name
+            }
+            ttl_env = os.getenv('QUEUE_MESSAGE_TTL_MS')
+            if ttl_env and ttl_env.isdigit() and int(ttl_env) > 0:
+                args['x-message-ttl'] = int(ttl_env)
+            self.channel.queue_declare(queue=self.queue_name, durable=True, arguments=args)
+
             self.channel.basic_qos(prefetch_count=self.worker_prefetch_count)
             self.logger.info(f"Connected to RabbitMQ at {self.queue_host}")
             self.logger.info(f"Consuming from: {self.queue_name}")
@@ -363,7 +571,7 @@ class BaseWorker:
                 )
                 # Reject without requeue to prevent CPU spin during DB outage
                 # Message will go to DLQ after max retries
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                self._safe_nack(ch, method.delivery_tag, requeue=False)
                 self.job_failed("Database unavailable")
                 return
 
@@ -383,50 +591,48 @@ class BaseWorker:
             # Store result in database
             cursor = self.db_conn.cursor()
             cursor.execute("""
-                INSERT INTO results (image_id, service, data, status, result_created, worker_id)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (image_id, self._get_clean_service_name(), json.dumps(result), 'success', datetime.now(), self.worker_id))
+                INSERT INTO results (image_id, service, data, status, worker_id)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (image_id, self._get_clean_service_name(), json.dumps(result), 'success', self.worker_id))
             self.db_conn.commit()  # CRITICAL: Commit the transaction!
             cursor.close()
 
-            # Trigger post-processing for bbox services
-            if self.service_name in self.bbox_services and self.enable_triggers:
-                # Check if connection is healthy
-                if not self.channel or self.connection.is_closed:
-                    self.logger.warning("RabbitMQ connection lost, reconnecting...")
-                    if not self.connect_to_queue():
-                        self.logger.error("Failed to reconnect to RabbitMQ for consensus message")
-                        raise Exception("RabbitMQ reconnection failed")
+            # In-place extrapolation hook: subclasses derive additional data
+            # from the same result without a separate queue/worker
+            self.after_result_stored(image_id, result, message)
 
+            # Trigger post-processing for bbox services (async via background publish thread)
+            if self.service_name in self.bbox_services and self.enable_triggers:
                 bbox_message = {
                     'image_id': image_id,
                     'image_filename': message.get('image_filename', f'image_{image_id}'),
-                    'image_data': message['image_data'],  # Pass through base64 image data
+                    'image_data': message['image_data'],
                     'trace_id': trace_id,
                     'service': self.service_name,
                     'worker_id': self.worker_id,
                     'processed_at': datetime.now().isoformat()
                 }
 
-                self.channel.basic_publish(
-                    exchange='',
-                    routing_key=self._get_queue_by_service_type('harmonization'),
-                    body=json.dumps(bbox_message),
-                    properties=pika.BasicProperties(delivery_mode=2)
+                self._enqueue_publish(
+                    self._get_queue_by_service_type('harmonization'),
+                    json.dumps(bbox_message)
                 )
 
-                harmonization_queue = self._get_queue_by_service_type('harmonization')
-                self.logger.debug(f"Published bbox completion to {harmonization_queue}")
+                self.logger.debug(f"Enqueued bbox completion to harmonization")
 
             # Trigger caption scoring
             if self.enable_caption_scoring:
                 self.trigger_caption_scoring(image_id, message)
 
+            # Trigger noun and verb consensus for VLM services
+            self.trigger_noun_consensus(image_id, message)
+            self.trigger_verb_consensus(image_id, message)
+
             # Trigger consensus processing
             self.trigger_consensus(image_id, message)
 
             # Acknowledge message
-            ch.basic_ack(delivery_tag=method.delivery_tag)
+            self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
 
             self.logger.info(f"Successfully processed {self.service_name} request for image {image_id}")
@@ -435,25 +641,33 @@ class BaseWorker:
             # Database connection errors - don't requeue to prevent CPU spin
             self.logger.error(f"Database error processing {self.service_name} message: {e}")
             self.logger.warning("Rejecting message without requeue due to database error")
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            self._safe_nack(ch, method.delivery_tag, requeue=False)
             self.job_failed(str(e))
         except Exception as e:
             # Other errors (ML service, parsing, etc.) - requeue for retry
             self.logger.error(f"Error processing {self.service_name} message: {e}")
-            # Reject and requeue for transient errors
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            self._safe_nack(ch, method.delivery_tag, requeue=True)
             self.job_failed(str(e))
     
     def start(self):
         """Start the worker"""
         self.logger.info(f"Starting {self.service_name} worker ({self.worker_id})")
-        
+
         # Connect to services
         if not self.connect_to_database():
             sys.exit(1)
         if not self.connect_to_queue():
             sys.exit(1)
-        
+
+        # Start background publish thread
+        self._running = True
+        self._publish_thread = threading.Thread(
+            target=self._publish_loop,
+            daemon=True,
+            name=f"{self.service_name}_publish"
+        )
+        self._publish_thread.start()
+
         # Start consuming with reconnect loop
         while True:
             try:
@@ -465,6 +679,7 @@ class BaseWorker:
                 self.channel.start_consuming()
             except KeyboardInterrupt:
                 self.logger.info("Stopping worker...")
+                self._running = False
                 try:
                     self.channel.stop_consuming()
                 except Exception:
@@ -473,9 +688,15 @@ class BaseWorker:
                     self.connection.close()
                 except Exception:
                     pass
+                if self._publish_thread and self._publish_thread.is_alive():
+                    self.logger.info("Waiting for publish thread to drain...")
+                    self._publish_thread.join(timeout=10)
+                    if self._publish_thread.is_alive():
+                        self.logger.warning("Publish thread did not stop within timeout")
                 break
-            except (pika.exceptions.AMQPConnectionError, pika.exceptions.StreamLostError, pika.exceptions.ChannelClosedByBroker) as e:
-                self.logger.warning(f"Queue connection lost/recovered needed: {e}. Reconnecting...")
+            except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
+                    pika.exceptions.StreamLostError) as e:
+                self.logger.warning(f"Queue connection lost: {e}. Reconnecting...")
                 time.sleep(self.retry_delay)
                 if not self.connect_to_queue():
                     self.logger.warning("Reconnect failed, retrying...")
@@ -487,7 +708,7 @@ class BaseWorker:
                         self.connect_to_database()
                     except Exception:
                         pass
-        
+
         if self.db_conn:
             self.db_conn.close()
         self.logger.info(f"{self.service_name} worker stopped")

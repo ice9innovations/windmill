@@ -11,6 +11,7 @@ import logging
 import argparse
 import base64
 import io
+import ssl
 import psycopg2
 import pika
 import requests
@@ -44,9 +45,12 @@ class RefinementProducer:
 
         # Queue configuration
         self.queue_host = self._get_required('QUEUE_HOST')
+        self.queue_port = int(os.getenv('QUEUE_PORT', '5672'))
+        self.queue_ssl = os.getenv('QUEUE_SSL', '').lower() in ('true', '1', 'yes')
         self.queue_user = self._get_required('QUEUE_USER')
         self.queue_password = self._get_required('QUEUE_PASSWORD')
         self.queue_name = 'refinement'
+        self.db_sslmode = os.getenv('DB_SSLMODE')
 
         # Request configuration
         self.request_timeout = int(os.getenv('REQUEST_TIMEOUT', '30'))
@@ -70,12 +74,13 @@ class RefinementProducer:
     def connect_to_database(self):
         """Connect to PostgreSQL database"""
         try:
-            self.db_conn = psycopg2.connect(
-                host=self.db_host,
-                database=self.db_name,
-                user=self.db_user,
-                password=self.db_password
+            db_kwargs = dict(
+                host=self.db_host, database=self.db_name,
+                user=self.db_user, password=self.db_password,
             )
+            if self.db_sslmode:
+                db_kwargs['sslmode'] = self.db_sslmode
+            self.db_conn = psycopg2.connect(**db_kwargs)
             self.db_conn.autocommit = True
             self.logger.info("Connected to PostgreSQL")
             return True
@@ -88,8 +93,16 @@ class RefinementProducer:
         """Connect to RabbitMQ"""
         try:
             credentials = pika.PlainCredentials(self.queue_user, self.queue_password)
-            parameters = pika.ConnectionParameters(host=self.queue_host, credentials=credentials)
-            self.queue_connection = pika.BlockingConnection(parameters)
+            kwargs = dict(
+                host=self.queue_host, port=self.queue_port,
+                credentials=credentials, heartbeat=60,
+                blocked_connection_timeout=300, connection_attempts=10,
+                retry_delay=5, socket_timeout=10,
+            )
+            if self.queue_ssl:
+                ssl_context = ssl.create_default_context()
+                kwargs['ssl_options'] = pika.SSLOptions(ssl_context, self.queue_host)
+            self.queue_connection = pika.BlockingConnection(pika.ConnectionParameters(**kwargs))
             self.queue_channel = self.queue_connection.channel()
 
             # Declare the refinement queue with DLQ pattern (matching worker declaration exactly)

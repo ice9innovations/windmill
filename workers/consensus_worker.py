@@ -18,6 +18,15 @@ from base_worker import BaseWorker
 MINIMUM_VOTES_REQUIRED = 3  # Require at least 2-service consensus
 TOTAL_AVAILABLE_SERVICES = 8  # Approximate total services that could vote
 
+# VLM consensus rebalancing
+# When all semantic (VLM) services unanimously agree on an emoji, give a ranking bonus
+# so that unanimous VLM consensus can outrank scattered spatial detections.
+# With 3 VLMs (blip, ollama, moondream) vs 6+ spatial services, raw vote counts
+# structurally favour spatial; this corrects that asymmetry in ranking only.
+# Filtering logic (apply_bbox_vote_filtering) is unchanged.
+VLM_SERVICES_COUNT = 3   # Number of semantic services currently in the pipeline
+VLM_CONSENSUS_BONUS = 2  # Ranking bonus when all VLM_SERVICES_COUNT agree
+
 def normalize_emoji(emoji):
     """Remove variation selectors and other invisible modifiers from emoji"""
     if not emoji:
@@ -44,6 +53,12 @@ class ConsensusWorkerMergeFocused(BaseWorker):
 
     def connect_to_database(self):
         """Connect to PostgreSQL database with dual connections"""
+        if hasattr(self, 'read_db_conn') and self.read_db_conn:
+            try:
+                self.read_db_conn.close()
+            except Exception:
+                pass
+
         if not super().connect_to_database():
             return False
 
@@ -52,13 +67,7 @@ class ConsensusWorkerMergeFocused(BaseWorker):
             self.db_conn.autocommit = False
 
             # Create separate read connection for queries
-            self.read_db_conn = psycopg2.connect(
-                host=self.db_host,
-                database=self.db_name,
-                user=self.db_user,
-                password=self.db_password
-            )
-            self.read_db_conn.autocommit = True
+            self.read_db_conn = self._new_db_connection(autocommit=True)
 
             return True
 
@@ -123,6 +132,39 @@ class ConsensusWorkerMergeFocused(BaseWorker):
         except Exception as e:
             self.logger.error(f"Error triggering content analysis: {e}")
             return False
+
+    def _consensus_is_current(self, image_id):
+        """Return True if the stored consensus already incorporates all current results.
+
+        Used to skip redundant runs when multiple service completions queue up
+        simultaneously — each service triggers a consensus message, but once the
+        first run finishes the remaining messages carry no new information.
+        Fails open: if the check itself errors, returns False so consensus runs anyway.
+        """
+        try:
+            cursor = self.read_db_conn.cursor()
+            cursor.execute("""
+                SELECT
+                    MAX(r.result_created)    AS latest_result,
+                    MAX(c.consensus_created) AS last_consensus
+                FROM results r
+                LEFT JOIN consensus c ON c.image_id = r.image_id
+                WHERE r.image_id = %s AND r.status = 'success'
+            """, (image_id,))
+            row = cursor.fetchone()
+            cursor.close()
+
+            if not row or not row[0]:
+                return False  # No results yet, nothing to skip
+
+            latest_result, last_consensus = row
+            return last_consensus is not None and latest_result <= last_consensus
+
+        except Exception as e:
+            self.logger.warning(
+                f"Staleness check failed for image {image_id}, running consensus anyway: {e}"
+            )
+            return False  # Fail open
 
     def get_service_results_for_image(self, image_id):
         """Get all successful service results for an image"""
@@ -769,6 +811,26 @@ class ConsensusWorkerMergeFocused(BaseWorker):
 
         return accepted_results
 
+    def compute_ranking_score(self, analysis):
+        """
+        Compute a ranking score that corrects for the structural imbalance between
+        spatial services (6+) and semantic/VLM services (3).
+
+        When all VLM_SERVICES_COUNT semantic services unanimously agree on an emoji,
+        add VLM_CONSENSUS_BONUS to the ranking score. This lets a 3-VLM unanimous
+        result (score 5) outrank moderate scattered spatial evidence (score 4-5)
+        without overriding truly overwhelming spatial evidence (score 6+).
+
+        Returns a (ranking_score, semantic_votes) tuple so semantic agreement acts
+        as a tiebreaker when the primary scores are equal.
+        """
+        vlm_services = set(
+            d['service'] for d in analysis['supporting_detections']
+            if d['evidence_type'] == 'semantic'
+        )
+        bonus = VLM_CONSENSUS_BONUS if len(vlm_services) >= VLM_SERVICES_COUNT else 0
+        return (analysis['total_votes'] + bonus, analysis['semantic_votes'])
+
     def calculate_consensus(self, service_results, image_id):
         """Main consensus calculation with per-bounding-box voting"""
         if not service_results:
@@ -798,14 +860,30 @@ class ConsensusWorkerMergeFocused(BaseWorker):
         # SPECIAL: Handle NSFW (🔞) as image-level determination
         accepted_results = self.handle_nsfw_special_case(bbox_analysis, accepted_results)
 
-        # Sort by total votes (descending)
-        accepted_results.sort(key=lambda x: x['total_votes'], reverse=True)
+        # Sort by ranking score (descending): unanimous VLM consensus gets a bonus
+        # so 3 agreeing VLMs can outrank scattered spatial detections.
+        accepted_results.sort(key=self.compute_ranking_score, reverse=True)
+
+        # Log when the VLM bonus changed the natural ordering
+        vlm_boosted = [
+            a['emoji'] for a in accepted_results
+            if len(set(d['service'] for d in a['supporting_detections']
+                       if d['evidence_type'] == 'semantic')) >= VLM_SERVICES_COUNT
+        ]
+        if vlm_boosted:
+            self.logger.info(f"VLM consensus bonus applied to: {vlm_boosted}")
 
         # Format final results per bounding box
         consensus_results = []
         for analysis in accepted_results:
             # Calculate evidence breakdown
             non_spatial_votes = analysis['semantic_votes'] + analysis['classification_votes']
+
+            vlm_services_agreeing = len(set(
+                d['service'] for d in analysis['supporting_detections']
+                if d['evidence_type'] == 'semantic'
+            ))
+            vlm_consensus_bonus = VLM_CONSENSUS_BONUS if vlm_services_agreeing >= VLM_SERVICES_COUNT else 0
 
             result = {
                 'emoji': analysis['emoji'],
@@ -822,7 +900,9 @@ class ConsensusWorkerMergeFocused(BaseWorker):
                     'summary': f"{non_spatial_votes} non-spatial" if non_spatial_votes > 0 else "spatial only",
                     'evidence_summary': f"{non_spatial_votes} non-spatial" if non_spatial_votes > 0 else "spatial only",
                     'final_decision': "consensus",
-                    'total_evidence': non_spatial_votes
+                    'total_evidence': non_spatial_votes,
+                    'vlm_services_agreeing': vlm_services_agreeing,
+                    'vlm_consensus_bonus': vlm_consensus_bonus
                 },
                 'services': list(set(d['service'] for d in analysis['supporting_detections'])),
                 'filter_reason': analysis['filter_reason'],
@@ -992,6 +1072,12 @@ class ConsensusWorkerMergeFocused(BaseWorker):
             image_id = message_data['image_id']
             image_filename = message_data.get('image_filename', f'image_{image_id}')
 
+            # Skip if consensus is already current (burst of triggers for same image)
+            if self._consensus_is_current(image_id):
+                self.logger.debug(f"Skipping redundant consensus for {image_filename} (already current)")
+                self._safe_ack(ch, method.delivery_tag)
+                return
+
             self.logger.info(f"Processing merge-focused consensus for: {image_filename}")
 
             # Update consensus for this specific image
@@ -1006,12 +1092,12 @@ class ConsensusWorkerMergeFocused(BaseWorker):
                 self.logger.error(f"Failed to update merge-focused consensus for {image_filename}")
 
             # Acknowledge the message
-            ch.basic_ack(delivery_tag=method.delivery_tag)
+            self._safe_ack(ch, method.delivery_tag)
 
         except Exception as e:
             self.logger.error(f"Error processing merge-focused consensus queue message: {e}")
             # Reject and requeue for retry
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            self._safe_nack(ch, method.delivery_tag, requeue=True)
 
     def run(self):
         """Main entry point - pure queue-based processing"""
@@ -1026,27 +1112,38 @@ class ConsensusWorkerMergeFocused(BaseWorker):
         self.logger.info(f"SIMPLE VOTE MODE: Vote count based filtering")
         self.logger.info(f"Minimum votes required: {MINIMUM_VOTES_REQUIRED}")
 
-        # Setup message consumer
-        self.channel.basic_consume(
-            queue=self.queue_name,
-            on_message_callback=self.process_queue_message
-        )
+        # Consume with reconnect loop
+        while True:
+            try:
+                self.channel.basic_consume(
+                    queue=self.queue_name,
+                    on_message_callback=self.process_queue_message
+                )
+                self.logger.info("Waiting for merge-focused consensus messages. Press CTRL+C to exit")
+                self.channel.start_consuming()
+            except KeyboardInterrupt:
+                self.logger.info("Stopping merge-focused consensus worker...")
+                try:
+                    self.channel.stop_consuming()
+                except Exception:
+                    pass
+                break
+            except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
+                    pika.exceptions.StreamLostError) as e:
+                self.logger.warning(f"Queue connection lost: {e}. Reconnecting...")
+                time.sleep(self.retry_delay)
+                if not self.connect_to_queue():
+                    self.logger.warning("Reconnect failed, retrying...")
+                    time.sleep(self.retry_delay)
+                    continue
 
-        self.logger.info("Waiting for merge-focused consensus messages. Press CTRL+C to exit")
-
-        try:
-            self.channel.start_consuming()
-        except KeyboardInterrupt:
-            self.logger.info("Stopping merge-focused consensus worker...")
-            self.channel.stop_consuming()
-        finally:
-            if self.connection and not self.connection.is_closed:
-                self.connection.close()
-            if self.db_conn:
-                self.db_conn.close()
-            if self.read_db_conn:
-                self.read_db_conn.close()
-            self.logger.info("Merge-focused consensus worker stopped")
+        if self.connection and not self.connection.is_closed:
+            self.connection.close()
+        if self.db_conn:
+            self.db_conn.close()
+        if self.read_db_conn:
+            self.read_db_conn.close()
+        self.logger.info("Merge-focused consensus worker stopped")
 
         return 0
 

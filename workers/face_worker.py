@@ -8,7 +8,9 @@ sys.path.append(os.path.dirname(__file__))
 
 import base64
 import io
+import json
 import requests
+import pika
 from postprocessing_worker import PostProcessingWorker
 
 class BboxFaceWorker(PostProcessingWorker):
@@ -19,19 +21,61 @@ class BboxFaceWorker(PostProcessingWorker):
         self.current_bbox = None  # Store current person bbox for coordinate transformation
     
     def process_message(self, ch, method, properties, body):
-        """Override to store bbox data for coordinate transformation"""
+        """Override to store bbox data for coordinate transformation, then
+        re-trigger content_analysis so the face+NudeNet face correlation runs
+        with actual face service detections available."""
         try:
-            import json
-            # Parse message
             message = json.loads(body.decode('utf-8'))
             self.current_bbox = message.get('bbox', {})
-            
+            image_id = message.get('image_id')
+
             # Call parent process_message which will call our process_service
-            return super().process_message(ch, method, properties, body)
-            
+            result = super().process_message(ch, method, properties, body)
+
+            # Re-trigger content_analysis now that face detections are in the
+            # postprocessing table.  content_analysis runs earlier (from
+            # consensus) before face worker completes, so face_service_detections
+            # would be empty on that first pass.  This second trigger ensures
+            # correlate_faces() has real data to work with.
+            if image_id:
+                self._trigger_content_analysis(image_id)
+
+            return result
+
         except Exception as e:
             self.logger.error(f"Error in face message processing: {e}")
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            self._safe_nack(ch, method.delivery_tag, requeue=True)
+
+    def _trigger_content_analysis(self, image_id: int):
+        """Publish to content_analysis queue so face+NudeNet correlation runs
+        with face service results present."""
+        try:
+            if not self.channel or self.connection.is_closed:
+                if not self.connect_to_queue():
+                    raise Exception("RabbitMQ reconnection failed")
+
+            queue_name = self._get_queue_name('system.content_analysis')
+            dlq_name = f"{queue_name}.dlq"
+            self.channel.queue_declare(queue=dlq_name, durable=True)
+            self.channel.queue_declare(
+                queue=queue_name, durable=True,
+                arguments={'x-dead-letter-exchange': '',
+                           'x-dead-letter-routing-key': dlq_name}
+            )
+            self.channel.basic_publish(
+                exchange='',
+                routing_key=queue_name,
+                body=json.dumps({'image_id': image_id}),
+                properties=pika.BasicProperties(delivery_mode=2),
+            )
+            self.logger.debug(
+                f"face: triggered content_analysis re-run for image {image_id}"
+            )
+        except Exception as e:
+            # Non-critical — the face job is already acked. Log and move on.
+            self.logger.warning(
+                f"face: failed to trigger content_analysis for image {image_id}: {e}"
+            )
     
     def process_service(self, cropped_image_data):
         """Process face detection on cropped image"""

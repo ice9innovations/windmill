@@ -8,11 +8,13 @@ import uuid
 import sys
 import json
 import time
+import ssl
 import pika
 import psycopg2
 import argparse
 import base64
 import requests
+import imagehash
 from datetime import datetime
 from dotenv import load_dotenv
 from PIL import Image
@@ -31,14 +33,17 @@ class ProducerConfig:
         
         # Queue configuration
         self.queue_host = self._get_required('QUEUE_HOST')
+        self.queue_port = int(os.getenv('QUEUE_PORT', '5672'))
+        self.queue_ssl = os.getenv('QUEUE_SSL', '').lower() in ('true', '1', 'yes')
         self.queue_user = self._get_required('QUEUE_USER')
         self.queue_password = self._get_required('QUEUE_PASSWORD')
-        
+
         # Database configuration
         self.db_host = self._get_required('DB_HOST')
         self.db_name = self._get_required('DB_NAME')
         self.db_user = self._get_required('DB_USER')
         self.db_password = self._get_required('DB_PASSWORD')
+        self.db_sslmode = os.getenv('DB_SSLMODE')
     
     def _get_required(self, key):
         """Get required environment variable with no fallback"""
@@ -89,16 +94,21 @@ class GenericProducer:
         """Connect to RabbitMQ"""
         try:
             credentials = pika.PlainCredentials(self.config.queue_user, self.config.queue_password)
+            kwargs = dict(
+                host=self.config.queue_host,
+                port=self.config.queue_port,
+                credentials=credentials,
+                heartbeat=60,
+                blocked_connection_timeout=300,
+                connection_attempts=10,
+                retry_delay=5,
+                socket_timeout=10,
+            )
+            if self.config.queue_ssl:
+                ssl_context = ssl.create_default_context()
+                kwargs['ssl_options'] = pika.SSLOptions(ssl_context, self.config.queue_host)
             self.connection = pika.BlockingConnection(
-                pika.ConnectionParameters(
-                    host=self.config.queue_host,
-                    credentials=credentials,
-                    heartbeat=60,
-                    blocked_connection_timeout=300,
-                    connection_attempts=10,
-                    retry_delay=5,
-                    socket_timeout=10
-                )
+                pika.ConnectionParameters(**kwargs)
             )
             self.channel = self.connection.channel()
             print(f"✅ Connected to RabbitMQ at {self.config.queue_host}")
@@ -111,12 +121,15 @@ class GenericProducer:
     def connect_to_database(self):
         """Connect to PostgreSQL database"""
         try:
-            self.db_conn = psycopg2.connect(
+            connect_kwargs = dict(
                 host=self.config.db_host,
                 database=self.config.db_name,
                 user=self.config.db_user,
-                password=self.config.db_password
+                password=self.config.db_password,
             )
+            if self.config.db_sslmode:
+                connect_kwargs['sslmode'] = self.config.db_sslmode
+            self.db_conn = psycopg2.connect(**connect_kwargs)
             print(f"✅ Connected to PostgreSQL at {self.config.db_host}")
             return True
             
@@ -230,6 +243,20 @@ class GenericProducer:
             print(f"❌ Database error: {e}")
             return None
     
+    def _backfill_phash(self, image_id, image_bytes):
+        """Compute and store pHash for an image if not already set."""
+        try:
+            phash = str(imagehash.phash(Image.open(io.BytesIO(image_bytes))))
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                "UPDATE images SET image_phash = %s WHERE image_id = %s AND image_phash IS NULL",
+                (phash, image_id)
+            )
+            self.db_conn.commit()
+            cursor.close()
+        except Exception as e:
+            print(f"⚠️  Failed to backfill pHash for image {image_id}: {e}")
+
     def process_image_row(self, row):
         """Process a single database row into image data"""
         image_data = {
@@ -237,11 +264,11 @@ class GenericProducer:
             "image_filename": row[1],
             "submitted_at": datetime.now().isoformat()
         }
-        
+
         # Try URL first (deployment-agnostic), fallback to local path
         image_url = row[3] if row[3] else None
         image_path = row[2] if row[2] else None
-        
+
         # Prefer URL for deployment-agnostic access
         if image_url:
             try:
@@ -249,33 +276,35 @@ class GenericProducer:
                 response = requests.get(image_url, timeout=10)
                 response.raise_for_status()
                 image_bytes = response.content
-                
+
                 # Extract dimensions and add image data
                 width, height = self.extract_image_dimensions(image_bytes)
                 image_data["image_data"] = base64.b64encode(image_bytes).decode('utf-8')
                 image_data["image_width"] = width
                 image_data["image_height"] = height
+                self._backfill_phash(image_data["image_id"], image_bytes)
                 return image_data
             except Exception as e:
                 print(f"⚠️  Failed to fetch image from URL {image_url}: {e}")
                 # Fall through to try local path
-        
+
         # Fallback to local file path
         if image_path and os.path.exists(image_path):
             try:
                 with open(image_path, 'rb') as f:
                     image_bytes = f.read()
-                    
+
                     # Extract dimensions and add image data
                     width, height = self.extract_image_dimensions(image_bytes)
                     image_data["image_data"] = base64.b64encode(image_bytes).decode('utf-8')
                     image_data["image_width"] = width
                     image_data["image_height"] = height
+                self._backfill_phash(image_data["image_id"], image_bytes)
                 return image_data
             except Exception as e:
                 print(f"⚠️  Failed to read image {image_path}: {e}")
                 return None
-        
+
         print(f"⚠️  No valid image source found - URL: {image_url}, Path: {image_path}")
         return None
     
