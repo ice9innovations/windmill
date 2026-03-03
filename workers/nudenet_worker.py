@@ -21,6 +21,7 @@ sys.path.append(os.path.dirname(__file__))
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 import json
+import time
 import base64
 import io
 from PIL import Image
@@ -31,6 +32,15 @@ from utils.spatial_analysis import detect_person_containment, detect_sexual_acti
 from utils.framing_analysis import classify_framing
 
 SPATIAL_ANALYSIS_VERSION = 'spatial_1.0'
+
+# Subsecond timeout — YOLO data is opportunistic. If it's not in the DB
+# within this window we proceed without person boxes. No performance penalty
+# compared to the status quo (person_bboxes was always [] before).
+YOLO_PERSON_TIMEOUT = 0.5   # seconds
+YOLO_PERSON_POLL    = 0.05  # seconds between polls
+
+# Person emojis that harmony groups under 🧑
+_PERSON_EMOJIS = frozenset(['🧑', '👩', '🧒'])
 
 
 class NudenetWorker(BaseWorker):
@@ -45,14 +55,40 @@ class NudenetWorker(BaseWorker):
             nudenet_detections = self._extract_detections(result)
             if not nudenet_detections:
                 # No detections — write a clean SFW record so Pass 2 has a row to update
-                self._store_spatial_analysis(image_id, nudenet_detections, [], 0, 0)
+                self._store_spatial_analysis_dict({
+                    'image_id': image_id,
+                    'gender_breakdown': {
+                        'female_nudity': False, 'male_nudity': False, 'mixed_gender': False,
+                        'confidence': {'female': 0.0, 'male': 0.0},
+                        'vote_details': None, 'reasoning': 'no_detections',
+                    },
+                    'anatomy_exposed': [],
+                    'scene_type': 'sfw',
+                    'intimacy_level': 'none',
+                    'activities_detected': [],
+                    'spatial_relationships': [],
+                    'person_bboxes_raw': 0,
+                    'person_bboxes_deduplicated': 0,
+                    'containment_relationships': [],
+                    'people_count': 0,
+                    'framing_analysis': {},
+                    'full_analysis': {
+                        'pass': SPATIAL_ANALYSIS_VERSION,
+                        'spatial_gender_inference': {'gender': 'unknown', 'confidence': 0.0, 'reasoning': 'no_detections'},
+                        'activity_analysis': {'scene_type': 'sfw', 'intimacy_level': 'none', 'activities': [], 'spatial_relationships': []},
+                        'framing_analysis': {},
+                        'person_deduplication': {'raw_count': 0, 'deduplicated_count': 0, 'containments': []},
+                    },
+                })
                 return
 
             image_width, image_height = self._image_dimensions(message['image_data'])
-            merged_boxes = self._fetch_merged_boxes(image_id)
 
+            # Best-effort: wait up to YOLO_PERSON_TIMEOUT for YOLO person boxes.
+            # If YOLO isn't done yet, person_bboxes stays [] and people_count stays 0.
+            # No functional regression — these fields were always empty before.
             person_bboxes, containment_relationships, person_bboxes_deduplicated = \
-                self._deduplicate_persons(merged_boxes)
+                self._fetch_yolo_persons_with_dedup(image_id)
 
             spatial_gender = infer_gender_from_anatomy(nudenet_detections)
             anatomy_labels = [d['label'] for d in nudenet_detections]
@@ -73,7 +109,7 @@ class NudenetWorker(BaseWorker):
             }
 
             # No VLM captions yet — pass empty string; activity detection is
-            # spatial only for this pass
+            # spatial only for this pass.
             activity_analysis = detect_sexual_activities(
                 nudenet_detections,
                 person_bboxes_deduplicated,
@@ -95,7 +131,7 @@ class NudenetWorker(BaseWorker):
                 'intimacy_level': activity_analysis['intimacy_level'],
                 'activities_detected': activity_analysis['activities'],
                 'spatial_relationships': activity_analysis['spatial_relationships'],
-                'person_bboxes_raw': len(merged_boxes),
+                'person_bboxes_raw': len(person_bboxes),
                 'person_bboxes_deduplicated': len(person_bboxes_deduplicated),
                 'containment_relationships': containment_relationships,
                 'people_count': len(person_bboxes_deduplicated),
@@ -106,7 +142,7 @@ class NudenetWorker(BaseWorker):
                     'activity_analysis': activity_analysis,
                     'framing_analysis': framing_analysis,
                     'person_deduplication': {
-                        'raw_count': len(merged_boxes),
+                        'raw_count': len(person_bboxes),
                         'deduplicated_count': len(person_bboxes_deduplicated),
                         'containments': containment_relationships,
                     },
@@ -142,33 +178,71 @@ class NudenetWorker(BaseWorker):
         with Image.open(io.BytesIO(img_bytes)) as img:
             return img.size  # (width, height)
 
-    def _fetch_merged_boxes(self, image_id):
-        """Query merged_boxes for person bboxes. Likely empty at this point;
-        Pass 2 refines with the complete merged set."""
+    def _fetch_yolo_persons_with_dedup(self, image_id):
+        """Poll for YOLO person bboxes, deduplicate, and return (raw, containments, deduped).
+
+        Returns empty lists immediately if YOLO doesn't respond within YOLO_PERSON_TIMEOUT.
+        Person bboxes are opportunistic — no functional regression if unavailable.
+        """
+        deadline = time.time() + YOLO_PERSON_TIMEOUT
+        while time.time() < deadline:
+            person_bboxes = self._fetch_yolo_person_bboxes(image_id)
+            if person_bboxes is not None:
+                containment = detect_person_containment(person_bboxes)
+                contained_ids = {c['contained_bbox_id'] for c in containment}
+                deduped = [p for p in person_bboxes if p['id'] not in contained_ids]
+                self.logger.debug(
+                    f"YOLO persons for image {image_id}: "
+                    f"raw={len(person_bboxes)}, deduped={len(deduped)}"
+                )
+                return person_bboxes, containment, deduped
+            time.sleep(YOLO_PERSON_POLL)
+
+        self.logger.debug(f"YOLO result not available within {YOLO_PERSON_TIMEOUT}s for image {image_id} — proceeding without person boxes")
+        return [], [], []
+
+    def _fetch_yolo_person_bboxes(self, image_id):
+        """Return person bboxes from YOLO result, or None if not yet in DB.
+
+        Each bbox is {id, bbox: {x, y, width, height}} for compatibility with
+        detect_person_containment() and detect_sexual_activities().
+        """
         try:
             cursor = self.db_conn.cursor()
             cursor.execute("""
-                SELECT merged_id, merged_data
-                FROM merged_boxes
-                WHERE image_id = %s
+                SELECT data FROM results
+                WHERE image_id = %s AND service = 'yolo_v8' AND status = 'success'
+                LIMIT 1
             """, (image_id,))
-            rows = cursor.fetchall()
+            row = cursor.fetchone()
             cursor.close()
-            return [{'merged_id': r[0], 'data': r[1]} for r in rows]
         except Exception as e:
-            self.logger.warning(f"Could not fetch merged_boxes for image {image_id}: {e}")
-            return []
+            self.logger.warning(f"Error fetching YOLO result for image {image_id}: {e}")
+            return None
 
-    def _deduplicate_persons(self, merged_boxes):
-        person_bboxes = [
-            {'id': mb['merged_id'], 'bbox': mb['data']['merged_bbox']}
-            for mb in merged_boxes
-            if mb['data'].get('emoji') == '🧑' and mb['data'].get('merged_bbox')
-        ]
-        containment = detect_person_containment(person_bboxes)
-        contained_ids = {c['contained_bbox_id'] for c in containment}
-        deduped = [p for p in person_bboxes if p['id'] not in contained_ids]
-        return person_bboxes, containment, deduped
+        if row is None:
+            return None
+
+        person_bboxes = []
+        for i, pred in enumerate(row[0].get('predictions', [])):
+            # Strip variation selectors; group 🧑/👩/🧒 under 🧑
+            raw_emoji = pred.get('emoji', '')
+            clean_emoji = ''.join(c for c in raw_emoji if ord(c) < 0xFE00 or ord(c) > 0xFE0F)
+            if clean_emoji not in _PERSON_EMOJIS:
+                continue
+            raw_bbox = pred.get('bbox')
+            if not raw_bbox:
+                continue
+            # Normalise array [x, y, w, h] → dict
+            if isinstance(raw_bbox, list) and len(raw_bbox) == 4:
+                bbox = {'x': raw_bbox[0], 'y': raw_bbox[1], 'width': raw_bbox[2], 'height': raw_bbox[3]}
+            elif isinstance(raw_bbox, dict) and all(k in raw_bbox for k in ('x', 'y', 'width', 'height')):
+                bbox = raw_bbox
+            else:
+                continue
+            person_bboxes.append({'id': i, 'bbox': bbox})
+
+        return person_bboxes
 
     def _store_spatial_analysis_dict(self, analysis):
         """Write Pass 1 result to content_analysis.
