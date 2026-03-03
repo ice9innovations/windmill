@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Services whose noun lists participate in consensus.
 # Matches the 'vlm' service_type entries in service_config.yaml.
-VLM_SERVICES = ['blip', 'haiku', 'moondream', 'ollama', 'qwen']
+VLM_SERVICES = ['blip', 'gemini', 'haiku', 'moondream', 'ollama', 'qwen']
 
 
 class NounConsensusWorker(BaseWorker):
@@ -61,6 +61,8 @@ class NounConsensusWorker(BaseWorker):
             image_id = message['image_id']
             image_data = message.get('image_data')
             triggering_service = message.get('service', 'unknown')
+
+            self._record_service_dispatch(image_id, 'noun_consensus')
 
             self.logger.debug(
                 f"noun_consensus: processing image {image_id} "
@@ -101,6 +103,7 @@ class NounConsensusWorker(BaseWorker):
                 category_tally=category_tally,
             )
 
+            self._update_service_dispatch(image_id, service='noun_consensus')
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
 
@@ -122,11 +125,12 @@ class NounConsensusWorker(BaseWorker):
                     f"{dict(subject_votes)} → '{subject_noun}'"
                 )
 
-            # Trigger SAM3 when all VLM services have reported.
-            # Compare the current consensus nouns against what SAM3 was last
-            # sent — only re-trigger if the noun list has changed (new nouns
-            # crossed the confidence threshold as more VLMs reported in).
-            if self._count_vlm_results(image_id) == len(VLM_SERVICES) and image_data:
+            # Trigger SAM3 as soon as any VLM has reported. The dedup guard
+            # (_sam3_previous_nouns) re-triggers only when the noun set changes,
+            # so in practice SAM3 runs once or twice per image as VLMs converge.
+            # Waiting for all VLMs would mean one slow or down service silently
+            # kills SAM3 for the entire image.
+            if self._count_vlm_results(image_id) > 0 and image_data:
                 consensus_nouns = [
                     n['canonical'] for n in collapsed
                     if n.get('confidence', 0) > 0.5
@@ -177,10 +181,10 @@ class NounConsensusWorker(BaseWorker):
             self.job_failed(str(e))
 
     def _count_vlm_results(self, image_id: int) -> int:
-        """Return the number of VLM_SERVICES that have any status='success' result.
+        """Return the number of VLM_SERVICES that have a status='success' result.
 
         Counts all VLMs regardless of whether they produced nouns — a blocked
-        haiku result (empty nouns, synthetic blocked text) still counts.
+        result (empty nouns, synthetic blocked text) still counts.
         """
         try:
             cursor = self.db_conn.cursor()
@@ -224,6 +228,9 @@ class NounConsensusWorker(BaseWorker):
         """Publish a SAM3 segmentation request for the final noun consensus."""
         try:
             queue_name = self._get_queue_by_service_type('sam3')
+            # Record dispatch before publishing so the row exists before SAM3 can complete.
+            # autocommit=True on this connection so the INSERT is immediately visible.
+            self._record_service_dispatch(image_id, 'sam3', None)
             self._enqueue_publish(
                 queue_name,
                 json.dumps({
@@ -240,6 +247,7 @@ class NounConsensusWorker(BaseWorker):
             )
         except Exception as e:
             self.logger.error(f"noun_consensus: failed to trigger SAM3 for image {image_id}: {e}")
+
 
     def _fetch_vlm_nouns(self, image_id: int) -> tuple:
         """
@@ -272,6 +280,10 @@ class NounConsensusWorker(BaseWorker):
 
             for service, data in rows:
                 if not isinstance(data, dict):
+                    continue
+                # Skip blocked results — their sentinel text (e.g. "[NSFW — not sent to
+                # Gemini API]") is not a caption and would produce garbage nouns.
+                if data.get('metadata', {}).get('blocked'):
                     continue
                 predictions = data.get('predictions', [])
                 caption = predictions[0].get('text', '').strip() if predictions else ''

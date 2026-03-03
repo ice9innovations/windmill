@@ -227,3 +227,21 @@ CREATE TABLE IF NOT EXISTS rembg_results (
 );
 
 CREATE INDEX IF NOT EXISTS idx_rembg_results_image ON rembg_results(image_id);
+
+-- Service Dispatch table: unified lifecycle tracking for all dispatched services.
+-- Primary services written at submission time by api.py; secondary services (face/pose/sam3)
+-- written at dispatch time by harmony_worker and noun_consensus_worker.
+-- Status updated to 'complete' by workers when result is written.
+-- 'stale' is computed at read time by api.py for pending rows past their age threshold.
+-- Enables accurate per-service status without relying on result rows, which can't
+-- distinguish "dispatched+no results" from "dispatched+crashed" from "never dispatched".
+CREATE TABLE IF NOT EXISTS service_dispatch (
+    dispatch_id   BIGSERIAL PRIMARY KEY,
+    image_id      BIGINT NOT NULL REFERENCES images(image_id),
+    service       TEXT NOT NULL,     -- service short name, e.g. 'blip', 'face', 'pose', 'sam3'
+    cluster_id    TEXT,              -- bbox cluster_id for face/pose; NULL for image-level services
+    dispatched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    status        TEXT NOT NULL DEFAULT 'pending'  -- pending, complete
+);
+
+CREATE INDEX IF NOT EXISTS idx_service_dispatch_image ON service_dispatch (image_id);

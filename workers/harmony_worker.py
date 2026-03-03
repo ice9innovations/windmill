@@ -249,6 +249,8 @@ class HarmonyWorker(BaseWorker):
                         if box_emoji == '🧑':
                             self.publish_bbox_message(self.postprocessing_queues['face'], base_message)
                             self.publish_bbox_message(self.postprocessing_queues['pose'], base_message)
+                            self._record_service_dispatch(image_id, 'face', cluster_id)
+                            self._record_service_dispatch(image_id, 'pose', cluster_id)
                             self.logger.debug(f"Dispatched face/pose for {width}x{height} person box")
                     else:
                         self.logger.debug(f"Skipped postprocessing for {width}x{height} box (too small)")
@@ -257,6 +259,7 @@ class HarmonyWorker(BaseWorker):
             self.logger.error(f"Error in dispatch_bbox_postprocessing: {e}")
             raise
     
+
     def crop_bbox_from_data(self, image_data, bbox):
         """Crop bbox region from image data and return as base64 encoded bytes"""
         try:
@@ -324,11 +327,15 @@ class HarmonyWorker(BaseWorker):
             image_id = message['image_id']
             image_filename = message.get('image_filename', f'image_{image_id}')
             image_data = message.get('image_data')  # Base64 encoded image data
-            
+
+            # Record that harmony was triggered — part of the harmonization transaction
+            self._record_service_dispatch(image_id, 'harmony')
+
             # Process the harmony merge for this image
             result = self.update_merged_boxes_for_image(image_id, image_filename, image_data)
-            
+
             if result['success']:
+                self._update_service_dispatch(image_id, service='harmony')
                 
                 # Only send spatial enrichment message if merged boxes were actually created
                 if result['merged_boxes_created']:

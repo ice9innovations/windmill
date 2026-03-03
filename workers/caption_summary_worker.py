@@ -118,6 +118,9 @@ class CaptionSummaryWorker(BaseWorker):
                 self._safe_ack(ch, method.delivery_tag)
                 return
 
+            # Record that caption_summary was triggered — after both skip guards
+            self._record_service_dispatch(image_id, 'caption_summary')
+
             # Fetch supporting consensus data (both optional — prompt degrades gracefully)
             nouns = self._fetch_noun_consensus(image_id)
             verbs = self._fetch_verb_consensus(image_id)
@@ -135,6 +138,7 @@ class CaptionSummaryWorker(BaseWorker):
 
             services_present = sorted(captions.keys())
             self._upsert(image_id, summary, synthesis_model, services_present)
+            self._update_service_dispatch(image_id, service='caption_summary')
 
             # CLIP score the synthesized caption — non-fatal if unavailable
             if image_data:

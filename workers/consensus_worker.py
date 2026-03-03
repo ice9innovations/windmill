@@ -1080,11 +1080,15 @@ class ConsensusWorkerMergeFocused(BaseWorker):
 
             self.logger.info(f"Processing merge-focused consensus for: {image_filename}")
 
+            # Record that consensus was triggered (after skip check — only track real work)
+            self._record_service_dispatch(image_id, 'consensus')
+
             # Update consensus for this specific image
             success = self.update_consensus_for_image(image_id, image_filename)
 
             if success:
                 self.logger.info(f"Completed merge-focused consensus for {image_filename}")
+                self._update_service_dispatch(image_id, service='consensus')
 
                 # Trigger content analysis after consensus completes
                 self.trigger_content_analysis(image_id, image_filename)

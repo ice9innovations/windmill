@@ -104,6 +104,7 @@ class PostProcessingWorker(BaseWorker):
                     self.db_conn.rollback()
                 return False
     
+
     def process_message(self, ch, method, properties, body):
         """Process a postprocessing message - standard pattern for all postprocessing workers"""
         try:
@@ -114,12 +115,12 @@ class PostProcessingWorker(BaseWorker):
             cluster_id = message['cluster_id']
             bbox = message['bbox']
             cropped_image_data = message['cropped_image_data']
-            
+
             self.logger.info(f"Processing {self.service_name} for {cluster_id} (merged_box_id: {merged_box_id})")
-            
+
             # Process with specific service
             result_data = self.process_service(cropped_image_data)
-            
+
             # Save result
             if result_data:
                 success = self.save_postprocessing_result(
@@ -127,6 +128,7 @@ class PostProcessingWorker(BaseWorker):
                 )
                 if success:
                     self._safe_ack(ch, method.delivery_tag)
+                    self._update_service_dispatch(image_id, cluster_id=cluster_id)
                     self.logger.info(f"Successfully processed {self.service_name} for {cluster_id}")
                 else:
                     self._safe_nack(ch, method.delivery_tag, requeue=True)
@@ -136,8 +138,9 @@ class PostProcessingWorker(BaseWorker):
                     merged_box_id, image_id, None, bbox, cluster_id
                 )
                 self._safe_ack(ch, method.delivery_tag)
+                self._update_service_dispatch(image_id, cluster_id=cluster_id)
                 self.logger.warning(f"No {self.service_name} data for {cluster_id}, saved empty result")
-                
+
         except Exception as e:
             error_str = str(e)
             if 'postprocessing_merged_box_id_fkey' in error_str:

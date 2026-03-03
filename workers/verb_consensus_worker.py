@@ -27,11 +27,12 @@ sys.path.append(os.path.dirname(__file__))
 
 from base_worker import BaseWorker
 from verb_utils import collapse_synonyms, warmup_wordnet
+from verb_extractor import extract_verbs_and_svo, warmup_verb_extractor
 
 logger = logging.getLogger(__name__)
 
 # Must match VLM_SERVICES in noun_consensus_worker.py
-VLM_SERVICES = ['blip', 'haiku', 'moondream', 'ollama', 'qwen']
+VLM_SERVICES = ['blip', 'gemini', 'haiku', 'moondream', 'ollama', 'qwen']
 
 
 class VerbConsensusWorker(BaseWorker):
@@ -42,7 +43,8 @@ class VerbConsensusWorker(BaseWorker):
 
     def __init__(self):
         super().__init__('system.verb_consensus')
-        warmup_wordnet()  # Load corpus now; first message pays no disk-load penalty
+        warmup_wordnet()         # Load WordNet corpus
+        warmup_verb_extractor()  # Load spaCy en_core_web_sm
 
     def process_message(self, ch, method, properties, body):
         """Override base process_message - no ML service call, DB-only logic."""
@@ -57,6 +59,8 @@ class VerbConsensusWorker(BaseWorker):
             message = json.loads(body)
             image_id = message['image_id']
             triggering_service = message.get('service', 'unknown')
+
+            self._record_service_dispatch(image_id, 'verb_consensus')
 
             self.logger.debug(
                 f"verb_consensus: processing image {image_id} "
@@ -80,6 +84,7 @@ class VerbConsensusWorker(BaseWorker):
                 processing_time=round(time.time() - start_time, 3),
             )
 
+            self._update_service_dispatch(image_id, service='verb_consensus')
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
 
@@ -96,7 +101,11 @@ class VerbConsensusWorker(BaseWorker):
 
     def _fetch_vlm_verbs(self, image_id: int) -> tuple:
         """
-        Fetch verb lists and SVO triples from results table for all VLM services.
+        Fetch captions from results table for all VLM services and extract
+        verbs and SVO triples locally — parallel to noun_consensus_worker's
+        _fetch_vlm_nouns() which extracts nouns from captions rather than
+        reading pre-stored noun lists.
+
         Returns (service_verb_map, service_svo_map):
           service_verb_map: {service: [verbs]}          — services with non-empty verb lists
           service_svo_map:  {service: [[s, v, o], ...]} — SVO triples per service
@@ -122,11 +131,18 @@ class VerbConsensusWorker(BaseWorker):
             for service, data in rows:
                 if not isinstance(data, dict):
                     continue
-                verbs = data.get('verbs', [])
-                svo_triples = data.get('svo_triples', [])
+                # Skip blocked results — their sentinel text is not a caption
+                # and would produce garbage verbs.
+                if data.get('metadata', {}).get('blocked'):
+                    continue
+                predictions = data.get('predictions', [])
+                caption = predictions[0].get('text', '').strip() if predictions else ''
+                if not caption:
+                    continue
+                verbs, svo_triples = extract_verbs_and_svo(caption)
                 if verbs:
                     service_verb_map[service] = verbs
-                    service_svo_map[service] = svo_triples if isinstance(svo_triples, list) else []
+                    service_svo_map[service] = svo_triples
 
         except Exception as e:
             self.logger.error(f"verb_consensus: DB fetch error for image {image_id}: {e}")

@@ -18,7 +18,7 @@ import psycopg2
 import psycopg2.extras
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 
@@ -64,6 +64,30 @@ MAX_IMAGE_DIMENSION = int(os.getenv('MAX_IMAGE_DIMENSION', 2048))
 
 SERVICE_CONFIG_PATH = os.getenv('SERVICE_CONFIG_PATH', 'service_config.yaml')
 config = get_service_config(SERVICE_CONFIG_PATH)
+
+# Age (seconds) after which a pending service_dispatch row with no result is considered stale.
+# Override per-service via environment variables; defaults apply if not set.
+_STALE_THRESHOLDS = {
+    'sam3':            int(os.getenv('STALE_SAM3_SEC',            '600')),
+    'face':            int(os.getenv('STALE_FACE_SEC',            '120')),
+    'pose':            int(os.getenv('STALE_POSE_SEC',            '120')),
+    'harmony':         int(os.getenv('STALE_HARMONY_SEC',         '60')),
+    'consensus':       int(os.getenv('STALE_CONSENSUS_SEC',       '60')),
+    'noun_consensus':  int(os.getenv('STALE_NOUN_CONSENSUS_SEC',  '60')),
+    'verb_consensus':  int(os.getenv('STALE_VERB_CONSENSUS_SEC',  '60')),
+    'caption_summary': int(os.getenv('STALE_CAPTION_SUMMARY_SEC', '120')),
+}
+_STALE_DEFAULT_SEC = int(os.getenv('STALE_DEFAULT_SEC', '300'))
+
+# Result tables to query for read-time reconciliation of system worker dispatch rows.
+# Keyed by service name; value is the SQL to check for any result for a given image_id.
+_SYSTEM_RECONCILE_QUERIES = {
+    'harmony':        "SELECT 1 FROM merged_boxes   WHERE image_id = %s LIMIT 1",
+    'consensus':      "SELECT 1 FROM consensus      WHERE image_id = %s LIMIT 1",
+    'noun_consensus': "SELECT 1 FROM noun_consensus WHERE image_id = %s LIMIT 1",
+    'verb_consensus': "SELECT 1 FROM verb_consensus WHERE image_id = %s LIMIT 1",
+    'caption_summary':"SELECT 1 FROM caption_summary WHERE image_id = %s LIMIT 1",
+}
 
 # ---------------------------------------------------------------------------
 # Security headers
@@ -365,6 +389,15 @@ def analyze():
             (image_filename, image_group, service_names, phash),
         )
         image_id = cur.fetchone()[0]
+        # Record pending dispatch for all primary services — best-effort tracking.
+        # Failures here must never abort image submission.
+        try:
+            cur.execute(
+                "INSERT INTO service_dispatch (image_id, service) SELECT %s, unnest(%s::text[])",
+                (image_id, service_names),
+            )
+        except Exception as e:
+            app.logger.warning("Failed to record service_dispatch entries: %s", e)
     except Exception as e:
         app.logger.error("Database insert failed: %s", e)
         return jsonify({"error": "Failed to register image in database"}), 500
@@ -565,6 +598,100 @@ def _fetch_results(cur, image_id):
             "updated_at":       caption_summary_row['updated_at'].isoformat() if caption_summary_row['updated_at'] else None,
         }
 
+    # Service dispatch — one row per (service, cluster_id), latest by dispatched_at.
+    # DISTINCT ON gives the most recent dispatch per (service, cluster_id) pair so that
+    # re-harmonization re-dispatches show the current status, not stale earlier ones.
+    cur.execute(
+        """SELECT DISTINCT ON (service, cluster_id)
+                  service, cluster_id, status, dispatched_at
+           FROM service_dispatch
+           WHERE image_id = %s
+           ORDER BY service, cluster_id NULLS LAST, dispatched_at DESC""",
+        (image_id,),
+    )
+    service_dispatch = []
+    for r in cur.fetchall():
+        row = dict(r)
+        if row.get('dispatched_at'):
+            row['dispatched_at'] = row['dispatched_at'].isoformat()
+        service_dispatch.append(row)
+
+    # Read-time reconciliation: result tables are authoritative.
+    # A dispatch row stuck in 'pending' despite a completed result means the worker
+    # crashed between writing the result and updating the dispatch row — treat as complete.
+    pending = [r for r in service_dispatch if r['status'] == 'pending']
+    if pending:
+        # Primary services (image-level, not sam3): check results table
+        primary_pending_svcs = [
+            r['service'] for r in pending
+            if r['cluster_id'] is None and r['service'] != 'sam3'
+        ]
+        if primary_pending_svcs:
+            cur.execute(
+                "SELECT DISTINCT service FROM results WHERE image_id = %s AND service = ANY(%s)",
+                (image_id, primary_pending_svcs),
+            )
+            results_found = {row['service'] for row in cur.fetchall()}
+            for r in pending:
+                if r['service'] in results_found and r['cluster_id'] is None:
+                    r['status'] = 'complete'
+
+        # SAM3: check sam3_results table
+        sam3_pending = [r for r in pending if r['service'] == 'sam3' and r['status'] == 'pending']
+        if sam3_pending:
+            cur.execute("SELECT 1 FROM sam3_results WHERE image_id = %s LIMIT 1", (image_id,))
+            if cur.fetchone():
+                for r in sam3_pending:
+                    r['status'] = 'complete'
+
+        # Face/pose (bbox-level): check postprocessing table by (service, cluster_id)
+        bbox_pending = [r for r in pending if r['cluster_id'] is not None and r['status'] == 'pending']
+        if bbox_pending:
+            pending_cluster_ids = [r['cluster_id'] for r in bbox_pending]
+            pending_services    = list({r['service'] for r in bbox_pending})
+            cur.execute(
+                """SELECT DISTINCT service, data->>'cluster_id' AS cluster_id
+                   FROM postprocessing
+                   WHERE image_id = %s AND service = ANY(%s)
+                     AND data->>'cluster_id' = ANY(%s)""",
+                (image_id, pending_services, pending_cluster_ids),
+            )
+            post_found = {(row['service'], row['cluster_id']) for row in cur.fetchall()}
+            for r in bbox_pending:
+                if (r['service'], r['cluster_id']) in post_found:
+                    r['status'] = 'complete'
+
+        # System workers (harmony, consensus, noun/verb consensus, caption_summary):
+        # check each worker's result table to catch the crash-between-result-and-update case.
+        system_pending = [
+            r for r in pending
+            if r['cluster_id'] is None
+            and r['service'] in _SYSTEM_RECONCILE_QUERIES
+            and r['status'] == 'pending'
+        ]
+        for r in system_pending:
+            cur.execute(_SYSTEM_RECONCILE_QUERIES[r['service']], (image_id,))
+            if cur.fetchone():
+                r['status'] = 'complete'
+
+    # Stale detection: pending + no result + past age threshold → 'stale' at read time.
+    # This is never written to the DB; it is a computed property for the caller.
+    now_utc = datetime.now(timezone.utc)
+    for r in service_dispatch:
+        if r['status'] != 'pending':
+            continue
+        threshold = _STALE_THRESHOLDS.get(r['service'], _STALE_DEFAULT_SEC)
+        dispatched_str = r.get('dispatched_at')
+        if dispatched_str:
+            try:
+                dispatched_at = datetime.fromisoformat(dispatched_str)
+                if dispatched_at.tzinfo is None:
+                    dispatched_at = dispatched_at.replace(tzinfo=timezone.utc)
+                if (now_utc - dispatched_at).total_seconds() > threshold:
+                    r['status'] = 'stale'
+            except Exception:
+                pass
+
     # Resolve source_bbox for SAM3-dispatched postprocessing rows (merged_box_id IS NULL).
     # These rows store cluster_id = "sam3:noun:idx" in data; use it to look up the
     # instance bbox from sam3_results so the console can draw pose skeletons.
@@ -595,6 +722,7 @@ def _fetch_results(cur, image_id):
         "sam3":             sam3_results,
         "verb_consensus":   verb_consensus,
         "caption_summary":  caption_summary,
+        "service_dispatch": service_dispatch,
     }
 
 

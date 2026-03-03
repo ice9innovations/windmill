@@ -426,6 +426,71 @@ class BaseWorker:
         except Exception as e:
             self.logger.error(f"Failed to enqueue verb_consensus message: {e}")
 
+    def _record_service_dispatch(self, image_id, service, cluster_id=None):
+        """Insert a pending service_dispatch record. Best-effort; errors swallowed.
+
+        On autocommit=False connections the INSERT is wrapped in a SAVEPOINT so
+        that a failure (e.g. FK violation) rolls back only this INSERT and leaves
+        the parent transaction alive.
+        """
+        try:
+            cursor = self.db_conn.cursor()
+            if not self.db_conn.autocommit:
+                cursor.execute("SAVEPOINT before_service_dispatch")
+            cursor.execute(
+                "INSERT INTO service_dispatch (image_id, service, cluster_id) VALUES (%s, %s, %s)",
+                (image_id, service, cluster_id),
+            )
+            cursor.close()
+        except Exception as e:
+            self.logger.warning(
+                f"Failed to record service_dispatch for {service}/{image_id}: {e}"
+            )
+            if not self.db_conn.autocommit:
+                try:
+                    self.db_conn.cursor().execute("ROLLBACK TO SAVEPOINT before_service_dispatch")
+                except Exception:
+                    pass
+
+    def _update_service_dispatch(self, image_id, service=None, cluster_id=None, status='complete'):
+        """Update service_dispatch to the given status. Best-effort; errors swallowed.
+
+        cluster_id=None matches rows WHERE cluster_id IS NULL (image-level services).
+        Provide cluster_id for bbox-level services such as face and pose.
+        service defaults to this worker's clean service name.
+
+        On autocommit=False connections the UPDATE is committed automatically.
+        """
+        service = service or self._get_clean_service_name()
+        try:
+            cursor = self.db_conn.cursor()
+            if cluster_id is None:
+                cursor.execute(
+                    """UPDATE service_dispatch SET status = %s
+                       WHERE image_id = %s AND service = %s
+                         AND cluster_id IS NULL AND status = 'pending'""",
+                    (status, image_id, service),
+                )
+            else:
+                cursor.execute(
+                    """UPDATE service_dispatch SET status = %s
+                       WHERE image_id = %s AND service = %s
+                         AND cluster_id = %s AND status = 'pending'""",
+                    (status, image_id, service, cluster_id),
+                )
+            cursor.close()
+            if not self.db_conn.autocommit:
+                self.db_conn.commit()
+        except Exception as e:
+            self.logger.warning(
+                f"Failed to update service_dispatch for {service}/{image_id}: {e}"
+            )
+            if not self.db_conn.autocommit:
+                try:
+                    self.db_conn.rollback()
+                except Exception:
+                    pass
+
     def after_result_stored(self, image_id, result, message):
         """Hook called after storing the ML result. Override in subclasses for
         in-place extrapolation that belongs to the same service."""
@@ -596,6 +661,9 @@ class BaseWorker:
             """, (image_id, self._get_clean_service_name(), json.dumps(result), 'success', self.worker_id))
             self.db_conn.commit()  # CRITICAL: Commit the transaction!
             cursor.close()
+
+            # Mark service as complete in dispatch tracking — best-effort
+            self._update_service_dispatch(image_id)
 
             # In-place extrapolation hook: subclasses derive additional data
             # from the same result without a separate queue/worker

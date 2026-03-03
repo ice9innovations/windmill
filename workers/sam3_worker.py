@@ -71,33 +71,37 @@ class Sam3Worker(BaseWorker):
                 self._safe_ack(ch, method.delivery_tag)
                 return
 
-            # Deduplication guard: noun_consensus_worker can trigger SAM3 multiple
-            # times for the same image if several VLMs complete within the same
-            # window (the sam3_already_ran check in noun_consensus races with SAM3
-            # committing its result). With prefetch=1 we process serially, so by
-            # the time a second SAM3 message is consumed the first run has already
-            # committed — just ack and skip.
-            cursor = self.db_conn.cursor()
-            cursor.execute(
-                "SELECT 1 FROM sam3_results WHERE image_id = %s LIMIT 1", (image_id,)
-            )
-            already_ran = cursor.fetchone() is not None
-            cursor.close()
-            if already_ran:
+            # Additive dedup: fetch any existing results so we only segment
+            # nouns SAM3 hasn't already processed for this image.
+            existing_nouns, existing_data = self._fetch_existing_results(image_id)
+            new_nouns = [n for n in nouns if n not in set(existing_nouns)]
+
+            if not new_nouns:
                 self.logger.info(
-                    f"sam3: image {image_id} already processed, skipping duplicate trigger"
+                    f"sam3: image {image_id} already processed with same nouns, skipping"
                 )
                 self._safe_ack(ch, method.delivery_tag)
                 return
 
-            self.logger.info(f"sam3: processing image {image_id} with nouns: {nouns}")
+            self.logger.info(
+                f"sam3: processing image {image_id} — "
+                f"new nouns: {new_nouns}"
+                + (f" (adding to existing: {existing_nouns})" if existing_nouns else "")
+            )
 
-            # Call SAM3 REST service
-            results = self._call_sam3(image_data, nouns)
-            if results is None:
+            # Call SAM3 only for the new nouns
+            new_results = self._call_sam3(image_data, new_nouns)
+            if new_results is None:
                 self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("SAM3 REST call failed")
                 return
+
+            # Merge with existing noun results. Strip underscore keys from the
+            # existing data — _subject and _background will be recomputed below
+            # from the full merged set so they always reflect all known nouns.
+            results = {k: v for k, v in existing_data.items() if not k.startswith('_')}
+            results.update(new_results)
+            all_nouns = existing_nouns + new_nouns
 
             # Subject mask: store the best segmentation of the voted subject noun
             # under "_subject" so downstream consumers can invert it for background
@@ -157,8 +161,11 @@ class Sam3Worker(BaseWorker):
 
             processing_time = round(time.time() - start_time, 3)
 
-            # Store results
-            self._upsert_sam3_results(image_id, nouns, results, processing_time)
+            # Store full merged results
+            self._upsert_sam3_results(image_id, all_nouns, results, processing_time)
+
+            # Mark all pending SAM3 dispatch records complete for this image
+            self._update_service_dispatch(image_id)
 
             # Mark validated nouns back in noun_consensus
             self._validate_noun_consensus(image_id, results)
@@ -440,6 +447,28 @@ class Sam3Worker(BaseWorker):
             'rle_runs': len(rle_out),
         }
 
+    def _fetch_existing_results(self, image_id: int) -> tuple:
+        """Return (nouns_queried, data) from any existing sam3_results row.
+
+        Returns ([], {}) if no row exists yet.
+        """
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                "SELECT nouns_queried, data FROM sam3_results WHERE image_id = %s LIMIT 1",
+                (image_id,)
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            if not row:
+                return [], {}
+            nouns_queried = row[0] or []
+            data = row[1] if isinstance(row[1], dict) else json.loads(row[1])
+            return nouns_queried, data
+        except Exception as e:
+            self.logger.error(f"sam3: fetch existing results failed for image {image_id}: {e}")
+            return [], {}
+
     def _upsert_sam3_results(
         self, image_id: int, nouns: list, results: dict, processing_time: float
     ):
@@ -477,6 +506,7 @@ class Sam3Worker(BaseWorker):
         except Exception as e:
             self.logger.error(f"sam3: upsert failed for image {image_id}: {e}")
             raise
+
 
 
     def _validate_noun_consensus(self, image_id: int, results: dict):
