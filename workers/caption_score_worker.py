@@ -383,10 +383,12 @@ class CaptionScoreWorker(BaseWorker):
         """Main entry point - queue-based processing"""
         if not self.connect_to_database():
             return 1
-        
+
         if not self.connect_to_queue():
             return 1
-        
+
+        self._start_registry()
+
         self.logger.info(f"Starting caption score worker ({self.worker_id})")
         self.logger.info(f"Listening on queue: {self.queue_name}")
         self.logger.info(f"CLIP score endpoint: {self.clip_score_url}")
@@ -407,6 +409,7 @@ class CaptionScoreWorker(BaseWorker):
                     self.channel.stop_consuming()
                 except Exception:
                     pass
+                self._stop_registry()
                 break
             except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
                     pika.exceptions.StreamLostError) as e:

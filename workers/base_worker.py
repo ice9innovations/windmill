@@ -47,6 +47,15 @@ class BaseWorker:
         self._publish_connection = None
         self._publish_channel = None
         self._running = False
+
+        # Heartbeat thread — keeps worker_registry up to date while running
+        self._heartbeat_thread = None
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_interval = int(os.getenv('WORKER_HEARTBEAT_INTERVAL', '30'))
+
+        # SIGTERM handler — converts kill signal into KeyboardInterrupt for clean shutdown
+        import signal
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
         
     def load_config(self, env_file):
         """Load configuration from .env and service_config.yaml"""
@@ -491,6 +500,114 @@ class BaseWorker:
                 except Exception:
                     pass
 
+    def _handle_sigterm(self, signum, frame):
+        """Convert SIGTERM to KeyboardInterrupt so workers can clean up on windmill.sh stop."""
+        raise KeyboardInterrupt("SIGTERM received")
+
+    def _register_worker(self):
+        """Register this worker in worker_registry. Called once on startup.
+
+        - Marks any existing online row for this (service, host) as offline at its last_heartbeat
+          (best approximation of when it died for unclean exits)
+        - Sweeps any globally stale online rows (last_heartbeat older than 3x heartbeat interval)
+        - Opportunistically deletes offline rows older than WORKER_REGISTRY_RETENTION_DAYS
+        - Inserts a fresh online row for this worker
+        """
+        service = self._get_clean_service_name()
+        host = socket.gethostname()
+        stale_threshold = self._heartbeat_interval * 3
+        try:
+            cursor = self.db_conn.cursor()
+
+            # Mark previous row for this (service, host) offline at its last known heartbeat
+            cursor.execute("""
+                UPDATE worker_registry
+                SET status = 'offline', offline_at = last_heartbeat
+                WHERE service = %s AND host = %s AND status = 'online'
+            """, (service, host))
+
+            # Sweep globally stale online rows from any host
+            cursor.execute("""
+                UPDATE worker_registry
+                SET status = 'offline', offline_at = last_heartbeat
+                WHERE status = 'online'
+                  AND last_heartbeat < NOW() - INTERVAL '%s seconds'
+            """, (stale_threshold,))
+
+            # Insert fresh row for this worker
+            cursor.execute("""
+                INSERT INTO worker_registry (worker_id, service, host, started_at, last_heartbeat, status)
+                VALUES (%s, %s, %s, NOW(), NOW(), 'online')
+            """, (self.worker_id, service, host))
+
+            cursor.close()
+            if not self.db_conn.autocommit:
+                self.db_conn.commit()
+            self.logger.info(f"Registered in worker registry ({host})")
+        except Exception as e:
+            self.logger.warning(f"Failed to register in worker registry: {e}")
+
+    def _heartbeat_loop(self):
+        """Background thread: updates last_heartbeat every WORKER_HEARTBEAT_INTERVAL seconds.
+        Marks status='offline' on clean exit so consumers can distinguish clean vs unclean shutdowns."""
+        try:
+            conn = self._new_db_connection(autocommit=True)
+        except Exception as e:
+            self.logger.warning(f"Heartbeat thread failed to connect to DB: {e}")
+            return
+
+        # Event.wait(timeout) blocks for up to timeout seconds, returns True if stop was signalled
+        while not self._heartbeat_stop.wait(self._heartbeat_interval):
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE worker_registry SET last_heartbeat = NOW() WHERE worker_id = %s",
+                    (self.worker_id,)
+                )
+                cursor.close()
+                self.logger.debug("Heartbeat sent")
+            except Exception as e:
+                self.logger.warning(f"Heartbeat failed: {e}. Reconnecting...")
+                try:
+                    conn.close()
+                    conn = self._new_db_connection(autocommit=True)
+                except Exception as reconnect_e:
+                    self.logger.error(f"Heartbeat reconnect failed: {reconnect_e}")
+
+        # Clean shutdown — mark offline with precise offline_at timestamp
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE worker_registry SET status = 'offline', offline_at = NOW() WHERE worker_id = %s",
+                (self.worker_id,)
+            )
+            cursor.close()
+            self.logger.info("Marked offline in worker registry")
+        except Exception as e:
+            self.logger.warning(f"Failed to mark offline in worker registry: {e}")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _start_registry(self):
+        """Register and start heartbeat thread. Call after DB connection established."""
+        self._heartbeat_stop.clear()
+        self._register_worker()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            daemon=True,
+            name=f"{self.service_name}_heartbeat"
+        )
+        self._heartbeat_thread.start()
+
+    def _stop_registry(self):
+        """Signal heartbeat to stop and wait for offline marker to be written."""
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join(timeout=5)
+
     def after_result_stored(self, image_id, result, message):
         """Hook called after storing the ML result. Override in subclasses for
         in-place extrapolation that belongs to the same service."""
@@ -736,6 +853,9 @@ class BaseWorker:
         )
         self._publish_thread.start()
 
+        # Register in worker registry and start heartbeat thread
+        self._start_registry()
+
         # Start consuming with reconnect loop
         while True:
             try:
@@ -761,6 +881,7 @@ class BaseWorker:
                     self._publish_thread.join(timeout=10)
                     if self._publish_thread.is_alive():
                         self.logger.warning("Publish thread did not stop within timeout")
+                self._stop_registry()
                 break
             except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
                     pika.exceptions.StreamLostError) as e:

@@ -172,15 +172,12 @@ stop_worker() {
     
     local pids=$(pgrep -f "$worker_file")
     if [ -n "$pids" ]; then
-        echo "  Killing PIDs: $pids"
-        kill -9 $pids  # Force kill immediately - no more Mr. Nice Guy
-        sleep 2        # Give more time for cleanup
-        
-        # Verify everything is actually dead
+        echo "  Stopping PIDs: $pids"
+        kill $pids 2>/dev/null        # SIGTERM — gives worker chance to mark offline
+        sleep 4                       # Grace period for clean shutdown
         local remaining=$(pgrep -f "$worker_file")
         if [ -n "$remaining" ]; then
-            echo "  ERROR: Process $remaining still alive after SIGKILL!"
-            kill -9 $remaining  # Try again
+            kill -9 $remaining 2>/dev/null  # Force kill if still alive
             sleep 1
         fi
         local canonical=$(basename "$worker_file" ".py")

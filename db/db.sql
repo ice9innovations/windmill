@@ -245,3 +245,20 @@ CREATE TABLE IF NOT EXISTS service_dispatch (
 );
 
 CREATE INDEX IF NOT EXISTS idx_service_dispatch_image ON service_dispatch (image_id);
+
+-- Worker registry: tracks worker uptime history across all machines.
+-- Workers INSERT on startup and UPDATE last_heartbeat while running.
+-- status='offline' is written on clean shutdown or stale detection; offline_at records when.
+-- Rows are never deleted — history is retained for pipeline gap diagnostics.
+CREATE TABLE IF NOT EXISTS worker_registry (
+    worker_id      TEXT PRIMARY KEY,           -- unique per process, e.g. worker_primary.yolo_v8_1772502927
+    service        TEXT NOT NULL,              -- clean service name, e.g. 'yolo_v8', 'harmony', 'face'
+    host           TEXT NOT NULL,              -- hostname of the machine running this worker
+    started_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_heartbeat TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    offline_at     TIMESTAMPTZ,                -- set on clean shutdown or stale detection; NULL while online
+    status         TEXT NOT NULL DEFAULT 'online'  -- 'online', 'offline'
+);
+
+CREATE INDEX IF NOT EXISTS idx_worker_registry_service ON worker_registry (service);
+CREATE INDEX IF NOT EXISTS idx_worker_registry_status  ON worker_registry (status);

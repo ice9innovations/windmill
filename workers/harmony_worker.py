@@ -1208,10 +1208,12 @@ class HarmonyWorker(BaseWorker):
         
         if not self.connect_to_database():
             return 1
-            
+
         if not self.connect_to_queue():
             return 1
-        
+
+        self._start_registry()
+
         # Consume with reconnect loop
         while True:
             try:
@@ -1227,6 +1229,7 @@ class HarmonyWorker(BaseWorker):
                     self.queue_channel.stop_consuming()
                 except Exception:
                     pass
+                self._stop_registry()
                 break
             except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
                     pika.exceptions.StreamLostError) as e:

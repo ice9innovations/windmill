@@ -1111,6 +1111,8 @@ class ConsensusWorkerMergeFocused(BaseWorker):
         if not self.connect_to_queue():
             return 1
 
+        self._start_registry()
+
         self.logger.info(f"Starting merge-focused consensus worker ({self.worker_id})")
         self.logger.info(f"Listening on queue: {self.queue_name}")
         self.logger.info(f"SIMPLE VOTE MODE: Vote count based filtering")
@@ -1131,6 +1133,7 @@ class ConsensusWorkerMergeFocused(BaseWorker):
                     self.channel.stop_consuming()
                 except Exception:
                     pass
+                self._stop_registry()
                 break
             except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
                     pika.exceptions.StreamLostError) as e:

@@ -41,7 +41,9 @@ class PostProcessingWorker(BaseWorker):
         # Configure database for transactions (needed for FK handling in postprocessing)
         if self.db_conn:
             self.db_conn.autocommit = False
-        
+
+        self._start_registry()
+
         # Start consuming with our custom message processor
         self.channel.basic_consume(
             queue=self.queue_name,
@@ -55,6 +57,7 @@ class PostProcessingWorker(BaseWorker):
             self.logger.info("Stopping worker...")
             self.channel.stop_consuming()
             self.connection.close()
+            self._stop_registry()
         finally:
             if self.db_conn:
                 self.db_conn.close()
