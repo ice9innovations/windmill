@@ -17,6 +17,13 @@ services:
       endpoint: /v3/analyze
       service_type: semantic, vlm
 
+    clip:
+      # queue_name: clip # queue name commented out to prove that this works
+      host: localhost
+      port: 7788
+      endpoint: /v3/analyze
+      service_type: classification # some services can be in multiple categories 
+
     colors:
       queue_name: colors
       host: localhost
@@ -24,6 +31,20 @@ services:
       endpoint: /v3/analyze
       service_type: colors
       consensus: false
+
+    detectron2:
+      queue_name: detectron # not hardcoded
+      host: localhost
+      port: 7771
+      endpoint: /v3/analyze
+      service_type: spatial
+
+    xception:
+      queue_name: xception
+      host: localhost
+      port: 7799
+      endpoint: /v3/analyze
+      service_type: spatial, classification # note there is a space in the csv for testing
 
     metadata:
       queue_name: metadata
@@ -36,6 +57,13 @@ services:
       queue_name: ocr
       host: localhost
       port: 7775
+      endpoint: /v3/analyze
+      service_type: specialized
+
+    nsfw2:
+      queue_name: nsfw
+      host: localhost
+      port: 7774
       endpoint: /v3/analyze
       service_type: specialized
 
@@ -82,10 +110,46 @@ services:
       endpoint: /v3/analyze
       service_type: semantic, vlm
 
+    rtdetr:
+      queue_name: rtdetr
+      host: localhost
+      port: 7780
+      endpoint: /v3/analyze
+      service_type: spatial
+
+    rtmdet:
+      queue_name: rtmdet
+      host: localhost
+      port: 7792
+      endpoint: /v3/analyze
+      service_type: spatial
+
+    speciesnet:
+      queue_name: speciesnet
+      host: localhost
+      port: 7794
+      endpoint: /analyze
+      service_type: spatial
+      consensus: false
+
     yolo_v8:
       queue_name: yolo_v8
       host: localhost
       port: 7773
+      endpoint: /v3/analyze
+      service_type: spatial
+
+    yolo_365:
+      queue_name: yolo_365
+      host: localhost
+      port: 7790
+      endpoint: /v3/analyze
+      service_type: spatial
+
+    yolo_oi7:
+      queue_name: yolo_oi7
+      host: localhost
+      port: 7791
       endpoint: /v3/analyze
       service_type: spatial
 
@@ -98,7 +162,7 @@ services:
       endpoint: /v3/analyze
       service_type: colors
       consensus: false
-      
+
     face:
       queue_name: face
       host: localhost
@@ -146,6 +210,14 @@ services:
       category: infrastructure
       service_type: harmonization
       # prefetch: 1  # default; keep single in-flight message per worker
+
+    segmentation:
+      queue_name: refinement
+      category: infrastructure
+      service_type: segmentation
+      host: localhost
+      port: 7793
+      endpoint: /analyze
 
     content_analysis:
       queue_name: content_analysis
