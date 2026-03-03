@@ -35,7 +35,7 @@ from base_worker import BaseWorker
 
 logger = logging.getLogger(__name__)
 
-VLM_SERVICES = ['blip', 'haiku', 'moondream', 'ollama', 'qwen']
+VLM_SERVICES = ['blip', 'gemini', 'gpt_nano', 'haiku', 'moondream', 'ollama', 'qwen']
 
 MIN_CAPTIONS = 2  # Skip synthesis if fewer than this many VLMs returned
 
@@ -137,7 +137,8 @@ class CaptionSummaryWorker(BaseWorker):
                 return
 
             services_present = sorted(captions.keys())
-            self._upsert(image_id, summary, synthesis_model, services_present)
+            self._upsert(image_id, summary, synthesis_model, services_present,
+                         processing_time=round(time.time() - start_time, 3))
             self._update_service_dispatch(image_id, service='caption_summary')
 
             # CLIP score the synthesized caption — non-fatal if unavailable
@@ -326,7 +327,8 @@ class CaptionSummaryWorker(BaseWorker):
     # DB write
     # ------------------------------------------------------------------
 
-    def _upsert(self, image_id: int, summary: str, model: str, services_present: list):
+    def _upsert(self, image_id: int, summary: str, model: str, services_present: list,
+                processing_time: float = None):
         """Insert or update the caption_summary row for this image."""
         try:
             cursor = self.db_conn.cursor()
@@ -334,16 +336,17 @@ class CaptionSummaryWorker(BaseWorker):
                 """
                 INSERT INTO caption_summary
                     (image_id, summary_caption, model, services_present, service_count,
-                     created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+                     processing_time, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
                 ON CONFLICT (image_id) DO UPDATE SET
                     summary_caption  = EXCLUDED.summary_caption,
                     model            = EXCLUDED.model,
                     services_present = EXCLUDED.services_present,
                     service_count    = EXCLUDED.service_count,
+                    processing_time  = EXCLUDED.processing_time,
                     updated_at       = NOW()
                 """,
-                (image_id, summary, model, services_present, len(services_present))
+                (image_id, summary, model, services_present, len(services_present), processing_time)
             )
             self.db_conn.commit()
             cursor.close()

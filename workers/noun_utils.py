@@ -29,10 +29,11 @@ logger = logging.getLogger(__name__)
 # Applied as a pre-pass before WordNet so votes from different VLM vocabularies
 # are correctly merged.
 CONTENT_MODERATION_SYNONYMS = {
-    'cock':  'penis',
-    'dick':  'penis',
-    'pussy': 'vagina',
-    'cunt':  'vagina',
+    'cock':      'penis',
+    'dick':      'penis',
+    'pussy':     'vagina',
+    'cunt':      'vagina',
+    'marijuana': 'cannabis'
 }
 
 _wordnet_available = None
@@ -169,7 +170,9 @@ def apply_mwe_normalization(
 
 # ConceptNet adjacency set, loaded once at startup.
 # Each entry is a frozenset of two normalized URIs that share a
-# Synonym/SimilarTo/IsA/PartOf edge. Bidirectional by construction.
+# /r/Synonym edge. Bidirectional by construction.
+# IsA is intentionally excluded: IsA is hierarchy (woman IS-A person),
+# not equivalence. Loading IsA as synonyms destroys gender/specificity signals.
 _conceptnet_edges: set = set()
 _conceptnet_loaded = False
 
@@ -209,7 +212,7 @@ def load_conceptnet(db_conn) -> int:
         cursor.execute(
             """
             SELECT start_uri, end_uri FROM conceptnet_edges
-            WHERE relation IN ('/r/Synonym', '/r/IsA')
+            WHERE relation = '/r/Synonym'
             """
         )
         for start_uri, end_uri in cursor.fetchall():
@@ -269,8 +272,8 @@ def _conceptnet_uri(noun: str) -> str:
 
 
 def _are_conceptnet_synonyms(noun1: str, noun2: str) -> bool:
-    """Return True if ConceptNet has a direct Synonym/SimilarTo/IsA/PartOf
-    edge between noun1 and noun2 (either direction).
+    """Return True if ConceptNet has a direct /r/Synonym edge between
+    noun1 and noun2 (either direction).
 
     URI matching uses exact-or-slash-suffix to avoid compound word false
     matches (e.g. /c/en/dog matches /c/en/dog and /c/en/dog/n/wn/animal

@@ -8,7 +8,7 @@ deduplicated, lowercase list suitable for cross-service reconciliation
 in Windmill v2.
 
 Also provides categorize_nouns() which maps each noun to a semantic
-category (animal, person, vehicle, food, plant, clothing, structure,
+category (animal, human, vehicle, food, plant, clothing, structure,
 body part, furniture, object) via WordNet hypernym traversal.
 """
 
@@ -126,8 +126,8 @@ def _clean_surface(s: str) -> str:
 # Manual overrides: noun → category.  Add entries here to hard-wire
 # edge cases that WordNet gets wrong for this domain.
 CATEGORY_OVERRIDES: Dict[str, str] = {
-    "people": "person",
-    "crowd": "person",
+    "people": "human",
+    "crowd": "human",
     "pangolid": "animal",   # Moondream hallucination for "pangolin"
     "fries": "food",
     "fry": "food",          # spaCy lemmatizes "fries" → "fry" when "French" is stripped as amod
@@ -139,7 +139,7 @@ CATEGORY_OVERRIDES: Dict[str, str] = {
 # before artifact.n.01, so boots → clothing rather than object).
 _CATEGORY_ANCHORS: Dict[str, str] = {
     "animal.n.01":     "animal",
-    "person.n.01":     "person",
+    "person.n.01":     "human",
     "vehicle.n.01":    "vehicle",
     "conveyance.n.03": "vehicle",   # wheeled_vehicle parent — catches car, bike
     "food.n.01":       "food",
@@ -179,7 +179,7 @@ def _find_category_for_synset(synset, max_depth: int = 12) -> Optional[str]:
 def categorize_nouns(nouns: List[str]) -> Dict[str, str]:
     """Map each noun to a semantic category via WordNet hypernym traversal.
 
-    Categories: animal, person, vehicle, food, plant, clothing,
+    Categories: animal, human, vehicle, food, plant, clothing,
                 structure, body part, furniture, object (fallback).
 
     Nouns matched by CATEGORY_OVERRIDES bypass WordNet entirely.

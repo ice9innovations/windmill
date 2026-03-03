@@ -32,7 +32,7 @@ from verb_extractor import extract_verbs_and_svo, warmup_verb_extractor
 logger = logging.getLogger(__name__)
 
 # Must match VLM_SERVICES in noun_consensus_worker.py
-VLM_SERVICES = ['blip', 'gemini', 'haiku', 'moondream', 'ollama', 'qwen']
+VLM_SERVICES = ['blip', 'gemini', 'gpt_nano', 'haiku', 'moondream', 'ollama', 'qwen']
 
 
 class VerbConsensusWorker(BaseWorker):
@@ -160,13 +160,15 @@ class VerbConsensusWorker(BaseWorker):
             cursor.execute(
                 """
                 INSERT INTO verb_consensus
-                    (image_id, verbs, svo_triples, services_present, service_count, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+                    (image_id, verbs, svo_triples, services_present, service_count,
+                     processing_time, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
                 ON CONFLICT (image_id) DO UPDATE SET
                     verbs            = EXCLUDED.verbs,
                     svo_triples      = EXCLUDED.svo_triples,
                     services_present = EXCLUDED.services_present,
                     service_count    = EXCLUDED.service_count,
+                    processing_time  = EXCLUDED.processing_time,
                     updated_at       = NOW()
                 """,
                 (
@@ -175,6 +177,7 @@ class VerbConsensusWorker(BaseWorker):
                     json.dumps(service_svo_map),
                     services_present,
                     len(services_present),
+                    processing_time,
                 )
             )
             self.db_conn.commit()

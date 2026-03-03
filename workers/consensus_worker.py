@@ -14,18 +14,9 @@ import re
 from datetime import datetime
 from base_worker import BaseWorker
 
-# MERGE-FOCUSED configuration with democratic confidence
-MINIMUM_VOTES_REQUIRED = 3  # Require at least 2-service consensus
-TOTAL_AVAILABLE_SERVICES = 8  # Approximate total services that could vote
-
-# VLM consensus rebalancing
-# When all semantic (VLM) services unanimously agree on an emoji, give a ranking bonus
-# so that unanimous VLM consensus can outrank scattered spatial detections.
-# With 3 VLMs (blip, ollama, moondream) vs 6+ spatial services, raw vote counts
-# structurally favour spatial; this corrects that asymmetry in ranking only.
-# Filtering logic (apply_bbox_vote_filtering) is unchanged.
-VLM_SERVICES_COUNT = 3   # Number of semantic services currently in the pipeline
-VLM_CONSENSUS_BONUS = 2  # Ranking bonus when all VLM_SERVICES_COUNT agree
+# Minimum services required to include an emoji in consensus output.
+# Spatial detections count as 2 votes (bbox confirmed by at least one service).
+MINIMUM_VOTES_REQUIRED = 3
 
 def normalize_emoji(emoji):
     """Remove variation selectors and other invisible modifiers from emoji"""
@@ -811,25 +802,6 @@ class ConsensusWorkerMergeFocused(BaseWorker):
 
         return accepted_results
 
-    def compute_ranking_score(self, analysis):
-        """
-        Compute a ranking score that corrects for the structural imbalance between
-        spatial services (6+) and semantic/VLM services (3).
-
-        When all VLM_SERVICES_COUNT semantic services unanimously agree on an emoji,
-        add VLM_CONSENSUS_BONUS to the ranking score. This lets a 3-VLM unanimous
-        result (score 5) outrank moderate scattered spatial evidence (score 4-5)
-        without overriding truly overwhelming spatial evidence (score 6+).
-
-        Returns a (ranking_score, semantic_votes) tuple so semantic agreement acts
-        as a tiebreaker when the primary scores are equal.
-        """
-        vlm_services = set(
-            d['service'] for d in analysis['supporting_detections']
-            if d['evidence_type'] == 'semantic'
-        )
-        bonus = VLM_CONSENSUS_BONUS if len(vlm_services) >= VLM_SERVICES_COUNT else 0
-        return (analysis['total_votes'] + bonus, analysis['semantic_votes'])
 
     def calculate_consensus(self, service_results, image_id):
         """Main consensus calculation with per-bounding-box voting"""
@@ -860,18 +832,11 @@ class ConsensusWorkerMergeFocused(BaseWorker):
         # SPECIAL: Handle NSFW (🔞) as image-level determination
         accepted_results = self.handle_nsfw_special_case(bbox_analysis, accepted_results)
 
-        # Sort by ranking score (descending): unanimous VLM consensus gets a bonus
-        # so 3 agreeing VLMs can outrank scattered spatial detections.
-        accepted_results.sort(key=self.compute_ranking_score, reverse=True)
-
-        # Log when the VLM bonus changed the natural ordering
-        vlm_boosted = [
-            a['emoji'] for a in accepted_results
-            if len(set(d['service'] for d in a['supporting_detections']
-                       if d['evidence_type'] == 'semantic')) >= VLM_SERVICES_COUNT
-        ]
-        if vlm_boosted:
-            self.logger.info(f"VLM consensus bonus applied to: {vlm_boosted}")
+        # Sort by total votes descending; semantic vote count breaks ties.
+        accepted_results.sort(
+            key=lambda a: (a['total_votes'], a['semantic_votes']),
+            reverse=True
+        )
 
         # Format final results per bounding box
         consensus_results = []
@@ -879,16 +844,10 @@ class ConsensusWorkerMergeFocused(BaseWorker):
             # Calculate evidence breakdown
             non_spatial_votes = analysis['semantic_votes'] + analysis['classification_votes']
 
-            vlm_services_agreeing = len(set(
-                d['service'] for d in analysis['supporting_detections']
-                if d['evidence_type'] == 'semantic'
-            ))
-            vlm_consensus_bonus = VLM_CONSENSUS_BONUS if vlm_services_agreeing >= VLM_SERVICES_COUNT else 0
-
             result = {
                 'emoji': analysis['emoji'],
                 'votes': analysis['total_votes'],
-                'merged_id': analysis.get('merged_id'),  # Include bounding box ID
+                'merged_id': analysis.get('merged_id'),
                 'democratic_confidence': analysis.get('democratic_confidence', 0),
                 'evidence': {
                     'total_votes': analysis['total_votes'],
@@ -896,13 +855,7 @@ class ConsensusWorkerMergeFocused(BaseWorker):
                     'semantic_votes': analysis['semantic_votes'],
                     'classification_votes': analysis['classification_votes'],
                     'non_spatial_votes': non_spatial_votes,
-                    'democratic_confidence': analysis.get('democratic_confidence', 0),
                     'summary': f"{non_spatial_votes} non-spatial" if non_spatial_votes > 0 else "spatial only",
-                    'evidence_summary': f"{non_spatial_votes} non-spatial" if non_spatial_votes > 0 else "spatial only",
-                    'final_decision': "consensus",
-                    'total_evidence': non_spatial_votes,
-                    'vlm_services_agreeing': vlm_services_agreeing,
-                    'vlm_consensus_bonus': vlm_consensus_bonus
                 },
                 'services': list(set(d['service'] for d in analysis['supporting_detections'])),
                 'filter_reason': analysis['filter_reason'],
@@ -1041,9 +994,9 @@ class ConsensusWorkerMergeFocused(BaseWorker):
 
             # Insert new consensus
             cursor.execute("""
-                INSERT INTO consensus (image_id, consensus_data)
-                VALUES (%s, %s)
-            """, (image_id, json.dumps(consensus_data)))
+                INSERT INTO consensus (image_id, consensus_data, processing_time)
+                VALUES (%s, %s, %s)
+            """, (image_id, json.dumps(consensus_data), round(processing_time, 3)))
 
             # Commit the transaction
             self.db_conn.commit()

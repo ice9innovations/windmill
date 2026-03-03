@@ -10,6 +10,7 @@ sys.path.append(os.path.dirname(__file__))
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 import json
+import time
 import psycopg2
 from datetime import datetime
 from base_worker import BaseWorker
@@ -542,7 +543,7 @@ class ContentAnalysisWorker(BaseWorker):
             self.logger.error(traceback.format_exc())
             return None
 
-    def store_analysis(self, analysis):
+    def store_analysis(self, analysis, processing_time=None):
         """Store content analysis in database"""
         try:
             cursor = self.db_conn.cursor()
@@ -554,9 +555,10 @@ class ContentAnalysisWorker(BaseWorker):
                     activities_detected, spatial_relationships, person_bboxes_raw,
                     person_bboxes_deduplicated, containment_relationships, semantic_validation,
                     vlm_hallucinations, people_count, person_attributions, framing_analysis,
-                    face_correlations, nsfw2_correlation, full_analysis, analysis_version
+                    face_correlations, nsfw2_correlation, full_analysis, analysis_version,
+                    processing_time
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (image_id) DO UPDATE SET
                     gender_breakdown = EXCLUDED.gender_breakdown,
@@ -576,7 +578,8 @@ class ContentAnalysisWorker(BaseWorker):
                     face_correlations = EXCLUDED.face_correlations,
                     nsfw2_correlation = EXCLUDED.nsfw2_correlation,
                     full_analysis = EXCLUDED.full_analysis,
-                    analysis_version = EXCLUDED.analysis_version
+                    analysis_version = EXCLUDED.analysis_version,
+                    processing_time = EXCLUDED.processing_time
             """, (
                 analysis['image_id'],
                 json.dumps(analysis['gender_breakdown']),
@@ -596,7 +599,8 @@ class ContentAnalysisWorker(BaseWorker):
                 json.dumps(analysis['face_correlations']),
                 json.dumps(analysis['nsfw2_correlation']),
                 json.dumps(analysis['full_analysis']),
-                analysis['analysis_version']
+                analysis['analysis_version'],
+                processing_time
             ))
 
             self.db_conn.commit()
@@ -647,6 +651,8 @@ class ContentAnalysisWorker(BaseWorker):
             else:
                 self.logger.debug(f"Processing content analysis for image {image_id}")
 
+            start_time = time.time()
+
             # Fetch all image data
             image_data = self.get_image_data(image_id)
             if not image_data:
@@ -664,7 +670,7 @@ class ContentAnalysisWorker(BaseWorker):
                 return
 
             # Store analysis
-            if not self.store_analysis(analysis):
+            if not self.store_analysis(analysis, processing_time=round(time.time() - start_time, 3)):
                 self.logger.error(f"Failed to store analysis for {image_id}")
                 self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Storage failed")

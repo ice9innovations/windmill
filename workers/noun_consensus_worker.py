@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Services whose noun lists participate in consensus.
 # Matches the 'vlm' service_type entries in service_config.yaml.
-VLM_SERVICES = ['blip', 'gemini', 'haiku', 'moondream', 'ollama', 'qwen']
+VLM_SERVICES = ['blip', 'gemini', 'gpt_nano', 'haiku', 'moondream', 'ollama', 'qwen']
 
 
 class NounConsensusWorker(BaseWorker):
@@ -386,8 +386,9 @@ class NounConsensusWorker(BaseWorker):
             cursor.execute(
                 """
                 INSERT INTO noun_consensus
-                    (image_id, nouns, category_tally, services_present, service_count, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+                    (image_id, nouns, category_tally, services_present, service_count,
+                     processing_time, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
                 ON CONFLICT (image_id) DO UPDATE SET
                     nouns = (
                         -- Preserve sam3_validated=true from the existing row.
@@ -411,6 +412,7 @@ class NounConsensusWorker(BaseWorker):
                     category_tally   = EXCLUDED.category_tally,
                     services_present = EXCLUDED.services_present,
                     service_count    = EXCLUDED.service_count,
+                    processing_time  = EXCLUDED.processing_time,
                     updated_at       = NOW()
                 """,
                 (
@@ -419,6 +421,7 @@ class NounConsensusWorker(BaseWorker):
                     json.dumps(category_tally or []),
                     services_present,
                     len(services_present),
+                    processing_time,
                 )
             )
             self.db_conn.commit()
