@@ -12,6 +12,48 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
+# Per-machine state file — tracks which workers are enabled on this machine.
+# Managed automatically by start/stop; never committed to git.
+STATE_FILE=".windmill_state"
+
+state_add() {
+    local name="$1"
+    touch "$STATE_FILE"
+    if ! grep -qx "$name" "$STATE_FILE"; then
+        echo "$name" >> "$STATE_FILE"
+    fi
+}
+
+state_remove() {
+    local name="$1"
+    if [ -f "$STATE_FILE" ]; then
+        grep -vx "$name" "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+    fi
+}
+
+get_enabled_workers() {
+    if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
+        cat "$STATE_FILE"
+    fi
+}
+
+bootstrap_state_from_running() {
+    echo "  No state file found — scanning running processes to build initial state..."
+    local found=0
+    for worker in $(get_all_workers); do
+        if pgrep -f "workers/${worker}.py" >/dev/null 2>&1; then
+            state_add "$worker"
+            echo "  Found running: $worker"
+            found=$((found + 1))
+        fi
+    done
+    if [ "$found" -eq 0 ]; then
+        echo -e "${YELLOW}  No running workers found. Use './windmill.sh start <worker>' to enable workers.${NC}"
+    else
+        echo "  State file initialized with $found worker(s)."
+    fi
+}
+
 # Dynamically build worker list from available worker files
 get_all_workers() {
     # Get all worker files and extract service names, excluding base classes
@@ -29,17 +71,29 @@ get_all_workers() {
 }
 
 start_all() {
-    echo "🚀 Starting all workers..."
     mkdir -p logs
-    
-    # Start all workers - now they all use the same clean pattern
-    for worker in $(get_all_workers); do
-        echo "  Starting $worker..."
-        nohup python workers/${worker}.py > logs/${worker}.log 2>&1 &
+
+    # Bootstrap state from running processes if no state file exists yet
+    if [ ! -f "$STATE_FILE" ]; then
+        bootstrap_state_from_running
+    fi
+
+    local enabled
+    enabled=$(get_enabled_workers)
+
+    if [ -z "$enabled" ]; then
+        echo -e "${YELLOW}⚠️  No enabled workers on this machine.${NC}"
+        echo "    Use './windmill.sh start <worker>' to enable workers."
+        return
+    fi
+
+    echo "🚀 Starting enabled workers..."
+    for worker in $enabled; do
+        start_worker "$worker"
     done
-    
+
     sleep 2
-    echo -e "${GREEN}✅ Started all workers${NC}"
+    echo -e "${GREEN}✅ Started enabled workers${NC}"
 }
 
 stop_all() {
@@ -129,6 +183,8 @@ stop_worker() {
             kill -9 $remaining  # Try again
             sleep 1
         fi
+        local canonical=$(basename "$worker_file" ".py")
+        state_remove "$canonical"
         echo "✅ Stopped $worker"
         return 0
     else
@@ -179,10 +235,12 @@ start_worker() {
         echo "❌ ERROR: $worker_file does not exist"
         return 1
     fi
-    
+
     # Extract actual worker name from file path for consistent logging
     local log_name=$(basename "$worker_file" ".py")
-    
+
+    state_add "$log_name"
+
     echo "  Starting $worker..."
     nohup python $worker_file > logs/${log_name}.log 2>&1 &
     echo "✅ Started $worker"

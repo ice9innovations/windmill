@@ -163,20 +163,20 @@ services:
       service_type: colors
       consensus: false
       
-#    face:
-#      queue_name: face
-#      host: localhost
-#      port: 7772
-#      endpoint: /v3/analyze
-#      service_type: specialized
+    face:
+      queue_name: face
+      host: localhost
+      port: 7772
+      endpoint: /v3/analyze
+      service_type: specialized
 
-#    pose:
-#      queue_name: pose
-#      host: localhost
-#      port: 7786
-#      endpoint: /v3/analyze
-#      service_type: specialized
-#      consensus: false
+    pose:
+      queue_name: pose
+      host: localhost
+      port: 7786
+      endpoint: /v3/analyze
+      service_type: specialized
+      consensus: false
 
     caption_score:
       queue_name: caption_score
