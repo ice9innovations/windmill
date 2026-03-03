@@ -551,6 +551,13 @@ class BaseWorker:
         """Background thread: updates last_heartbeat every WORKER_HEARTBEAT_INTERVAL seconds.
         Marks status='offline' on clean exit so consumers can distinguish clean vs unclean shutdowns."""
         try:
+            self._heartbeat_loop_inner()
+        except Exception as e:
+            self.logger.error(f"Heartbeat thread crashed unexpectedly: {e}", exc_info=True)
+
+    def _heartbeat_loop_inner(self):
+        """Inner heartbeat loop — separated so the outer method can catch any unexpected exit."""
+        try:
             conn = self._new_db_connection(autocommit=True)
         except Exception as e:
             self.logger.warning(f"Heartbeat thread failed to connect to DB: {e}")
