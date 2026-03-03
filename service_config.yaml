@@ -75,6 +75,13 @@ services:
       endpoint: /v3/analyze
       service_type: semantic, vlm
 
+    gpt_nano:
+      queue_name: gpt_nano
+      host: localhost
+      port: 7800
+      endpoint: /v3/analyze
+      service_type: semantic, vlm
+
     qwen:
       queue_name: qwen
       host: localhost

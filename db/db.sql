@@ -163,8 +163,10 @@ CREATE TABLE content_analysis (
 
     -- Metadata
     analysis_version TEXT,
+    processing_time DOUBLE PRECISION,
     created TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
 
+    -- Live schema also has: framing_analysis JSONB, face_correlations JSONB, nsfw2_correlation JSONB
     UNIQUE(image_id)
 );
 
@@ -187,12 +189,30 @@ CREATE TABLE IF NOT EXISTS verb_consensus (
     svo_triples       JSONB  NOT NULL DEFAULT '{}', -- {service: [[s,v,o], ...]} per-service reference
     services_present  TEXT[] NOT NULL DEFAULT '{}', -- which VLMs contributed
     service_count     INTEGER NOT NULL DEFAULT 0,
+    processing_time   DOUBLE PRECISION,
     created_at        TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
     updated_at        TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
     CONSTRAINT verb_consensus_image_id_unique UNIQUE (image_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_verb_consensus_image ON verb_consensus(image_id);
+
+-- Noun Consensus table: Cross-VLM noun synonym collapsing and vote counting
+-- Progressive: upserted on each VLM completion; sam3_validated flags preserved across upserts.
+CREATE TABLE IF NOT EXISTS noun_consensus (
+    noun_consensus_id BIGSERIAL PRIMARY KEY,
+    image_id          BIGINT NOT NULL REFERENCES images(image_id),
+    nouns             JSONB  NOT NULL DEFAULT '[]', -- array of collapsed noun objects with sam3_validated flags
+    category_tally    JSONB  NOT NULL DEFAULT '[]', -- [{category, vote_count, services, nouns:[...]}]
+    services_present  TEXT[] NOT NULL DEFAULT '{}', -- which VLMs contributed
+    service_count     INTEGER NOT NULL DEFAULT 0,
+    processing_time   DOUBLE PRECISION,
+    created_at        TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+    updated_at        TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+    CONSTRAINT noun_consensus_image_id_unique UNIQUE (image_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_noun_consensus_image ON noun_consensus(image_id);
 
 -- Caption Summary table: LLM-synthesized single caption from all VLM outputs
 -- Triggered by SAM3 completion; requires >= 2 VLM captions to write a row.
@@ -203,6 +223,7 @@ CREATE TABLE IF NOT EXISTS caption_summary (
     model              TEXT    NOT NULL,
     services_present   TEXT[]  NOT NULL DEFAULT '{}',
     service_count      INTEGER NOT NULL DEFAULT 0,
+    processing_time    DOUBLE PRECISION,
     created_at         TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
     updated_at         TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
     CONSTRAINT caption_summary_image_id_unique UNIQUE (image_id)

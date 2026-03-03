@@ -778,11 +778,16 @@ class BaseWorker:
             result = self.post_image_data(message['image_data'])
 
             # Store result in database
+            processing_time = None
+            if isinstance(result, dict):
+                processing_time = result.get('processing_time') or (
+                    result.get('metadata') or {}
+                ).get('processing_time')
             cursor = self.db_conn.cursor()
             cursor.execute("""
-                INSERT INTO results (image_id, service, data, status, worker_id)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (image_id, self._get_clean_service_name(), json.dumps(result), 'success', self.worker_id))
+                INSERT INTO results (image_id, service, data, status, worker_id, processing_time)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (image_id, self._get_clean_service_name(), json.dumps(result), 'success', self.worker_id, processing_time))
             self.db_conn.commit()  # CRITICAL: Commit the transaction!
             cursor.close()
 
