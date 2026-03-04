@@ -8,25 +8,23 @@ import sys
 import uuid
 import json
 import base64
-import io
 import logging
 
-import imagehash
 import ssl
 import pika
 import psycopg2
 import psycopg2.extras
-from PIL import Image, ImageOps
-from pillow_heif import register_heif_opener
-from datetime import datetime, timezone
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 
-# Add workers directory to path for service_config import
+# Add workers and core directories to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'workers'))
+sys.path.insert(0, os.path.dirname(__file__))
 from service_config import get_service_config
+from core.image import validate_and_normalize_image, compute_phash
+from core.dispatch import resolve_services, compute_expected_downstream
+from core.results import fetch_results
 
-register_heif_opener()  # adds HEIC/HEIF support to PIL globally
 load_dotenv()
 
 app = Flask(__name__)
@@ -59,37 +57,8 @@ _MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 app.config['MAX_CONTENT_LENGTH'] = _MAX_UPLOAD_BYTES
 app.config['MAX_FORM_MEMORY_SIZE'] = _MAX_UPLOAD_BYTES
 
-# Longest dimension (px) to normalize to before queuing; resize is in-memory only.
-MAX_IMAGE_DIMENSION = int(os.getenv('MAX_IMAGE_DIMENSION', 2048))
-
 SERVICE_CONFIG_PATH = os.getenv('SERVICE_CONFIG_PATH', 'service_config.yaml')
 config = get_service_config(SERVICE_CONFIG_PATH)
-
-_VALID_TIERS = frozenset({'free', 'basic', 'premium', 'cloud'})
-
-# Age (seconds) after which a pending service_dispatch row with no result is considered stale.
-# Override per-service via environment variables; defaults apply if not set.
-_STALE_THRESHOLDS = {
-    'sam3':            int(os.getenv('STALE_SAM3_SEC',            '600')),
-    'face':            int(os.getenv('STALE_FACE_SEC',            '120')),
-    'pose':            int(os.getenv('STALE_POSE_SEC',            '120')),
-    'harmony':         int(os.getenv('STALE_HARMONY_SEC',         '60')),
-    'consensus':       int(os.getenv('STALE_CONSENSUS_SEC',       '60')),
-    'noun_consensus':  int(os.getenv('STALE_NOUN_CONSENSUS_SEC',  '60')),
-    'verb_consensus':  int(os.getenv('STALE_VERB_CONSENSUS_SEC',  '60')),
-    'caption_summary': int(os.getenv('STALE_CAPTION_SUMMARY_SEC', '120')),
-}
-_STALE_DEFAULT_SEC = int(os.getenv('STALE_DEFAULT_SEC', '300'))
-
-# Result tables to query for read-time reconciliation of system worker dispatch rows.
-# Keyed by service name; value is the SQL to check for any result for a given image_id.
-_SYSTEM_RECONCILE_QUERIES = {
-    'harmony':        "SELECT 1 FROM merged_boxes   WHERE image_id = %s LIMIT 1",
-    'consensus':      "SELECT 1 FROM consensus      WHERE image_id = %s LIMIT 1",
-    'noun_consensus': "SELECT 1 FROM noun_consensus WHERE image_id = %s LIMIT 1",
-    'verb_consensus': "SELECT 1 FROM verb_consensus WHERE image_id = %s LIMIT 1",
-    'caption_summary':"SELECT 1 FROM caption_summary WHERE image_id = %s LIMIT 1",
-}
 
 # ---------------------------------------------------------------------------
 # Security headers
@@ -212,129 +181,6 @@ def declare_queue(channel, queue_name):
 
 
 # ---------------------------------------------------------------------------
-# Image helpers
-# ---------------------------------------------------------------------------
-
-def validate_and_normalize_image(image_bytes):
-    """Validate image bytes and resize if necessary. No disk I/O ever.
-
-    PIL's verify() performs an integrity check but closes the stream and
-    invalidates the Image object, so we re-open from the original bytes
-    for actual processing.
-
-    Returns (normalized_bytes, width, height).
-    Raises ValueError with a safe message if the bytes are not a valid image.
-    """
-    try:
-        Image.open(io.BytesIO(image_bytes)).verify()
-    except Exception:
-        raise ValueError("Invalid or corrupt image")
-
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-        img.load()
-    except Exception:
-        raise ValueError("Failed to decode image")
-
-    original_format = img.format or 'JPEG'
-
-    # Normalize EXIF orientation so all downstream workers (VLMs, SAM3, etc.)
-    # receive pixels in display orientation. Without this, a portrait phone
-    # photo stored as landscape pixels with an EXIF rotation tag would cause
-    # bounding box coordinates to be in the raw (unrotated) space while the
-    # browser displays the image rotated — producing misaligned overlays.
-    transposed = ImageOps.exif_transpose(img)
-    orientation_changed = transposed is not img
-    img = transposed
-    width, height = img.size
-
-    # Formats that downstream workers (VLMs, SAM3, etc.) cannot handle.
-    # Always re-encode these to JPEG regardless of image dimensions.
-    _WEB_SAFE = {'JPEG', 'PNG', 'WEBP'}
-    needs_transcode = original_format not in _WEB_SAFE
-
-    if max(width, height) <= MAX_IMAGE_DIMENSION and not needs_transcode and not orientation_changed:
-        return image_bytes, width, height
-
-    # Resize if needed — all in memory, no temp files
-    if max(width, height) > MAX_IMAGE_DIMENSION:
-        ratio    = MAX_IMAGE_DIMENSION / max(width, height)
-        new_size = (max(1, int(width * ratio)), max(1, int(height * ratio)))
-        img      = img.resize(new_size, Image.LANCZOS)
-        width, height = img.size
-
-    save_format = original_format if original_format in _WEB_SAFE else 'JPEG'
-    if save_format == 'JPEG' and img.mode not in ('RGB', 'L'):
-        img = img.convert('RGB')
-
-    buf = io.BytesIO()
-    img.save(buf, format=save_format)
-    app.logger.info(
-        "%s -> %s %dx%d",
-        original_format, save_format, width, height,
-    )
-    return buf.getvalue(), width, height
-
-
-def compute_phash(image_bytes):
-    """Compute a 64-bit perceptual hash of the image. Returns a 16-char hex string."""
-    img = Image.open(io.BytesIO(image_bytes))
-    return str(imagehash.phash(img))
-
-
-def resolve_services(services_param, tier='free'):
-    """Resolve a comma-separated service list, or return tier-appropriate primary services."""
-    primary   = config.get_services_by_category('primary')
-    available = sorted(name.split('.', 1)[1] for name in primary.keys())
-
-    if not services_param:
-        tier_services = config.get_services_by_tier(tier)
-        return sorted(
-            name.split('.', 1)[1]
-            for name in tier_services.keys()
-            if name.startswith('primary.')
-        ), None
-
-    requested = [s.strip() for s in services_param.split(',')]
-    invalid   = [s for s in requested if s not in available]
-    if invalid:
-        return None, f"Unknown services: {', '.join(invalid)}. Available: {', '.join(available)}"
-    return requested, None
-
-
-def _compute_expected_downstream(services_submitted):
-    """Determine which downstream services are expected based on submitted primary services.
-
-    Returns a dict of {downstream_name: True/False} indicating whether each
-    downstream service is expected to eventually produce a result for this image.
-    Uses service_config.yaml definitions so the logic adapts when services change.
-    """
-    if not services_submitted:
-        return {}
-
-    has_consensus_service = any(
-        config.should_trigger_consensus(f'primary.{s}')
-        for s in services_submitted
-    )
-
-    vlm_services = [
-        s for s in services_submitted
-        if config.is_vlm_service(f'primary.{s}')
-    ]
-    has_vlm = len(vlm_services) > 0
-    has_multi_vlm = len(vlm_services) >= 2
-
-    return {
-        'consensus':        has_consensus_service,
-        'content_analysis': has_consensus_service,
-        'noun_consensus':   has_vlm,
-        'verb_consensus':   has_vlm,
-        'sam3':             has_vlm,
-        'caption_summary':  has_multi_vlm,
-    }
-
-
-# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -366,8 +212,9 @@ def analyze():
     image_group    = request.form.get('image_group', 'api')
     tier           = request.form.get('tier', 'free')
 
-    if tier not in _VALID_TIERS:
-        return jsonify({"error": f"Invalid tier '{tier}'. Valid tiers: {', '.join(sorted(_VALID_TIERS))}"}), 400
+    valid_tiers = config.get_valid_tiers()
+    if tier not in valid_tiers:
+        return jsonify({"error": f"Invalid tier '{tier}'. Valid tiers: {', '.join(sorted(valid_tiers))}"}), 400
 
     if not image_bytes:
         return jsonify({"error": "Empty image data"}), 400
@@ -386,7 +233,7 @@ def analyze():
         app.logger.warning("Perceptual hash computation failed: %s", e)
 
     # Validate services
-    service_names, err = resolve_services(services_param, tier)
+    service_names, err = resolve_services(services_param, tier, config)
     if err:
         return jsonify({"error": err}), 400
 
@@ -464,281 +311,6 @@ def analyze():
     }), 202
 
 
-def _fetch_results(cur, image_id):
-    """Fetch all results data for an image. Shared by status and results endpoints."""
-    # Service results
-    cur.execute(
-        """SELECT service, data, status, processing_time, result_created
-           FROM results WHERE image_id = %s AND status = 'success'
-           ORDER BY result_created""",
-        (image_id,),
-    )
-    service_results = {}
-    for r in cur.fetchall():
-        service_results[r['service']] = {
-            "data":            r['data'],
-            "processing_time": r['processing_time'],
-            "result_created":  r['result_created'].isoformat() if r['result_created'] else None,
-        }
-
-    # Harmonized boxes
-    cur.execute(
-        "SELECT merged_id, merged_data, status, created FROM merged_boxes WHERE image_id = %s",
-        (image_id,),
-    )
-    merged_boxes = []
-    for r in cur.fetchall():
-        row_dict = dict(r)
-        if row_dict.get('created'):
-            row_dict['created'] = row_dict['created'].isoformat()
-        merged_boxes.append(row_dict)
-
-    # Consensus
-    cur.execute(
-        """SELECT consensus_data, processing_time, consensus_created
-           FROM consensus WHERE image_id = %s
-           ORDER BY consensus_created DESC LIMIT 1""",
-        (image_id,),
-    )
-    consensus_row = cur.fetchone()
-    consensus = None
-    if consensus_row:
-        consensus = {
-            "consensus_data":    consensus_row['consensus_data'],
-            "processing_time":   consensus_row['processing_time'],
-            "consensus_created": consensus_row['consensus_created'].isoformat() if consensus_row['consensus_created'] else None,
-        }
-
-    # Content analysis
-    cur.execute(
-        """SELECT scene_type, intimacy_level, activities_detected, people_count,
-                  gender_breakdown, anatomy_exposed, spatial_relationships,
-                  person_attributions, semantic_validation, full_analysis, created
-           FROM content_analysis WHERE image_id = %s""",
-        (image_id,),
-    )
-    content_row      = cur.fetchone()
-    content_analysis = dict(content_row) if content_row else None
-    if content_analysis and content_analysis.get('created'):
-        content_analysis['created'] = content_analysis['created'].isoformat()
-
-    # Postprocessing — also resolve source_bbox for canvas coordinate transforms.
-    # For merged_box rows: bbox lives in merged_boxes.merged_data.merged_bbox.
-    # For SAM3 rows (merged_box_id IS NULL): cluster_id in data.cluster_id lets us
-    # look up the instance bbox from sam3_results.
-    cur.execute(
-        """SELECT p.service, p.merged_box_id, p.data, p.processing_time,
-                  mb.merged_data->'merged_bbox' AS source_bbox
-           FROM postprocessing p
-           LEFT JOIN merged_boxes mb ON mb.merged_id = p.merged_box_id
-           WHERE p.image_id = %s AND p.status = 'success'""",
-        (image_id,),
-    )
-    postprocessing = [dict(r) for r in cur.fetchall()]
-
-    # Noun consensus
-    cur.execute(
-        """SELECT nouns, category_tally, services_present, service_count, created_at, updated_at
-           FROM noun_consensus WHERE image_id = %s""",
-        (image_id,),
-    )
-    noun_consensus_row = cur.fetchone()
-    noun_consensus     = None
-    if noun_consensus_row:
-        all_nouns      = noun_consensus_row['nouns'] or []
-        consensus_nouns = [n for n in all_nouns if n.get('confidence', 0) > 0.5 or n.get('promoted', False)]
-        noun_consensus = {
-            "nouns":            consensus_nouns,
-            "nouns_all":        all_nouns,
-            "category_tally":   noun_consensus_row['category_tally'] or [],
-            "services_present": noun_consensus_row['services_present'],
-            "service_count":    noun_consensus_row['service_count'],
-            "created_at":       noun_consensus_row['created_at'].isoformat() if noun_consensus_row['created_at'] else None,
-            "updated_at":       noun_consensus_row['updated_at'].isoformat() if noun_consensus_row['updated_at'] else None,
-        }
-
-    # SAM3 segmentation results
-    cur.execute(
-        """SELECT nouns_queried, data, instance_count, processing_time, created_at, updated_at
-           FROM sam3_results WHERE image_id = %s""",
-        (image_id,),
-    )
-    sam3_row    = cur.fetchone()
-    sam3_results = None
-    if sam3_row:
-        sam3_results = {
-            "nouns_queried":  sam3_row['nouns_queried'],
-            "results":        sam3_row['data'],
-            "instance_count": sam3_row['instance_count'],
-            "processing_time": sam3_row['processing_time'],
-            "created_at":     sam3_row['created_at'].isoformat() if sam3_row['created_at'] else None,
-            "updated_at":     sam3_row['updated_at'].isoformat() if sam3_row['updated_at'] else None,
-        }
-
-    # Verb consensus
-    cur.execute(
-        """SELECT verbs, svo_triples, services_present, service_count, created_at, updated_at
-           FROM verb_consensus WHERE image_id = %s""",
-        (image_id,),
-    )
-    verb_consensus_row = cur.fetchone()
-    verb_consensus     = None
-    if verb_consensus_row:
-        verb_consensus = {
-            "verbs":            verb_consensus_row['verbs'] or [],
-            "svo_triples":      verb_consensus_row['svo_triples'] or {},
-            "services_present": verb_consensus_row['services_present'],
-            "service_count":    verb_consensus_row['service_count'],
-            "created_at":       verb_consensus_row['created_at'].isoformat() if verb_consensus_row['created_at'] else None,
-            "updated_at":       verb_consensus_row['updated_at'].isoformat() if verb_consensus_row['updated_at'] else None,
-        }
-
-    # Caption summary
-    cur.execute(
-        """SELECT summary_caption, model, services_present, service_count, created_at, updated_at
-           FROM caption_summary WHERE image_id = %s""",
-        (image_id,),
-    )
-    caption_summary_row = cur.fetchone()
-    caption_summary     = None
-    if caption_summary_row:
-        caption_summary = {
-            "summary_caption":  caption_summary_row['summary_caption'],
-            "model":            caption_summary_row['model'],
-            "services_present": caption_summary_row['services_present'],
-            "service_count":    caption_summary_row['service_count'],
-            "created_at":       caption_summary_row['created_at'].isoformat() if caption_summary_row['created_at'] else None,
-            "updated_at":       caption_summary_row['updated_at'].isoformat() if caption_summary_row['updated_at'] else None,
-        }
-
-    # Service dispatch — one row per (service, cluster_id), latest by dispatched_at.
-    # DISTINCT ON gives the most recent dispatch per (service, cluster_id) pair so that
-    # re-harmonization re-dispatches show the current status, not stale earlier ones.
-    cur.execute(
-        """SELECT DISTINCT ON (service, cluster_id)
-                  service, cluster_id, status, dispatched_at
-           FROM service_dispatch
-           WHERE image_id = %s
-           ORDER BY service, cluster_id NULLS LAST, dispatched_at DESC""",
-        (image_id,),
-    )
-    service_dispatch = []
-    for r in cur.fetchall():
-        row = dict(r)
-        if row.get('dispatched_at'):
-            row['dispatched_at'] = row['dispatched_at'].isoformat()
-        service_dispatch.append(row)
-
-    # Read-time reconciliation: result tables are authoritative.
-    # A dispatch row stuck in 'pending' despite a completed result means the worker
-    # crashed between writing the result and updating the dispatch row — treat as complete.
-    pending = [r for r in service_dispatch if r['status'] == 'pending']
-    if pending:
-        # Primary services (image-level, not sam3): check results table
-        primary_pending_svcs = [
-            r['service'] for r in pending
-            if r['cluster_id'] is None and r['service'] != 'sam3'
-        ]
-        if primary_pending_svcs:
-            cur.execute(
-                "SELECT DISTINCT service FROM results WHERE image_id = %s AND service = ANY(%s)",
-                (image_id, primary_pending_svcs),
-            )
-            results_found = {row['service'] for row in cur.fetchall()}
-            for r in pending:
-                if r['service'] in results_found and r['cluster_id'] is None:
-                    r['status'] = 'complete'
-
-        # SAM3: check sam3_results table
-        sam3_pending = [r for r in pending if r['service'] == 'sam3' and r['status'] == 'pending']
-        if sam3_pending:
-            cur.execute("SELECT 1 FROM sam3_results WHERE image_id = %s LIMIT 1", (image_id,))
-            if cur.fetchone():
-                for r in sam3_pending:
-                    r['status'] = 'complete'
-
-        # Face/pose (bbox-level): check postprocessing table by (service, cluster_id)
-        bbox_pending = [r for r in pending if r['cluster_id'] is not None and r['status'] == 'pending']
-        if bbox_pending:
-            pending_cluster_ids = [r['cluster_id'] for r in bbox_pending]
-            pending_services    = list({r['service'] for r in bbox_pending})
-            cur.execute(
-                """SELECT DISTINCT service, data->>'cluster_id' AS cluster_id
-                   FROM postprocessing
-                   WHERE image_id = %s AND service = ANY(%s)
-                     AND data->>'cluster_id' = ANY(%s)""",
-                (image_id, pending_services, pending_cluster_ids),
-            )
-            post_found = {(row['service'], row['cluster_id']) for row in cur.fetchall()}
-            for r in bbox_pending:
-                if (r['service'], r['cluster_id']) in post_found:
-                    r['status'] = 'complete'
-
-        # System workers (harmony, consensus, noun/verb consensus, caption_summary):
-        # check each worker's result table to catch the crash-between-result-and-update case.
-        system_pending = [
-            r for r in pending
-            if r['cluster_id'] is None
-            and r['service'] in _SYSTEM_RECONCILE_QUERIES
-            and r['status'] == 'pending'
-        ]
-        for r in system_pending:
-            cur.execute(_SYSTEM_RECONCILE_QUERIES[r['service']], (image_id,))
-            if cur.fetchone():
-                r['status'] = 'complete'
-
-    # Stale detection: pending + no result + past age threshold → 'stale' at read time.
-    # This is never written to the DB; it is a computed property for the caller.
-    now_utc = datetime.now(timezone.utc)
-    for r in service_dispatch:
-        if r['status'] != 'pending':
-            continue
-        threshold = _STALE_THRESHOLDS.get(r['service'], _STALE_DEFAULT_SEC)
-        dispatched_str = r.get('dispatched_at')
-        if dispatched_str:
-            try:
-                dispatched_at = datetime.fromisoformat(dispatched_str)
-                if dispatched_at.tzinfo is None:
-                    dispatched_at = dispatched_at.replace(tzinfo=timezone.utc)
-                if (now_utc - dispatched_at).total_seconds() > threshold:
-                    r['status'] = 'stale'
-            except Exception:
-                pass
-
-    # Resolve source_bbox for SAM3-dispatched postprocessing rows (merged_box_id IS NULL).
-    # These rows store cluster_id = "sam3:noun:idx" in data; use it to look up the
-    # instance bbox from sam3_results so the console can draw pose skeletons.
-    if sam3_results:
-        sam3_data = sam3_results.get('results') or {}
-        for row in postprocessing:
-            if row.get('source_bbox') is not None:
-                continue  # already resolved via merged_boxes JOIN
-            cluster_id = (row.get('data') or {}).get('cluster_id', '')
-            if not cluster_id.startswith('sam3:'):
-                continue
-            parts = cluster_id.split(':')
-            if len(parts) == 3:
-                _, noun, idx_str = parts
-                try:
-                    inst = sam3_data.get(noun, {}).get('instances', [])[int(idx_str)]
-                    row['source_bbox'] = inst.get('bbox')
-                except (IndexError, ValueError, TypeError):
-                    pass
-
-    return {
-        "service_results":  service_results,
-        "merged_boxes":     merged_boxes,
-        "consensus":        consensus,
-        "content_analysis": content_analysis,
-        "postprocessing":   postprocessing,
-        "noun_consensus":   noun_consensus,
-        "sam3":             sam3_results,
-        "verb_consensus":   verb_consensus,
-        "caption_summary":  caption_summary,
-        "service_dispatch": service_dispatch,
-    }
-
-
 @app.route('/status/<int:image_id>', methods=['GET'])
 def status(image_id):
     """Check processing status and progressive results for an image."""
@@ -777,13 +349,13 @@ def status(image_id):
         total = len(services_submitted) if services_submitted else 0
         done  = len(completed)
 
-        results_data = _fetch_results(cur, image_id)
+        results_data = fetch_results(cur, image_id)
 
         vlm_short_names = {k.split('.', 1)[1] for k in config.get_services_by_type('vlm')}
         vlm_services = [s for s in services_submitted if s in vlm_short_names]
 
         primary_complete     = done == total and total > 0
-        expected_downstream  = _compute_expected_downstream(services_submitted)
+        expected_downstream  = compute_expected_downstream(services_submitted, config)
         downstream_pending   = [
             svc for svc, expected in expected_downstream.items()
             if expected and results_data.get(svc) is None
@@ -834,7 +406,7 @@ def results(image_id):
         if not image_row:
             return jsonify({"error": "Image not found"}), 404
 
-        results_data = _fetch_results(cur, image_id)
+        results_data = fetch_results(cur, image_id)
 
         return jsonify({
             "image_id":           image_id,

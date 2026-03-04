@@ -197,6 +197,25 @@ class ServiceConfig:
                     names.add(service_name)
         return sorted(names)
 
+    def get_valid_tiers(self) -> frozenset:
+        """Return the set of all customer-facing tier names defined in service_config.yaml.
+
+        Excludes 'system' — that is an internal routing tag, not a customer tier.
+        Derived from the config so adding a new tier automatically makes it valid.
+        Result is cached on the instance — the scan runs once per process.
+        """
+        if not hasattr(self, '_valid_tiers_cache'):
+            tiers = set()
+            for category, services in self.raw_config['services'].items():
+                for service_config in services.values():
+                    if not service_config:
+                        continue
+                    for t in (service_config.get('tier') or []):
+                        if t != 'system':
+                            tiers.add(t)
+            self._valid_tiers_cache = frozenset(tiers)
+        return self._valid_tiers_cache
+
 # Global singleton instance
 _config_instance = None
 
