@@ -28,40 +28,12 @@ class PostProcessingWorker(BaseWorker):
             # For postprocessing services that might not have HTTP endpoints
             self.service_url = None
     
-    def start(self):
-        """Start the postprocessing worker - setup database transactions"""
-        self.logger.info(f"Starting {self.service_name} postprocessing worker ({self.worker_id})")
-        
-        # Connect to services (from base worker)
-        if not self.connect_to_database():
-            sys.exit(1)
-        if not self.connect_to_queue():
-            sys.exit(1)
-        
-        # Configure database for transactions (needed for FK handling in postprocessing)
-        if self.db_conn:
-            self.db_conn.autocommit = False
-
-        self._start_registry()
-
-        # Start consuming with our custom message processor
-        self.channel.basic_consume(
-            queue=self.queue_name,
-            on_message_callback=self.process_message
-        )
-        
-        self.logger.info("Waiting for postprocessing messages. Press CTRL+C to exit")
-        try:
-            self.channel.start_consuming()
-        except KeyboardInterrupt:
-            self.logger.info("Stopping worker...")
-            self.channel.stop_consuming()
-            self.connection.close()
-            self._stop_registry()
-        finally:
-            if self.db_conn:
-                self.db_conn.close()
-            self.logger.info(f"{self.service_name} postprocessing worker stopped")
+    def connect_to_database(self):
+        """Connect to DB and set autocommit=False for FK-safe transaction handling."""
+        if not super().connect_to_database():
+            return False
+        self.db_conn.autocommit = False
+        return True
     
     def process_service(self, cropped_image_data):
         """Process the cropped image with the specific service - override in subclasses"""

@@ -620,6 +620,12 @@ class BaseWorker:
         in-place extrapolation that belongs to the same service."""
         pass
 
+    def _cleanup(self):
+        """Hook called during shutdown, after the consume loop exits but before
+        the main DB connection is closed. Override in subclasses to close extra
+        connections (e.g. read_db_conn) or flush other resources."""
+        pass
+
     def _new_db_connection(self, autocommit=True):
         """Create a new PostgreSQL connection using the worker's config.
         Subclasses should use this for any additional connections (e.g. read replicas)."""
@@ -910,6 +916,7 @@ class BaseWorker:
                     except Exception:
                         pass
 
+        self._cleanup()
         if self.db_conn:
             self.db_conn.close()
         self.logger.info(f"{self.service_name} worker stopped")

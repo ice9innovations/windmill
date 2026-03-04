@@ -314,7 +314,7 @@ class HarmonyWorker(BaseWorker):
             self.logger.error(f"Failed to publish to {queue_name}: {e}")
             raise
     
-    def process_queue_message(self, ch, method, properties, body):
+    def process_message(self, ch, method, properties, body):
         """Process a single queue message"""
         try:
             # Parse message
@@ -1201,75 +1201,13 @@ class HarmonyWorker(BaseWorker):
     
     
     
-    def run(self):
-        """Main entry point - pure queue-based processing"""
-        self.logger.info(f"Starting harmony worker in QUEUE MODE ({self.worker_id})")
-        self.logger.info(f"Queue: {self.queue_name} → postprocessing queues")
-        
-        if not self.connect_to_database():
-            return 1
-
-        if not self.connect_to_queue():
-            return 1
-
-        self._start_registry()
-
-        # Consume with reconnect loop
-        while True:
-            try:
-                self.queue_channel.basic_consume(
-                    queue=self.queue_name,
-                    on_message_callback=self.process_queue_message
-                )
-                self.logger.info("Waiting for harmony messages. Press CTRL+C to exit")
-                self.queue_channel.start_consuming()
-            except KeyboardInterrupt:
-                self.logger.info("Stopping harmony worker...")
-                try:
-                    self.queue_channel.stop_consuming()
-                except Exception:
-                    pass
-                self._stop_registry()
-                break
-            except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
-                    pika.exceptions.StreamLostError) as e:
-                self.logger.warning(f"Queue connection lost: {e}. Reconnecting...")
-                time.sleep(self.retry_delay)
-                if not self.connect_to_queue():
-                    self.logger.warning("Reconnect failed, retrying...")
-                    time.sleep(self.retry_delay)
-                    continue
-
-        self.cleanup_connections()
-
-        return 0
-    
-    def cleanup_connections(self):
-        """Clean up all connections"""
-        
-        if self.db_conn:
-            self.db_conn.close()
+    def _cleanup(self):
         if self.read_db_conn:
             self.read_db_conn.close()
         if self.queue_connection and not self.queue_connection.is_closed:
             self.queue_connection.close()
-        
-        self.logger.info("Harmony worker stopped")
-    
 
-def main():
-    """Main entry point"""
-    try:
-        worker = HarmonyWorker()
-        return worker.run()
-        
-    except ValueError as e:
-        print(f"Configuration error: {e}")
-        return 1
-    except Exception as e:
-        print(f"Harmony worker error: {e}")
-        return 1
 
 if __name__ == "__main__":
-    import sys
-    sys.exit(main())
+    worker = HarmonyWorker()
+    worker.start()
