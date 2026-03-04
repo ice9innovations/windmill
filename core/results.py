@@ -6,42 +6,9 @@ for opening the connection and cursor.
 
 NOTE on ice9-api usage: ice9-api adds per-account ownership filtering
 (AND account_id = %s) to protect against IDOR. That is a business rule, not
-pipeline logic. ice9-api should not call fetch_results() directly for
-user-facing endpoints; it should either wrap this function and re-query with
-ownership constraints, or keep its own _fetch_results locally and call the
-smaller helpers here (fetch_service_results, fetch_consensus, etc.) individually.
+pipeline logic. ice9-api keeps its own _fetch_results locally; this module is
+not imported by ice9-api.
 """
-import os
-from datetime import datetime, timezone
-
-# ---------------------------------------------------------------------------
-# Stale detection constants
-# ---------------------------------------------------------------------------
-# Age (seconds) after which a pending service_dispatch row with no result is
-# considered stale. These exist only until job lifecycle events (failed /
-# dead-lettered writes from workers) are confirmed working in production, at
-# which point this entire module's stale logic and _SYSTEM_RECONCILE_QUERIES
-# can be deleted and replaced with a direct status read.
-
-_STALE_THRESHOLDS = {
-    'sam3':            int(os.getenv('STALE_SAM3_SEC',            '600')),
-    'face':            int(os.getenv('STALE_FACE_SEC',            '120')),
-    'pose':            int(os.getenv('STALE_POSE_SEC',            '120')),
-    'harmony':         int(os.getenv('STALE_HARMONY_SEC',         '60')),
-    'consensus':       int(os.getenv('STALE_CONSENSUS_SEC',       '60')),
-    'noun_consensus':  int(os.getenv('STALE_NOUN_CONSENSUS_SEC',  '60')),
-    'verb_consensus':  int(os.getenv('STALE_VERB_CONSENSUS_SEC',  '60')),
-    'caption_summary': int(os.getenv('STALE_CAPTION_SUMMARY_SEC', '120')),
-}
-_STALE_DEFAULT_SEC = int(os.getenv('STALE_DEFAULT_SEC', '300'))
-
-_SYSTEM_RECONCILE_QUERIES = {
-    'harmony':        "SELECT 1 FROM merged_boxes    WHERE image_id = %s LIMIT 1",
-    'consensus':      "SELECT 1 FROM consensus       WHERE image_id = %s LIMIT 1",
-    'noun_consensus': "SELECT 1 FROM noun_consensus  WHERE image_id = %s LIMIT 1",
-    'verb_consensus': "SELECT 1 FROM verb_consensus  WHERE image_id = %s LIMIT 1",
-    'caption_summary':"SELECT 1 FROM caption_summary WHERE image_id = %s LIMIT 1",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -214,79 +181,6 @@ def fetch_results(cur, image_id):
         if row.get('dispatched_at'):
             row['dispatched_at'] = row['dispatched_at'].isoformat()
         service_dispatch.append(row)
-
-    # Read-time reconciliation: result tables are authoritative.
-    # A dispatch row stuck in 'pending' despite a completed result means the worker
-    # crashed between writing the result and updating the dispatch row.
-    pending = [r for r in service_dispatch if r['status'] == 'pending']
-    if pending:
-        primary_pending_svcs = [
-            r['service'] for r in pending
-            if r['cluster_id'] is None and r['service'] != 'sam3'
-        ]
-        if primary_pending_svcs:
-            cur.execute(
-                "SELECT DISTINCT service FROM results WHERE image_id = %s AND service = ANY(%s)",
-                (image_id, primary_pending_svcs),
-            )
-            results_found = {row['service'] for row in cur.fetchall()}
-            for r in pending:
-                if r['service'] in results_found and r['cluster_id'] is None:
-                    r['status'] = 'complete'
-
-        sam3_pending = [r for r in pending if r['service'] == 'sam3' and r['status'] == 'pending']
-        if sam3_pending:
-            cur.execute("SELECT 1 FROM sam3_results WHERE image_id = %s LIMIT 1", (image_id,))
-            if cur.fetchone():
-                for r in sam3_pending:
-                    r['status'] = 'complete'
-
-        bbox_pending = [r for r in pending if r['cluster_id'] is not None and r['status'] == 'pending']
-        if bbox_pending:
-            pending_cluster_ids = [r['cluster_id'] for r in bbox_pending]
-            pending_services    = list({r['service'] for r in bbox_pending})
-            cur.execute(
-                """SELECT DISTINCT service, data->>'cluster_id' AS cluster_id
-                   FROM postprocessing
-                   WHERE image_id = %s AND service = ANY(%s)
-                     AND data->>'cluster_id' = ANY(%s)""",
-                (image_id, pending_services, pending_cluster_ids),
-            )
-            post_found = {(row['service'], row['cluster_id']) for row in cur.fetchall()}
-            for r in bbox_pending:
-                if (r['service'], r['cluster_id']) in post_found:
-                    r['status'] = 'complete'
-
-        system_pending = [
-            r for r in pending
-            if r['cluster_id'] is None
-            and r['service'] in _SYSTEM_RECONCILE_QUERIES
-            and r['status'] == 'pending'
-        ]
-        for r in system_pending:
-            cur.execute(_SYSTEM_RECONCILE_QUERIES[r['service']], (image_id,))
-            if cur.fetchone():
-                r['status'] = 'complete'
-
-    # Stale detection: pending + no result + past age threshold → 'stale'.
-    # Computed at read time, never written to DB.
-    # Delete this block once failed/dead-lettered lifecycle writes are confirmed
-    # working in production — at that point status is authoritative.
-    now_utc = datetime.now(timezone.utc)
-    for r in service_dispatch:
-        if r['status'] != 'pending':
-            continue
-        threshold     = _STALE_THRESHOLDS.get(r['service'], _STALE_DEFAULT_SEC)
-        dispatched_str = r.get('dispatched_at')
-        if dispatched_str:
-            try:
-                dispatched_at = datetime.fromisoformat(dispatched_str)
-                if dispatched_at.tzinfo is None:
-                    dispatched_at = dispatched_at.replace(tzinfo=timezone.utc)
-                if (now_utc - dispatched_at).total_seconds() > threshold:
-                    r['status'] = 'stale'
-            except Exception:
-                pass
 
     # Resolve source_bbox for SAM3-dispatched postprocessing rows.
     if sam3_results:
