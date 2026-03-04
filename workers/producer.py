@@ -65,6 +65,15 @@ class ProducerConfig:
     def get_primary_services(self):
         """Get services that run on whole images (excludes postprocessing-only services)"""
         return self.get_services_by_category('primary')
+
+    def get_primary_services_by_tier(self, tier):
+        """Get primary services available for a specific tier"""
+        tier_services = self.config.get_services_by_tier(tier)
+        return sorted(
+            name.split('.', 1)[1]
+            for name in tier_services.keys()
+            if name.startswith('primary.')
+        )
     
     def get_queue_name(self, service_name):
         """Get queue name for a service (expects service_name without category prefix)"""
@@ -327,7 +336,7 @@ class GenericProducer:
             print(f"❌ Error submitting to {queue_name}: {e}")
             return False
     
-    def submit_jobs(self, service_names, cursor, delay=0.01):
+    def submit_jobs(self, service_names, cursor, delay=0.01, tier='free'):
         """Submit jobs for multiple services and images using streaming cursor"""
         submitted_jobs = 0
         processed_images = 0
@@ -357,6 +366,7 @@ class GenericProducer:
                     job_data['trace_id'] = trace_id
                     job_data['service_name'] = service_name
                     job_data['queue_name'] = queue_name
+                    job_data['tier'] = tier
                     
                     if self.submit_job(queue_name, job_data):
                         submitted_jobs += 1
@@ -420,6 +430,11 @@ def main():
 
     parser.add_argument('--services', '-s',
                        help='Comma-separated services to run (e.g., "rtmdet,yolo_v8") or "all" for all primary services')
+
+    parser.add_argument('--tier', '-t',
+                       default='free',
+                       choices=['free', 'basic', 'premium', 'cloud'],
+                       help='Customer tier for service selection (default: free). Ignored when --services is specified.')
 
     args = parser.parse_args()
     
@@ -490,8 +505,9 @@ def main():
 
                 service_names = requested_services
         else:
-            # Default to all primary services
-            service_names = producer.config.get_primary_services()
+            # Default to tier-appropriate primary services
+            service_names = producer.config.get_primary_services_by_tier(args.tier)
+            print(f"🏷️  Tier: {args.tier}")
 
         print(f"🎯 Target services: {', '.join(service_names)}")
         
@@ -509,7 +525,7 @@ def main():
             return 1
         
         # Submit jobs using streaming
-        submitted = producer.submit_jobs(service_names, cursor, args.delay)
+        submitted = producer.submit_jobs(service_names, cursor, args.delay, args.tier)
         
         print(f"🎉 Processing complete! {submitted} jobs submitted.")
         

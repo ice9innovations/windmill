@@ -58,6 +58,7 @@ class Sam3Worker(BaseWorker):
             image_data = message.get('image_data')
             nouns = message.get('nouns', [])
             subject_noun = message.get('subject_noun')
+            tier = message.get('tier', 'free')
 
             if not image_data:
                 self.logger.error(f"sam3: no image_data in message for image {image_id}")
@@ -67,7 +68,7 @@ class Sam3Worker(BaseWorker):
 
             if not nouns:
                 self.logger.info(f"sam3: no nouns to query for image {image_id}, skipping")
-                self._trigger_caption_summary(image_id, image_data)
+                self._trigger_caption_summary(image_id, image_data, tier)
                 self._safe_ack(ch, method.delivery_tag)
                 return
 
@@ -171,7 +172,7 @@ class Sam3Worker(BaseWorker):
             self._validate_noun_consensus(image_id, results)
 
             # Trigger caption synthesis now that noun consensus is finalized
-            self._trigger_caption_summary(image_id, image_data)
+            self._trigger_caption_summary(image_id, image_data, tier)
 
             # Trigger rembg refinement if _subject was set — re-runs background
             # removal with the subject mask applied, improving on any blind first pass.
@@ -572,7 +573,7 @@ class Sam3Worker(BaseWorker):
         except Exception as e:
             self.logger.error(f"sam3: failed to trigger rembg for image {image_id}: {e}")
 
-    def _trigger_caption_summary(self, image_id: int, image_data: str = None):
+    def _trigger_caption_summary(self, image_id: int, image_data: str = None, tier: str = 'free'):
         """Publish image_id (and image bytes) to the caption_summary queue for synthesis."""
         try:
             queue = self._get_queue_name('system.caption_summary')
@@ -585,7 +586,7 @@ class Sam3Worker(BaseWorker):
             self.channel.basic_publish(
                 exchange='',
                 routing_key=queue,
-                body=json.dumps({'image_id': image_id, 'image_data': image_data}),
+                body=json.dumps({'image_id': image_id, 'image_data': image_data, 'tier': tier}),
                 properties=pika.BasicProperties(delivery_mode=2)
             )
             self.logger.info(f"sam3: triggered caption_summary for image {image_id}")

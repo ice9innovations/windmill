@@ -166,6 +166,37 @@ class ServiceConfig:
         """Get list of all spatial service names"""
         return list(self.get_services_by_type('spatial').keys())
 
+    def get_services_by_tier(self, tier: str) -> Dict[str, Dict[str, Any]]:
+        """Get all services available in a specific tier"""
+        matching_services = {}
+
+        for category, services in self.raw_config['services'].items():
+            for service_name, service_config in services.items():
+                if not service_config:
+                    continue
+
+                if tier in (service_config.get('tier') or []):
+                    full_name = f"{category}.{service_name}"
+                    config = service_config.copy()
+                    config['category'] = category
+                    if 'queue_name' not in config:
+                        config['queue_name'] = service_name
+                    matching_services[full_name] = config
+
+        return matching_services
+
+    def get_all_tiered_service_names(self) -> List[str]:
+        """Get short names of all customer-facing tiered services (excludes tier: system)"""
+        names = set()
+        for category, services in self.raw_config['services'].items():
+            for service_name, service_config in services.items():
+                if not service_config:
+                    continue
+                tiers = service_config.get('tier') or []
+                if tiers and tiers != ['system']:
+                    names.add(service_name)
+        return sorted(names)
+
 # Global singleton instance
 _config_instance = None
 

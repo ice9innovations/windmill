@@ -19,6 +19,7 @@ are confirmed equivalent. Lone nouns always keep their surface form.
 
 import logging
 import os
+from functools import lru_cache
 from typing import Dict, List, Set
 
 logger = logging.getLogger(__name__)
@@ -292,6 +293,7 @@ def _are_conceptnet_synonyms(noun1: str, noun2: str) -> bool:
     return False
 
 
+@lru_cache(maxsize=2048)
 def _get_synsets(noun: str) -> List[str]:
     """
     Return synset names for a noun in WordNet's order (most common sense first).
@@ -310,6 +312,7 @@ def _get_synsets(noun: str) -> List[str]:
     return [s.name() for s in synsets[:1]]
 
 
+@lru_cache(maxsize=2048)
 def _synset_canonical(synset_name: str) -> str:
     """First lemma name of a synset - used as the label for a matched group."""
     if not _check_wordnet():

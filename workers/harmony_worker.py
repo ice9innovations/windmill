@@ -24,6 +24,11 @@ SMALL_OBJECT_AREA = 1024  # COCO small object definition (32x32 pixels)
 SMALL_OBJECT_DISTANCE = 20  # ~3% of 640px width for small objects
 # MINIMUM_CONFIDENCE = 0.4  # Confidence filtering moved to consensus worker
 
+# Minimum bounding box size for postprocessing dispatch.
+# Filters out garbage harmonization artifacts; not a meaningful ML threshold.
+# Face/pose are YOLO-gated so real person boxes are already meaningful.
+MIN_POSTPROCESSING_SIZE = (8, 8)
+
 # Extensible merge rules: containment-based merging where smaller objects get absorbed into larger ones
 CONTAINMENT_MERGE_RULES = [
     {
@@ -233,27 +238,25 @@ class HarmonyWorker(BaseWorker):
                         'bbox': merged_bbox,
                         'cropped_image_data': cropped_image_data.decode('latin-1')  # Encode bytes for JSON
                     }
-                    # Propagate trace_id if present on harmony input
+                    # Propagate trace_id and tier from harmony input
                     if hasattr(self, 'current_trace_id') and self.current_trace_id:
                         base_message['trace_id'] = self.current_trace_id
+                    base_message['tier'] = getattr(self, 'current_tier', 'free')
                     
-                    # Dispatch postprocessing for boxes >= 24x24 pixels (filter out tiny icons)
                     width = merged_bbox.get('width', 0)
                     height = merged_bbox.get('height', 0)
-                    if width >= 24 and height >= 24:
-                        self.publish_bbox_message(self.postprocessing_queues['colors'], base_message)
-                        self.logger.debug(f"Dispatched colors for {width}x{height} box")
+                    if width < MIN_POSTPROCESSING_SIZE[0] or height < MIN_POSTPROCESSING_SIZE[1]:
+                        self.logger.debug(f"Skipped postprocessing for {width}x{height} box (below 8x8 minimum)")
+                        continue
 
-                        # Dispatch face and pose for person-emoji boxes
-                        box_emoji = normalize_person_emoji(instance.get('emoji', ''))
-                        if box_emoji == '🧑':
-                            self.publish_bbox_message(self.postprocessing_queues['face'], base_message)
-                            self.publish_bbox_message(self.postprocessing_queues['pose'], base_message)
-                            self._record_service_dispatch(image_id, 'face', cluster_id)
-                            self._record_service_dispatch(image_id, 'pose', cluster_id)
-                            self.logger.debug(f"Dispatched face/pose for {width}x{height} person box")
-                    else:
-                        self.logger.debug(f"Skipped postprocessing for {width}x{height} box (too small)")
+                    self.publish_bbox_message(self.postprocessing_queues['colors'], base_message)
+
+                    box_emoji = normalize_person_emoji(instance.get('emoji', ''))
+                    if box_emoji == '🧑':
+                        self.publish_bbox_message(self.postprocessing_queues['face'], base_message)
+                        self.publish_bbox_message(self.postprocessing_queues['pose'], base_message)
+                        self._record_service_dispatch(image_id, 'face', cluster_id)
+                        self._record_service_dispatch(image_id, 'pose', cluster_id)
                     
         except Exception as e:
             self.logger.error(f"Error in dispatch_bbox_postprocessing: {e}")
@@ -319,8 +322,9 @@ class HarmonyWorker(BaseWorker):
         try:
             # Parse message
             message = json.loads(body)
-            # Capture trace_id for propagation to postprocessing
+            # Capture trace_id and tier for propagation to postprocessing
             self.current_trace_id = message.get('trace_id')
+            self.current_tier = message.get('tier', 'free')
             self.logger.debug(f"Processing queue message: {message}")
             
             # Extract image info

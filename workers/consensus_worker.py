@@ -92,8 +92,11 @@ class ConsensusWorkerMergeFocused(BaseWorker):
             self.logger.warning(f"Read database connection unhealthy: {e}")
             return self.connect_to_database()
 
-    def trigger_content_analysis(self, image_id, image_filename):
-        """Trigger content analysis after consensus completes"""
+    def trigger_content_analysis(self, image_id, image_filename, tier='free'):
+        """Trigger content analysis after consensus completes (basic+ tiers only)"""
+        if tier == 'free':
+            return True
+
         try:
             # Check if connection is healthy
             if not self.channel or self.connection.is_closed:
@@ -107,7 +110,8 @@ class ConsensusWorkerMergeFocused(BaseWorker):
                 'image_filename': image_filename,
                 'triggered_by': 'consensus',
                 'worker_id': self.worker_id,
-                'triggered_at': datetime.now().isoformat()
+                'triggered_at': datetime.now().isoformat(),
+                'tier': tier,
             }
 
             self.channel.basic_publish(
@@ -338,9 +342,29 @@ class ConsensusWorkerMergeFocused(BaseWorker):
         semantic_detections = [d for d in all_detections if d['evidence_type'] == 'semantic']
         classification_detections = [d for d in all_detections if d['evidence_type'] == 'classification']
 
+        # Pre-build emoji→detections dicts to avoid O(n) rescans per bbox
+        sem_by_emoji = {}
+        for d in semantic_detections:
+            key = normalize_emoji(d['emoji'])
+            sem_by_emoji.setdefault(key, []).append(d)
+
+        cls_by_emoji = {}
+        for d in classification_detections:
+            key = normalize_emoji(d['emoji'])
+            cls_by_emoji.setdefault(key, []).append(d)
+
+        spa_by_emoji = {}
+        for d in spatial_detections:
+            key = normalize_emoji(d['emoji'])
+            spa_by_emoji.setdefault(key, []).append(d)
+
         # Process each bounding box as a separate voting unit
         for emoji, bbox_list in spatial_evidence.items():
             normalized_emoji = normalize_emoji(emoji)
+
+            sem_matches = sem_by_emoji.get(normalized_emoji, [])
+            cls_matches = cls_by_emoji.get(normalized_emoji, [])
+            spa_matches = spa_by_emoji.get(normalized_emoji, [])
 
             for bbox_data in bbox_list:
                 merged_id = bbox_data['merged_id']
@@ -349,11 +373,9 @@ class ConsensusWorkerMergeFocused(BaseWorker):
                 # Count spatial votes (services that contributed to this specific bbox)
                 spatial_votes = len(contributing_services)
 
-                # Count semantic votes (all semantic services that detected this emoji support this bbox)
-                semantic_votes = len([d for d in semantic_detections if normalize_emoji(d['emoji']) == normalized_emoji])
-
-                # Count classification votes (all classification services that detected this emoji support this bbox)
-                classification_votes = len([d for d in classification_detections if normalize_emoji(d['emoji']) == normalized_emoji])
+                # Count semantic/classification votes (all matching detections support this bbox)
+                semantic_votes = len(sem_matches)
+                classification_votes = len(cls_matches)
 
                 total_votes = spatial_votes + semantic_votes + classification_votes
 
@@ -361,20 +383,13 @@ class ConsensusWorkerMergeFocused(BaseWorker):
                 supporting_detections = []
 
                 # Add spatial detections from contributing services
-                for detection in spatial_detections:
-                    if (normalize_emoji(detection['emoji']) == normalized_emoji and
-                        detection['service'] in contributing_services):
+                contributing_set = set(contributing_services)
+                for detection in spa_matches:
+                    if detection['service'] in contributing_set:
                         supporting_detections.append(detection)
 
-                # Add semantic detections for this emoji
-                for detection in semantic_detections:
-                    if normalize_emoji(detection['emoji']) == normalized_emoji:
-                        supporting_detections.append(detection)
-
-                # Add classification detections for this emoji
-                for detection in classification_detections:
-                    if normalize_emoji(detection['emoji']) == normalized_emoji:
-                        supporting_detections.append(detection)
+                supporting_detections.extend(sem_matches)
+                supporting_detections.extend(cls_matches)
 
                 bbox_analysis = {
                     'merged_id': merged_id,
@@ -400,12 +415,12 @@ class ConsensusWorkerMergeFocused(BaseWorker):
             normalized_emoji = normalize_emoji(detection['emoji'])
             if normalized_emoji not in all_spatial_emojis and normalized_emoji not in processed_non_spatial:
                 # This emoji has no spatial evidence, create a non-spatial instance
-                # Collect all detections for this emoji
-                emoji_detections = [d for d in semantic_detections + classification_detections
-                                  if normalize_emoji(d['emoji']) == normalized_emoji]
+                sem_matches_ns = sem_by_emoji.get(normalized_emoji, [])
+                cls_matches_ns = cls_by_emoji.get(normalized_emoji, [])
+                emoji_detections = sem_matches_ns + cls_matches_ns
 
-                semantic_count = len([d for d in emoji_detections if d['evidence_type'] == 'semantic'])
-                classification_count = len([d for d in emoji_detections if d['evidence_type'] == 'classification'])
+                semantic_count = len(sem_matches_ns)
+                classification_count = len(cls_matches_ns)
 
                 bbox_analysis = {
                     'merged_id': None,
@@ -590,15 +605,13 @@ class ConsensusWorkerMergeFocused(BaseWorker):
                 bbox2 = result2['bbox_data']['merged_bbox']
 
                 # Check if boxes are near-identical using multiple criteria
-                if self.are_boxes_near_identical(bbox1, bbox2, IOU_THRESHOLD, CENTER_DISTANCE_THRESHOLD, SIZE_SIMILARITY_THRESHOLD):
+                is_near_identical, iou, center_dist, size_sim = self.are_boxes_near_identical(
+                    bbox1, bbox2, IOU_THRESHOLD, CENTER_DISTANCE_THRESHOLD, SIZE_SIMILARITY_THRESHOLD
+                )
+                if is_near_identical:
                     # Near-identical boxes with different emojis - resolve conflict
                     votes1 = result1['total_votes']
                     votes2 = result2['total_votes']
-
-                    # Get detailed metrics for logging
-                    iou = self.calculate_bbox_iou(bbox1, bbox2)
-                    center_dist = self.calculate_center_distance(bbox1, bbox2)
-                    size_sim = self.calculate_size_similarity(bbox1, bbox2)
 
                     if votes1 > votes2:
                         # result1 wins, eliminate result2
@@ -661,23 +674,31 @@ class ConsensusWorkerMergeFocused(BaseWorker):
         return intersection / union if union > 0 else 0.0
 
     def are_boxes_near_identical(self, bbox1, bbox2, iou_threshold, center_distance_threshold, size_similarity_threshold):
-        """Check if two bounding boxes are near-identical using multiple criteria"""
-        # 1. IoU check
-        iou = self.calculate_bbox_iou(bbox1, bbox2)
-        if iou < iou_threshold:
-            return False
+        """Check if two bounding boxes are near-identical using multiple criteria.
 
-        # 2. Center distance check
+        Checks are ordered cheapest-first to minimise computation — most
+        non-matching pairs are eliminated by center distance before IoU is
+        ever computed.
+
+        Returns (is_match, iou, center_distance, size_similarity).
+        Metric values are 0.0 on a non-match (caller should not use them).
+        """
+        # 1. Center distance (cheapest — eliminates most non-overlapping pairs)
         center_distance = self.calculate_center_distance(bbox1, bbox2)
         if center_distance > center_distance_threshold:
-            return False
+            return False, 0.0, 0.0, 0.0
 
-        # 3. Size similarity check
+        # 2. Size similarity
         size_similarity = self.calculate_size_similarity(bbox1, bbox2)
         if size_similarity < size_similarity_threshold:
-            return False
+            return False, 0.0, 0.0, 0.0
 
-        return True
+        # 3. IoU (most expensive — only reached by plausible candidates)
+        iou = self.calculate_bbox_iou(bbox1, bbox2)
+        if iou < iou_threshold:
+            return False, 0.0, 0.0, 0.0
+
+        return True, iou, center_distance, size_similarity
 
     def calculate_center_distance(self, bbox1, bbox2):
         """Calculate distance between bounding box centers"""
@@ -1024,6 +1045,7 @@ class ConsensusWorkerMergeFocused(BaseWorker):
             message_data = json.loads(body.decode('utf-8'))
             image_id = message_data['image_id']
             image_filename = message_data.get('image_filename', f'image_{image_id}')
+            tier = message_data.get('tier', 'free')
 
             # Skip if consensus is already current (burst of triggers for same image)
             if self._consensus_is_current(image_id):
@@ -1043,8 +1065,8 @@ class ConsensusWorkerMergeFocused(BaseWorker):
                 self.logger.info(f"Completed merge-focused consensus for {image_filename}")
                 self._update_service_dispatch(image_id, service='consensus')
 
-                # Trigger content analysis after consensus completes
-                self.trigger_content_analysis(image_id, image_filename)
+                # Trigger content analysis after consensus completes (basic+ only)
+                self.trigger_content_analysis(image_id, image_filename, tier)
             else:
                 self.logger.error(f"Failed to update merge-focused consensus for {image_filename}")
 

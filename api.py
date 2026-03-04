@@ -65,6 +65,8 @@ MAX_IMAGE_DIMENSION = int(os.getenv('MAX_IMAGE_DIMENSION', 2048))
 SERVICE_CONFIG_PATH = os.getenv('SERVICE_CONFIG_PATH', 'service_config.yaml')
 config = get_service_config(SERVICE_CONFIG_PATH)
 
+_VALID_TIERS = frozenset({'free', 'basic', 'premium', 'cloud'})
+
 # Age (seconds) after which a pending service_dispatch row with no result is considered stale.
 # Override per-service via environment variables; defaults apply if not set.
 _STALE_THRESHOLDS = {
@@ -280,13 +282,18 @@ def compute_phash(image_bytes):
     return str(imagehash.phash(img))
 
 
-def resolve_services(services_param):
-    """Resolve a comma-separated service list (or None for all primary)."""
+def resolve_services(services_param, tier='free'):
+    """Resolve a comma-separated service list, or return tier-appropriate primary services."""
     primary   = config.get_services_by_category('primary')
     available = sorted(name.split('.', 1)[1] for name in primary.keys())
 
     if not services_param:
-        return available, None
+        tier_services = config.get_services_by_tier(tier)
+        return sorted(
+            name.split('.', 1)[1]
+            for name in tier_services.keys()
+            if name.startswith('primary.')
+        ), None
 
     requested = [s.strip() for s in services_param.split(',')]
     invalid   = [s for s in requested if s not in available]
@@ -339,8 +346,9 @@ def analyze():
     URL-based submission is not supported — send the image bytes directly.
 
     Optional form fields:
-      - services:     comma-separated service list (default: all primary)
+      - services:     comma-separated service list (default: tier-appropriate primary services)
       - image_group:  group tag for the image (default: 'api')
+      - tier:         customer tier — free, basic, premium, cloud (default: 'free')
     """
     if not request.content_type or 'multipart/form-data' not in request.content_type:
         return jsonify({"error": "Request must be multipart/form-data with a 'file' field"}), 400
@@ -356,6 +364,10 @@ def analyze():
     image_filename = file.filename or 'upload.jpg'
     services_param = request.form.get('services')
     image_group    = request.form.get('image_group', 'api')
+    tier           = request.form.get('tier', 'free')
+
+    if tier not in _VALID_TIERS:
+        return jsonify({"error": f"Invalid tier '{tier}'. Valid tiers: {', '.join(sorted(_VALID_TIERS))}"}), 400
 
     if not image_bytes:
         return jsonify({"error": "Empty image data"}), 400
@@ -374,7 +386,7 @@ def analyze():
         app.logger.warning("Perceptual hash computation failed: %s", e)
 
     # Validate services
-    service_names, err = resolve_services(services_param)
+    service_names, err = resolve_services(services_param, tier)
     if err:
         return jsonify({"error": err}), 400
 
@@ -383,10 +395,10 @@ def analyze():
         db  = get_db()
         cur = db.cursor()
         cur.execute(
-            """INSERT INTO images (image_filename, image_group, services_submitted, image_phash)
-               VALUES (%s, %s, %s, %s)
+            """INSERT INTO images (image_filename, image_group, services_submitted, image_phash, tier)
+               VALUES (%s, %s, %s, %s, %s)
                RETURNING image_id""",
-            (image_filename, image_group, service_names, phash),
+            (image_filename, image_group, service_names, phash, tier),
         )
         image_id = cur.fetchone()[0]
         # Record pending dispatch for all primary services — best-effort tracking.
@@ -423,6 +435,7 @@ def analyze():
                     "trace_id":       trace_id,
                     "service_name":   service_name,
                     "queue_name":     queue_name,
+                    "tier":           tier,
                 }),
                 properties=pika.BasicProperties(delivery_mode=2),
             )

@@ -262,7 +262,8 @@ CREATE TABLE IF NOT EXISTS service_dispatch (
     service       TEXT NOT NULL,     -- service short name, e.g. 'blip', 'face', 'pose', 'sam3'
     cluster_id    TEXT,              -- bbox cluster_id for face/pose; NULL for image-level services
     dispatched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    status        TEXT NOT NULL DEFAULT 'pending'  -- pending, complete
+    status        TEXT NOT NULL DEFAULT 'pending',  -- pending, complete, failed, dead-lettered
+    failed_reason TEXT                              -- error message or DLQ death reason; NULL on success
 );
 
 CREATE INDEX IF NOT EXISTS idx_service_dispatch_image ON service_dispatch (image_id);

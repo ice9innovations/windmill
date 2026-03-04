@@ -28,6 +28,7 @@ class BboxFaceWorker(PostProcessingWorker):
             message = json.loads(body.decode('utf-8'))
             self.current_bbox = message.get('bbox', {})
             image_id = message.get('image_id')
+            tier = message.get('tier', 'free')
 
             # Call parent process_message which will call our process_service
             result = super().process_message(ch, method, properties, body)
@@ -38,7 +39,7 @@ class BboxFaceWorker(PostProcessingWorker):
             # would be empty on that first pass.  This second trigger ensures
             # correlate_faces() has real data to work with.
             if image_id:
-                self._trigger_content_analysis(image_id)
+                self._trigger_content_analysis(image_id, tier)
 
             return result
 
@@ -46,9 +47,12 @@ class BboxFaceWorker(PostProcessingWorker):
             self.logger.error(f"Error in face message processing: {e}")
             self._safe_nack(ch, method.delivery_tag, requeue=True)
 
-    def _trigger_content_analysis(self, image_id: int):
+    def _trigger_content_analysis(self, image_id: int, tier: str = 'free'):
         """Publish to content_analysis queue so face+NudeNet correlation runs
-        with face service results present."""
+        with face service results present (basic+ tiers only)."""
+        if tier == 'free':
+            return
+
         try:
             if not self.channel or self.connection.is_closed:
                 if not self.connect_to_queue():
@@ -65,7 +69,7 @@ class BboxFaceWorker(PostProcessingWorker):
             self.channel.basic_publish(
                 exchange='',
                 routing_key=queue_name,
-                body=json.dumps({'image_id': image_id}),
+                body=json.dumps({'image_id': image_id, 'tier': tier}),
                 properties=pika.BasicProperties(delivery_mode=2),
             )
             self.logger.debug(

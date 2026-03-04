@@ -24,7 +24,7 @@ sys.path.append(os.path.dirname(__file__))
 
 from base_worker import BaseWorker
 from noun_utils import collapse_synonyms, warmup_wordnet, load_conceptnet, load_mwe, apply_mwe_normalization
-from noun_extractor import extract_nouns, categorize_nouns, extract_subject, warmup_noun_extractor
+from noun_extractor import extract_nouns, categorize_nouns, extract_subject, extract_nouns_and_subject, warmup_noun_extractor
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,7 @@ class NounConsensusWorker(BaseWorker):
             image_id = message['image_id']
             image_data = message.get('image_data')
             triggering_service = message.get('service', 'unknown')
+            tier = message.get('tier', 'free')
 
             self._record_service_dispatch(image_id, 'noun_consensus')
 
@@ -142,7 +143,7 @@ class NounConsensusWorker(BaseWorker):
                         f"with same nouns, skipping"
                     )
                 elif consensus_nouns:
-                    self._trigger_sam3(image_id, image_data, consensus_nouns, subject_noun)
+                    self._trigger_sam3(image_id, image_data, consensus_nouns, subject_noun, tier)
                 else:
                     # No consensus reached — promote the top noun if it's a clear
                     # leader (strictly ahead of second place). Fires only when the
@@ -173,7 +174,12 @@ class NounConsensusWorker(BaseWorker):
                                 processing_time=round(time.time() - start_time, 3),
                                 category_tally=category_tally,
                             )
-                            self._trigger_sam3(image_id, image_data, [top], subject_noun)
+                            self._trigger_sam3(image_id, image_data, [top], subject_noun, tier)
+
+            # Direct caption_summary update path — catches stragglers that arrive after
+            # SAM3's noun-dedup has stabilised and won't re-trigger caption_summary.
+            if tier != 'free' and image_data:
+                self._maybe_update_caption_summary(image_id, image_data, tier)
 
         except Exception as e:
             self.logger.error(f"noun_consensus: error processing message: {e}")
@@ -224,8 +230,67 @@ class NounConsensusWorker(BaseWorker):
             self.logger.error(f"noun_consensus: sam3 check failed for image {image_id}: {e}")
             return None
 
-    def _trigger_sam3(self, image_id: int, image_data: str, nouns: list, subject_noun: str = None):
-        """Publish a SAM3 segmentation request for the final noun consensus."""
+    def _maybe_update_caption_summary(self, image_id: int, image_data: str, tier: str):
+        """Trigger caption_summary re-synthesis if more VLM captions are available than
+        the last synthesis used. Covers the straggler case where a slow VLM (e.g. gpt_nano)
+        reports after SAM3 has already stabilised and won't re-trigger."""
+        try:
+            # Count captions from tier VLMs available right now
+            tier_vlms = [
+                name.split('.', 1)[1]
+                for name in self.config.get_services_by_tier(tier)
+                if name.startswith('primary.')
+                and name.split('.', 1)[1] in VLM_SERVICES
+            ]
+            if not tier_vlms:
+                return
+
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """SELECT COUNT(DISTINCT service) FROM results
+                   WHERE image_id = %s AND service = ANY(%s) AND status = 'success'""",
+                (image_id, tier_vlms),
+            )
+            available_count = cursor.fetchone()[0]
+
+            # Check what the last synthesis used
+            cursor.execute(
+                "SELECT service_count FROM caption_summary WHERE image_id = %s LIMIT 1",
+                (image_id,),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            last_count = row[0] if row else 0
+
+            if available_count <= last_count:
+                return  # Nothing new since last synthesis
+
+            # Declare caption_summary queue on consume channel (idempotent — queue is broker-side)
+            queue_name = self._get_queue_name('system.caption_summary')
+            dlq = f"{queue_name}.dlq"
+            self.channel.queue_declare(queue=dlq, durable=True)
+            self.channel.queue_declare(
+                queue=queue_name, durable=True,
+                arguments={'x-dead-letter-exchange': '', 'x-dead-letter-routing-key': dlq},
+            )
+            self._enqueue_publish(
+                queue_name,
+                json.dumps({'image_id': image_id, 'image_data': image_data, 'tier': tier}),
+            )
+            self.logger.info(
+                f"noun_consensus: triggered caption_summary update for image {image_id} "
+                f"({available_count} captions available, last synthesis had {last_count})"
+            )
+        except Exception as e:
+            self.logger.error(
+                f"noun_consensus: failed to check/trigger caption_summary for image {image_id}: {e}"
+            )
+
+    def _trigger_sam3(self, image_id: int, image_data: str, nouns: list, subject_noun: str = None, tier: str = 'free'):
+        """Publish a SAM3 segmentation request for the final noun consensus (basic+ only)."""
+        if tier == 'free':
+            self.logger.debug(f"noun_consensus: skipping SAM3 for free tier image {image_id}")
+            return
         try:
             queue_name = self._get_queue_by_service_type('sam3')
             # Record dispatch before publishing so the row exists before SAM3 can complete.
@@ -239,6 +304,7 @@ class NounConsensusWorker(BaseWorker):
                     'nouns': nouns,
                     'subject_noun': subject_noun,
                     'triggered_at': datetime.now().isoformat(),
+                    'tier': tier,
                 }),
             )
             self.logger.info(
@@ -289,9 +355,8 @@ class NounConsensusWorker(BaseWorker):
                 caption = predictions[0].get('text', '').strip() if predictions else ''
                 if not caption:
                     continue
-                nouns = extract_nouns(caption)
+                nouns, subject = extract_nouns_and_subject(caption)
                 categories = categorize_nouns(nouns)
-                subject = extract_subject(caption)
                 if nouns:
                     service_noun_map[service] = nouns
                     service_category_map[service] = categories

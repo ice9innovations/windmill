@@ -51,6 +51,8 @@ class NudenetWorker(BaseWorker):
 
     def after_result_stored(self, image_id, result, message):
         """Run spatial content analysis immediately after the NudeNet result is stored."""
+        if message.get('tier', 'free') == 'free':
+            return
         try:
             nudenet_detections = self._extract_detections(result)
             if not nudenet_detections:

@@ -238,6 +238,66 @@ def categorize_nouns(nouns: List[str]) -> Dict[str, str]:
     return result
 
 
+def _extract_subject_from_doc(doc) -> Optional[str]:
+    """Extract grammatical subject from a pre-parsed spaCy doc."""
+    # Work on the first sentence only — VLM captions are usually one
+    # sentence, and the main subject is always in the first clause.
+    first_sent = next(doc.sents, None)
+    if first_sent is None:
+        return None
+
+    # Find the root verb of the first sentence
+    root = next((t for t in first_sent if t.dep_ == 'ROOT'), None)
+    if root is None:
+        return None
+
+    # Find the nominal subject (nsubj) of the root
+    nsubj = next((t for t in root.children if t.dep_ == 'nsubj'), None)
+
+    if nsubj is not None and nsubj.pos_ == 'PRON':
+        # Skip pronoun subjects ("it", "they", "something")
+        nsubj = None
+
+    if nsubj is not None:
+        # Action sentence path: use the nsubj noun chunk head.
+        # e.g. "A horse runs through a field" → nsubj=horse → "horse"
+        for chunk in doc.noun_chunks:
+            if nsubj in chunk:
+                root_token = chunk.root
+                surface = root_token.text.lower()
+                candidate = surface if surface in _PLURALE_TANTUM else root_token.lemma_.lower()
+                candidate = _clean_surface(candidate)
+                if candidate and len(candidate) > 1 and candidate not in _STOP_NOUNS:
+                    return candidate
+                return None
+
+        # No noun chunk found for nsubj — use the token itself
+        surface = nsubj.text.lower()
+        candidate = surface if surface in _PLURALE_TANTUM else nsubj.lemma_.lower()
+        candidate = _clean_surface(candidate)
+        if candidate and len(candidate) > 1 and candidate not in _STOP_NOUNS:
+            return candidate
+        return None
+
+    # Nominal sentence fallback: no nsubj means there is likely no verb.
+    # spaCy promotes the head noun to ROOT in nominal sentences, e.g.:
+    #   "A bowl of soup with chives" → ROOT=bowl (NOUN)
+    # Only fire if the ROOT is itself a noun — a verb ROOT with a missing
+    # nsubj is a parse failure, not a nominal sentence.
+    if root.pos_ == 'NOUN':
+        for chunk in doc.noun_chunks:
+            if root in chunk:
+                root_token = chunk.root
+                surface = root_token.text.lower()
+                candidate = surface if surface in _PLURALE_TANTUM else root_token.lemma_.lower()
+                candidate = _clean_surface(candidate)
+                if candidate and len(candidate) > 1 and candidate not in _STOP_NOUNS:
+                    return candidate
+                return None
+
+    return None
+
+
 def extract_subject(text: str) -> Optional[str]:
     """
     Extract the grammatical subject from a VLM caption.
@@ -267,67 +327,139 @@ def extract_subject(text: str) -> Optional[str]:
 
     try:
         doc = _nlp(text)
-
-        # Work on the first sentence only — VLM captions are usually one
-        # sentence, and the main subject is always in the first clause.
-        first_sent = next(doc.sents, None)
-        if first_sent is None:
-            return None
-
-        # Find the root verb of the first sentence
-        root = next((t for t in first_sent if t.dep_ == 'ROOT'), None)
-        if root is None:
-            return None
-
-        # Find the nominal subject (nsubj) of the root
-        nsubj = next((t for t in root.children if t.dep_ == 'nsubj'), None)
-
-        if nsubj is not None and nsubj.pos_ == 'PRON':
-            # Skip pronoun subjects ("it", "they", "something")
-            nsubj = None
-
-        if nsubj is not None:
-            # Action sentence path: use the nsubj noun chunk head.
-            # e.g. "A horse runs through a field" → nsubj=horse → "horse"
-            for chunk in doc.noun_chunks:
-                if nsubj in chunk:
-                    root_token = chunk.root
-                    surface = root_token.text.lower()
-                    candidate = surface if surface in _PLURALE_TANTUM else root_token.lemma_.lower()
-                    candidate = _clean_surface(candidate)
-                    if candidate and len(candidate) > 1 and candidate not in _STOP_NOUNS:
-                        return candidate
-                    return None
-
-            # No noun chunk found for nsubj — use the token itself
-            surface = nsubj.text.lower()
-            candidate = surface if surface in _PLURALE_TANTUM else nsubj.lemma_.lower()
-            candidate = _clean_surface(candidate)
-            if candidate and len(candidate) > 1 and candidate not in _STOP_NOUNS:
-                return candidate
-            return None
-
-        # Nominal sentence fallback: no nsubj means there is likely no verb.
-        # spaCy promotes the head noun to ROOT in nominal sentences, e.g.:
-        #   "A bowl of soup with chives" → ROOT=bowl (NOUN)
-        # Only fire if the ROOT is itself a noun — a verb ROOT with a missing
-        # nsubj is a parse failure, not a nominal sentence.
-        if root.pos_ == 'NOUN':
-            for chunk in doc.noun_chunks:
-                if root in chunk:
-                    root_token = chunk.root
-                    surface = root_token.text.lower()
-                    candidate = surface if surface in _PLURALE_TANTUM else root_token.lemma_.lower()
-                    candidate = _clean_surface(candidate)
-                    if candidate and len(candidate) > 1 and candidate not in _STOP_NOUNS:
-                        return candidate
-                    return None
-
-        return None
-
+        return _extract_subject_from_doc(doc)
     except Exception as e:
         logger.error(f"noun_extractor: subject extraction failed: {e}")
         return None
+
+
+def _extract_nouns_from_doc(doc) -> List[str]:
+    """Extract nouns from a pre-parsed spaCy doc."""
+    seen = set()          # full phrases already added
+    seen_lemmas = set()   # individual lemmas consumed by a chunk
+    nouns = []
+
+    _LEADING_STRIP = {"a", "an", "the", "some", "any",
+                      "this", "that", "these", "those"}
+    _QUANTIFIERS = {"one", "two", "three", "four", "five", "six",
+                    "seven", "eight", "nine", "ten", "many", "several",
+                    "few", "multiple", "various", "numerous"}
+    # Determiners that negate the noun — skip the whole chunk and
+    # blacklist its lemmas so the standalone pass doesn't re-add them.
+    # Handles "no people", "no text", "no nudity" from VLMs that
+    # explicitly report the absence of content.
+    _NEGATION_DETS = {"no", "without"}
+
+    # Noun chunks first - preserves genuine compound nouns ("park bench",
+    # "metal arm") as single entries rather than splitting them.
+    for chunk in doc.noun_chunks:
+        # Skip pronoun-headed chunks ("it", "they", "something")
+        if chunk.root.pos_ == 'PRON':
+            continue
+
+        raw_tokens = chunk.text.lower().strip().split()
+
+        # Skip negated chunks ("no people", "no text", "no nudity").
+        # Still mark their lemmas as seen so the standalone pass doesn't
+        # re-add them (spaCy processes tokens independently of chunks).
+        if raw_tokens and raw_tokens[0] in _NEGATION_DETS:
+            for token in chunk:
+                seen_lemmas.add(token.lemma_.lower())
+                if token.text.lower() in _PLURALE_TANTUM:
+                    seen_lemmas.add(token.text.lower())
+            continue
+
+        # Strip leading determiners and quantifiers
+        while raw_tokens and raw_tokens[0] in _LEADING_STRIP | _QUANTIFIERS:
+            raw_tokens = raw_tokens[1:]
+
+        if not raw_tokens:
+            continue
+
+        if len(raw_tokens) == 1:
+            # Single-word chunk: lemmatize (with plurale tantum guard)
+            # so "cats" → "cat", "glasses" → "glasses"
+            surface = raw_tokens[0]
+            candidate = surface if surface in _PLURALE_TANTUM else chunk.root.lemma_.lower()
+
+        else:
+            # Multi-word chunk: inspect modifier dependency types.
+            # If every non-root token is a purely adjectival/functional
+            # modifier, reduce the chunk to just the root noun — this
+            # strips colour/size/comparative adjectives that add noise
+            # without semantic distinctiveness across VLMs.
+            # If any non-root token has dep_='compound' (noun modifying
+            # noun), strip adjectival tokens and rebuild from compound+root
+            # tokens only:
+            #   "white filing cabinet"  → "filing cabinet"
+            #   "beige cardboard boxes" → "cardboard boxes"
+            #   "metal arm"             → "metal arm"  (no amod, unchanged)
+            non_root_tokens = [t for t in chunk if t != chunk.root]
+            all_adjectival = all(t.dep_ in _ADJ_DEPS for t in non_root_tokens)
+
+            if all_adjectival:
+                root = chunk.root
+                surface = root.text.lower()
+                candidate = surface if surface in _PLURALE_TANTUM else root.lemma_.lower()
+            else:
+                # Keep only compound modifiers and the root — drop amod etc.
+                content_tokens = [t for t in chunk
+                                  if (t.dep_ == 'compound'
+                                      and _has_noun_synsets(t.lemma_.lower()))
+                                  or t == chunk.root]
+                if len(content_tokens) == 1:
+                    # Only the root survived stripping; reduce to root lemma
+                    root = chunk.root
+                    surface = root.text.lower()
+                    candidate = surface if surface in _PLURALE_TANTUM else root.lemma_.lower()
+                else:
+                    phrase = " ".join(t.text.lower() for t in content_tokens)
+                    # Drop phrases with punctuation bleed or disjunctions
+                    if any(c in phrase for c in ('"', "'", ',')):
+                        continue
+                    if ' or ' in phrase or ' and ' in phrase:
+                        continue
+                    candidate = phrase
+
+        # Strip any surviving leading/trailing punctuation and validate.
+        candidate = _clean_surface(candidate)
+
+        if (not candidate
+                or len(candidate) < 2
+                or not _VALID_NOUN_RE.match(candidate)
+                or candidate in seen
+                or candidate in _STOP_NOUNS):
+            continue
+
+        seen.add(candidate)
+        nouns.append(candidate)
+
+        # Mark every lemma AND every plurale tantum surface form in this
+        # chunk as consumed so the standalone pass doesn't re-add them.
+        for token in chunk:
+            seen_lemmas.add(token.lemma_.lower())
+            surface = token.text.lower()
+            if surface in _PLURALE_TANTUM:
+                seen_lemmas.add(surface)
+
+    # Capture standalone nouns not already covered by a chunk
+    for token in doc:
+        if token.pos_ == "NOUN" and not token.is_stop:
+            surface = token.text.lower().strip()
+            # Preserve plurale tantum as-is; lemmatize everything else
+            candidate = surface if surface in _PLURALE_TANTUM else token.lemma_.lower().strip()
+            candidate = _clean_surface(candidate)
+            if (candidate
+                    and len(candidate) > 1
+                    and _VALID_NOUN_RE.match(candidate)
+                    and candidate not in seen
+                    and candidate not in seen_lemmas
+                    and candidate not in _STOP_NOUNS):
+                seen.add(candidate)
+                seen_lemmas.add(candidate)
+                nouns.append(candidate)
+
+    return nouns
 
 
 def extract_nouns(text: str) -> List[str]:
@@ -355,132 +487,30 @@ def extract_nouns(text: str) -> List[str]:
 
     try:
         doc = _nlp(text)
-        seen = set()          # full phrases already added
-        seen_lemmas = set()   # individual lemmas consumed by a chunk
-        nouns = []
-
-        _LEADING_STRIP = {"a", "an", "the", "some", "any",
-                          "this", "that", "these", "those"}
-        _QUANTIFIERS = {"one", "two", "three", "four", "five", "six",
-                        "seven", "eight", "nine", "ten", "many", "several",
-                        "few", "multiple", "various", "numerous"}
-        # Determiners that negate the noun — skip the whole chunk and
-        # blacklist its lemmas so the standalone pass doesn't re-add them.
-        # Handles "no people", "no text", "no nudity" from VLMs that
-        # explicitly report the absence of content.
-        _NEGATION_DETS = {"no", "without"}
-
-        # Noun chunks first - preserves genuine compound nouns ("park bench",
-        # "metal arm") as single entries rather than splitting them.
-        for chunk in doc.noun_chunks:
-            # Skip pronoun-headed chunks ("it", "they", "something")
-            if chunk.root.pos_ == 'PRON':
-                continue
-
-            raw_tokens = chunk.text.lower().strip().split()
-
-            # Skip negated chunks ("no people", "no text", "no nudity").
-            # Still mark their lemmas as seen so the standalone pass doesn't
-            # re-add them (spaCy processes tokens independently of chunks).
-            if raw_tokens and raw_tokens[0] in _NEGATION_DETS:
-                for token in chunk:
-                    seen_lemmas.add(token.lemma_.lower())
-                    if token.text.lower() in _PLURALE_TANTUM:
-                        seen_lemmas.add(token.text.lower())
-                continue
-
-            # Strip leading determiners and quantifiers
-            while raw_tokens and raw_tokens[0] in _LEADING_STRIP | _QUANTIFIERS:
-                raw_tokens = raw_tokens[1:]
-
-            if not raw_tokens:
-                continue
-
-            if len(raw_tokens) == 1:
-                # Single-word chunk: lemmatize (with plurale tantum guard)
-                # so "cats" → "cat", "glasses" → "glasses"
-                surface = raw_tokens[0]
-                candidate = surface if surface in _PLURALE_TANTUM else chunk.root.lemma_.lower()
-
-            else:
-                # Multi-word chunk: inspect modifier dependency types.
-                # If every non-root token is a purely adjectival/functional
-                # modifier, reduce the chunk to just the root noun — this
-                # strips colour/size/comparative adjectives that add noise
-                # without semantic distinctiveness across VLMs.
-                # If any non-root token has dep_='compound' (noun modifying
-                # noun), strip adjectival tokens and rebuild from compound+root
-                # tokens only:
-                #   "white filing cabinet"  → "filing cabinet"
-                #   "beige cardboard boxes" → "cardboard boxes"
-                #   "metal arm"             → "metal arm"  (no amod, unchanged)
-                non_root_tokens = [t for t in chunk if t != chunk.root]
-                all_adjectival = all(t.dep_ in _ADJ_DEPS for t in non_root_tokens)
-
-                if all_adjectival:
-                    root = chunk.root
-                    surface = root.text.lower()
-                    candidate = surface if surface in _PLURALE_TANTUM else root.lemma_.lower()
-                else:
-                    # Keep only compound modifiers and the root — drop amod etc.
-                    content_tokens = [t for t in chunk
-                                      if (t.dep_ == 'compound'
-                                          and _has_noun_synsets(t.lemma_.lower()))
-                                      or t == chunk.root]
-                    if len(content_tokens) == 1:
-                        # Only the root survived stripping; reduce to root lemma
-                        root = chunk.root
-                        surface = root.text.lower()
-                        candidate = surface if surface in _PLURALE_TANTUM else root.lemma_.lower()
-                    else:
-                        phrase = " ".join(t.text.lower() for t in content_tokens)
-                        # Drop phrases with punctuation bleed or disjunctions
-                        if any(c in phrase for c in ('"', "'", ',')):
-                            continue
-                        if ' or ' in phrase or ' and ' in phrase:
-                            continue
-                        candidate = phrase
-
-            # Strip any surviving leading/trailing punctuation and validate.
-            candidate = _clean_surface(candidate)
-
-            if (not candidate
-                    or len(candidate) < 2
-                    or not _VALID_NOUN_RE.match(candidate)
-                    or candidate in seen
-                    or candidate in _STOP_NOUNS):
-                continue
-
-            seen.add(candidate)
-            nouns.append(candidate)
-
-            # Mark every lemma AND every plurale tantum surface form in this
-            # chunk as consumed so the standalone pass doesn't re-add them.
-            for token in chunk:
-                seen_lemmas.add(token.lemma_.lower())
-                surface = token.text.lower()
-                if surface in _PLURALE_TANTUM:
-                    seen_lemmas.add(surface)
-
-        # Capture standalone nouns not already covered by a chunk
-        for token in doc:
-            if token.pos_ == "NOUN" and not token.is_stop:
-                surface = token.text.lower().strip()
-                # Preserve plurale tantum as-is; lemmatize everything else
-                candidate = surface if surface in _PLURALE_TANTUM else token.lemma_.lower().strip()
-                candidate = _clean_surface(candidate)
-                if (candidate
-                        and len(candidate) > 1
-                        and _VALID_NOUN_RE.match(candidate)
-                        and candidate not in seen
-                        and candidate not in seen_lemmas
-                        and candidate not in _STOP_NOUNS):
-                    seen.add(candidate)
-                    seen_lemmas.add(candidate)
-                    nouns.append(candidate)
-
-        return nouns
-
+        return _extract_nouns_from_doc(doc)
     except Exception as e:
         logger.error(f"noun_extractor: extraction failed: {e}")
         return []
+
+
+def extract_nouns_and_subject(text: str):
+    """Parse text once and return both nouns and subject.
+
+    Equivalent to calling extract_nouns(text) + extract_subject(text) but
+    with a single spaCy parse instead of two.
+
+    Returns:
+        (nouns: List[str], subject: Optional[str])
+    """
+    if not text or not text.strip():
+        return [], None
+
+    if not _load_model():
+        return [], None
+
+    try:
+        doc = _nlp(text)
+        return _extract_nouns_from_doc(doc), _extract_subject_from_doc(doc)
+    except Exception as e:
+        logger.error(f"noun_extractor: combined extraction failed: {e}")
+        return [], None

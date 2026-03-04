@@ -2,20 +2,23 @@
 # Defines ML services, infrastructure components, and their queue mappings
 #
 
-# Rules: 
+# Rules:
 # Spatial services trigger box harmonization
 # Semantic services trigger caption scores
 # All services trigger consesus building unless tagged with consensus: false
 
 services:
   # Primary ML Services - Run on full images
-  primary: 
+  primary:
     blip:
       queue_name: blip # allows overrides if explicitly defined, uses service name if not
       host: localhost
       port: 7777
       endpoint: /v3/analyze
       service_type: semantic, vlm
+      tier:
+        - basic
+        - premium
 
     colors:
       queue_name: colors
@@ -24,6 +27,11 @@ services:
       endpoint: /v3/analyze
       service_type: colors
       consensus: false
+      tier:
+        - free
+        - basic
+        - premium
+        - cloud
 
     metadata:
       queue_name: metadata
@@ -31,6 +39,11 @@ services:
       port: 7781
       endpoint: /v3/analyze
       service_type: metadata
+      tier:
+        - free
+        - basic
+        - premium
+        - cloud
 
     ocr:
       queue_name: ocr
@@ -38,6 +51,11 @@ services:
       port: 7775
       endpoint: /v3/analyze
       service_type: specialized
+      tier:
+        - free
+        - basic
+        - premium
+        - cloud
 
     nudenet:
       queue_name: nudenet
@@ -45,6 +63,11 @@ services:
       port: 7789
       endpoint: /v3/analyze
       service_type: specialized
+      tier:
+        - free
+        - basic
+        - premium
+        - cloud
 
     moondream:
       queue_name: moondream
@@ -52,6 +75,9 @@ services:
       port: 7795
       endpoint: /v3/analyze
       service_type: semantic, vlm
+      tier:
+        - basic
+        - premium
 
     ollama:
       queue_name: ollama
@@ -59,6 +85,9 @@ services:
       port: 7782
       endpoint: /v3/analyze
       service_type: semantic, vlm
+      tier:
+        - basic
+        - premium
       # caption_scoring: true # all semantic services trigger caption scoring
 
     haiku:
@@ -67,6 +96,9 @@ services:
       port: 7797
       endpoint: /v3/analyze
       service_type: semantic, vlm
+      tier:
+        - premium
+        - cloud
 
     gemini:
       queue_name: gemini
@@ -74,6 +106,9 @@ services:
       port: 7767
       endpoint: /v3/analyze
       service_type: semantic, vlm
+      tier:
+        - premium
+        - cloud
 
     gpt_nano:
       queue_name: gpt_nano
@@ -81,6 +116,9 @@ services:
       port: 7800
       endpoint: /v3/analyze
       service_type: semantic, vlm
+      tier:
+        - premium
+        - cloud
 
     qwen:
       queue_name: qwen
@@ -88,6 +126,9 @@ services:
       port: 7796
       endpoint: /v3/analyze
       service_type: semantic, vlm
+      tier:
+        - basic
+        - premium
 
     yolo_v8:
       queue_name: yolo_v8
@@ -95,6 +136,10 @@ services:
       port: 7773
       endpoint: /v3/analyze
       service_type: spatial
+      tier:
+        - basic
+        - premium
+        - cloud
 
   postprocessing:
     # Postprocessing Services - Run on cropped bbox regions or captions
@@ -105,13 +150,19 @@ services:
       endpoint: /v3/analyze
       service_type: colors
       consensus: false
-      
+      tier:
+        - system
+
     face:
       queue_name: face
       host: localhost
       port: 7772
       endpoint: /v3/analyze
       service_type: specialized
+      tier:
+        - basic
+        - premium
+        - cloud
 
     pose:
       queue_name: pose
@@ -120,6 +171,10 @@ services:
       endpoint: /v3/analyze
       service_type: specialized
       consensus: false
+      tier:
+        - basic
+        - premium
+        - cloud
 
     caption_score:
       queue_name: caption_score
@@ -128,6 +183,8 @@ services:
       endpoint: /score
       service_type: caption_score
       consensus: false
+      tier:
+        - system
 
     clip_score:
       host: localhost
@@ -135,6 +192,8 @@ services:
       endpoint: /v3/score
       service_type: clip_score
       consensus: false
+      tier:
+        - system
 
   system:
 
@@ -147,27 +206,39 @@ services:
       queue_name: consensus
       category: infrastructure
       service_type: consensus
+      tier:
+        - system
 
     harmony:
       queue_name: harmony
       category: infrastructure
       service_type: harmonization
+      tier:
+        - system
       # prefetch: 1  # default; keep single in-flight message per worker
 
     content_analysis:
       queue_name: content_analysis
       category: infrastructure
       service_type: content_analysis
+      tier:
+        - basic
+        - premium
+        - cloud
 
     noun_consensus:
       queue_name: noun_consensus
       category: infrastructure
       service_type: noun_consensus
+      tier:
+        - system
 
     verb_consensus:
       queue_name: verb_consensus
       category: infrastructure
       service_type: verb_consensus
+      tier:
+        - system
 
     sam3:
       queue_name: sam3
@@ -176,6 +247,8 @@ services:
       host: localhost
       port: 9779
       endpoint: /analyze
+      tier:
+        - system
 
     caption_summary:
       queue_name: caption_summary
@@ -184,6 +257,8 @@ services:
       host: localhost
       port: 7799
       endpoint: /summarize
+      tier:
+        - system
 
     rembg:
       queue_name: rembg
@@ -192,3 +267,7 @@ services:
       host: localhost
       port: 7768
       endpoint: /analyze
+      tier:
+        - basic
+        - premium
+        - cloud

@@ -90,26 +90,35 @@ class CaptionSummaryWorker(BaseWorker):
             message = json.loads(body)
             image_id = message['image_id']
             image_data = message.get('image_data')  # base64; may be None for legacy messages
+            tier = message.get('tier', 'free')
 
-            self.logger.debug(f"caption_summary: processing image {image_id}")
+            self.logger.debug(f"caption_summary: processing image {image_id} (tier={tier})")
 
-            # Dedup guard — only one synthesis per image
+            # Derive tier-appropriate VLM list — only synthesize from services this tier ran
+            tier_vlm_services = self._tier_vlm_services(tier)
+
+            # Dedup guard — skip if we have no more captions than the last synthesis used.
+            # Allows re-synthesis when stragglers (e.g. gpt_nano) arrive after first pass.
             cursor = self.db_conn.cursor()
             cursor.execute(
-                "SELECT 1 FROM caption_summary WHERE image_id = %s LIMIT 1",
+                "SELECT service_count FROM caption_summary WHERE image_id = %s LIMIT 1",
                 (image_id,)
             )
-            if cursor.fetchone():
+            row = cursor.fetchone()
+            cursor.close()
+            existing_count = row[0] if row else 0
+
+            # Fetch VLM captions — tier-scoped
+            captions = self._fetch_captions(image_id, tier_vlm_services)
+
+            if len(captions) <= existing_count:
                 self.logger.info(
-                    f"caption_summary: image {image_id} already synthesized, skipping"
+                    f"caption_summary: image {image_id} already synthesized with "
+                    f"{existing_count} caption(s), still {len(captions)} available — skipping"
                 )
-                cursor.close()
                 self._safe_ack(ch, method.delivery_tag)
                 return
-            cursor.close()
 
-            # Fetch VLM captions
-            captions = self._fetch_captions(image_id)
             if len(captions) < MIN_CAPTIONS:
                 self.logger.info(
                     f"caption_summary: image {image_id} has {len(captions)} caption(s), "
@@ -167,11 +176,21 @@ class CaptionSummaryWorker(BaseWorker):
     # Data fetching
     # ------------------------------------------------------------------
 
-    def _fetch_captions(self, image_id: int) -> dict:
+    def _tier_vlm_services(self, tier: str) -> list:
+        """Return the VLM services active for a given tier, ordered as VLM_SERVICES."""
+        tier_primary = {
+            name.split('.', 1)[1]
+            for name in self.config.get_services_by_tier(tier)
+            if name.startswith('primary.')
+        }
+        return [s for s in VLM_SERVICES if s in tier_primary]
+
+    def _fetch_captions(self, image_id: int, vlm_services: list = None) -> dict:
         """
-        Return {service: caption_text} for all VLM services that produced
-        a non-empty caption for this image.
+        Return {service: caption_text} for the given VLM services that produced
+        a non-empty caption for this image. Defaults to all VLM_SERVICES.
         """
+        services = vlm_services if vlm_services is not None else VLM_SERVICES
         captions = {}
         try:
             cursor = self.db_conn.cursor()
@@ -184,7 +203,7 @@ class CaptionSummaryWorker(BaseWorker):
                   AND status = 'success'
                 ORDER BY result_created ASC
                 """,
-                (image_id, VLM_SERVICES)
+                (image_id, services)
             )
             for service, data in cursor.fetchall():
                 if not isinstance(data, dict):

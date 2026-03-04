@@ -352,7 +352,8 @@ class BaseWorker:
                     'image_filename': message.get('image_filename', f'image_{image_id}'),
                     'service': self.service_name,
                     'worker_id': self.worker_id,
-                    'processed_at': datetime.now().isoformat()
+                    'processed_at': datetime.now().isoformat(),
+                    'tier': message.get('tier', 'free'),
                 }
 
                 self._enqueue_publish(
@@ -375,7 +376,8 @@ class BaseWorker:
                     'image_data': message['image_data'],
                     'service': self.service_name,
                     'worker_id': self.worker_id,
-                    'processed_at': datetime.now().isoformat()
+                    'processed_at': datetime.now().isoformat(),
+                    'tier': message.get('tier', 'free'),
                 }
 
                 self._enqueue_publish(
@@ -399,7 +401,8 @@ class BaseWorker:
                 'image_data': message.get('image_data'),
                 'service': self.service_name,
                 'worker_id': self.worker_id,
-                'processed_at': datetime.now().isoformat()
+                'processed_at': datetime.now().isoformat(),
+                'tier': message.get('tier', 'free'),
             }
 
             self._enqueue_publish(
@@ -422,7 +425,8 @@ class BaseWorker:
                 'image_filename': message.get('image_filename', f'image_{image_id}'),
                 'service': self.service_name,
                 'worker_id': self.worker_id,
-                'processed_at': datetime.now().isoformat()
+                'processed_at': datetime.now().isoformat(),
+                'tier': message.get('tier', 'free'),
             }
 
             self._enqueue_publish(
@@ -461,12 +465,13 @@ class BaseWorker:
                 except Exception:
                     pass
 
-    def _update_service_dispatch(self, image_id, service=None, cluster_id=None, status='complete'):
+    def _update_service_dispatch(self, image_id, service=None, cluster_id=None, status='complete', reason=None):
         """Update service_dispatch to the given status. Best-effort; errors swallowed.
 
         cluster_id=None matches rows WHERE cluster_id IS NULL (image-level services).
         Provide cluster_id for bbox-level services such as face and pose.
         service defaults to this worker's clean service name.
+        reason is written to failed_reason when provided (requires schema migration).
 
         On autocommit=False connections the UPDATE is committed automatically.
         """
@@ -474,19 +479,35 @@ class BaseWorker:
         try:
             cursor = self.db_conn.cursor()
             if cluster_id is None:
-                cursor.execute(
-                    """UPDATE service_dispatch SET status = %s
-                       WHERE image_id = %s AND service = %s
-                         AND cluster_id IS NULL AND status = 'pending'""",
-                    (status, image_id, service),
-                )
+                if reason is not None:
+                    cursor.execute(
+                        """UPDATE service_dispatch SET status = %s, failed_reason = %s
+                           WHERE image_id = %s AND service = %s
+                             AND cluster_id IS NULL AND status = 'pending'""",
+                        (status, reason, image_id, service),
+                    )
+                else:
+                    cursor.execute(
+                        """UPDATE service_dispatch SET status = %s
+                           WHERE image_id = %s AND service = %s
+                             AND cluster_id IS NULL AND status = 'pending'""",
+                        (status, image_id, service),
+                    )
             else:
-                cursor.execute(
-                    """UPDATE service_dispatch SET status = %s
-                       WHERE image_id = %s AND service = %s
-                         AND cluster_id = %s AND status = 'pending'""",
-                    (status, image_id, service, cluster_id),
-                )
+                if reason is not None:
+                    cursor.execute(
+                        """UPDATE service_dispatch SET status = %s, failed_reason = %s
+                           WHERE image_id = %s AND service = %s
+                             AND cluster_id = %s AND status = 'pending'""",
+                        (status, reason, image_id, service, cluster_id),
+                    )
+                else:
+                    cursor.execute(
+                        """UPDATE service_dispatch SET status = %s
+                           WHERE image_id = %s AND service = %s
+                             AND cluster_id = %s AND status = 'pending'""",
+                        (status, image_id, service, cluster_id),
+                    )
             cursor.close()
             if not self.db_conn.autocommit:
                 self.db_conn.commit()
@@ -757,6 +778,7 @@ class BaseWorker:
     
     def process_message(self, ch, method, properties, body):
         """Process a queue message - common logic for all workers"""
+        image_id = None  # initialised here so the failure except blocks can reference it
         try:
             # Ensure database connection is healthy before processing
             if not self.ensure_database_connection():
@@ -813,7 +835,8 @@ class BaseWorker:
                     'trace_id': trace_id,
                     'service': self.service_name,
                     'worker_id': self.worker_id,
-                    'processed_at': datetime.now().isoformat()
+                    'processed_at': datetime.now().isoformat(),
+                    'tier': message.get('tier', 'free'),
                 }
 
                 self._enqueue_publish(
@@ -845,6 +868,9 @@ class BaseWorker:
             self.logger.error(f"Database error processing {self.service_name} message: {e}")
             self.logger.warning("Rejecting message without requeue due to database error")
             self._safe_nack(ch, method.delivery_tag, requeue=False)
+            if image_id is not None:
+                # Best-effort — will silently fail if the DB connection is fully dead
+                self._update_service_dispatch(image_id, status='failed', reason=str(e))
             self.job_failed(str(e))
         except Exception as e:
             # Other errors (ML service, parsing, etc.) - requeue for retry
