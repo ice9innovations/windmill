@@ -14,6 +14,7 @@ import ssl
 import pika
 import psycopg2
 import psycopg2.extras
+from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 
