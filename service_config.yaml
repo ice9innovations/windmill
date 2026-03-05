@@ -204,14 +204,12 @@ services:
 
     consensus:
       queue_name: consensus
-      category: infrastructure
       service_type: consensus
       tier:
         - system
 
     harmony:
       queue_name: harmony
-      category: infrastructure
       service_type: harmonization
       tier:
         - system
@@ -219,7 +217,6 @@ services:
 
     content_analysis:
       queue_name: content_analysis
-      category: infrastructure
       service_type: content_analysis
       tier:
         - basic
@@ -228,21 +225,18 @@ services:
 
     noun_consensus:
       queue_name: noun_consensus
-      category: infrastructure
       service_type: noun_consensus
       tier:
         - system
 
     verb_consensus:
       queue_name: verb_consensus
-      category: infrastructure
       service_type: verb_consensus
       tier:
         - system
 
     sam3:
       queue_name: sam3
-      category: infrastructure
       service_type: sam3
       host: localhost
       port: 9779
@@ -252,7 +246,6 @@ services:
 
     caption_summary:
       queue_name: caption_summary
-      category: infrastructure
       service_type: caption_summary
       host: localhost
       port: 7799
@@ -262,7 +255,6 @@ services:
 
     rembg:
       queue_name: rembg
-      category: infrastructure
       service_type: rembg
       host: localhost
       port: 7768
