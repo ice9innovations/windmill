@@ -1,436 +1,400 @@
-# Windmill - Distributed ML Processing Pipeline for Animal Farm
+# Windmill
 
-"Windmill or no windmill, he said, life would go on as it had always gone on — that is, badly."
+> "Windmill or no windmill, he said, life would go on as it had always gone on — that is, badly."
 
-A complete distributed processing system. This system transforms Animal Farm from monolithic API to continuous processing pipeline capable of infinite-scale image streams across the Animal Farm machine learning services.
+Distributed ML image processing pipeline for Animal Farm. Transforms monolithic API calls into a continuous queue-based pipeline capable of processing image streams at scale across 10+ ML services.
 
-## Overview
+---
 
-This system delivers the complete vision of distributed ML processing with three key innovations:
+## How It Works
 
-1. **Complete Service Coverage**: 15 ML services (BLIP, CLIP, Colors, Detectron2, Face, Xception, Metadata, OCR, NSFW2, Ollama, Pose, RT-DETR, YOLOv8, YOLO_365, YOLO_OI7) plus Caption Scoring postprocessing
-2. **Progressive Harmonization**: Immediate results after ANY service completes, with automatic re-harmonization as more services finish
-3. **Distributed Spatial Processing**: Specialized postprocessing workers for bbox-level face detection, pose estimation, and color analysis
+Images are submitted to the API (or directly via the producer) and dispatched into RabbitMQ queues. Workers consume from their queues, call the corresponding ML service, and write results to PostgreSQL. Downstream workers (harmony, consensus, noun consensus, SAM3, caption summary) trigger automatically as primary results arrive.
 
-The system processes images through the full ML pipeline while solving the specialized challenge of **bounding box harmonization** from detection services.
+```
+Submit image
+    │
+    ├─→ [blip] [moondream] [ollama] [haiku] [gemini] [gpt_nano] [qwen]   ← VLM / semantic
+    ├─→ [colors] [ocr] [nudenet] [metadata]                                ← specialized
+    └─→ [yolo_v8]                                                          ← spatial (bbox)
+            │
+            ├─→ harmony_worker → merged_boxes
+            │       └─→ [colors_post] [face] [pose]   ← postprocessing on each bbox
+            │
+            └─→ consensus_worker → consensus
+                    └─→ noun_consensus_worker → noun_consensus
+                            ├─→ sam3_worker → sam3_results
+                            └─→ verb_consensus_worker → verb_consensus
+                                        └─→ caption_summary_worker → caption_summary
+```
 
-### Key Innovation: Progressive Harmonization
+---
 
-Instead of waiting for all bbox services to complete, the system **harmonizes immediately after ANY service completes**, then re-harmonizes as more services finish:
+## Services
 
-1. **RT-DETR completes** → Harmonize with RT-DETR results alone
-2. **YOLOv8 completes** → Re-harmonize with RT-DETR + YOLOv8 results  
-3. **Detectron2 completes** → Re-harmonize with all three services
+### Primary Services (run on full image)
 
-This approach is **fault-tolerant** (works if services fail) and **performance-optimized** (immediate results that improve over time).
+| Service | Port | Type | Tiers |
+|---------|------|------|-------|
+| blip | 7777 | semantic, vlm | basic, premium |
+| colors | 7770 | colors | free, basic, premium, cloud |
+| metadata | 7781 | metadata | free, basic, premium, cloud |
+| ocr | 7775 | specialized | free, basic, premium, cloud |
+| nudenet | 7789 | specialized | free, basic, premium, cloud |
+| moondream | 7795 | semantic, vlm | basic, premium |
+| ollama | 7782 | semantic, vlm | basic, premium |
+| haiku | 7797 | semantic, vlm | premium, cloud |
+| gemini | 7767 | semantic, vlm | premium, cloud |
+| gpt_nano | 7800 | semantic, vlm | premium, cloud |
+| qwen | 7796 | semantic, vlm | basic, premium |
+| yolo_v8 | 7773 | spatial | basic, premium, cloud |
 
-## Architecture Components
+### Postprocessing Services (run on cropped bbox regions)
 
-### 1. Message Queue Infrastructure
-- **RabbitMQ** 
-- **PostgreSQL** 
-- **Queue-per-service** pattern (`queue_colors`, `queue_yolov8`, etc.)
+| Service | Port | Type | Trigger |
+|---------|------|------|---------|
+| colors_post | 7770 | colors | all bboxes |
+| face | 7772 | specialized | person bboxes only |
+| pose | 7786 | specialized | person bboxes only |
+| caption_score | 7778 | caption_score | after each VLM result |
 
-### 2. Core Workers
+### System Services (internal pipeline workers)
 
-#### Service-Specific ML Workers
-- **Dedicated workers** for each service (blip_worker.py, clip_worker.py, colors_worker.py, etc.)
-- **BaseWorker inheritance** (`base_worker.py`) provides shared database, queue, and HTTP functionality
-- **Service-specific classes** extend BaseWorker with minimal service-specific logic
+| Service | Role |
+|---------|------|
+| harmony | IoU clustering across spatial results → merged_boxes |
+| consensus | V3 voting across all ML results → consensus |
+| noun_consensus | Noun extraction + synonym collapse → noun_consensus |
+| verb_consensus | Verb/SVO extraction → verb_consensus |
+| sam3 | SAM3 segmentation for detected nouns → sam3_results |
+| caption_summary | LLM synthesis of all VLM captions → caption_summary |
+| rembg | Background removal → used by downstream consumers |
 
-#### Bounding Box Harmonizer (`harmony_worker.py`) 
-- **Purpose**: Harmonize bbox results from yolov8, rtdetr, detectron2
-- **Trigger**: Queue-based processing via `queue_harmony`
-- **Algorithm**: Cross-service IoU clustering with democratic filtering  
-- **Output**: Harmonized bounding boxes stored in `merged_boxes` table
-- **Dispatch**: Crops bounding boxes and dispatches to postprocessing queues
+---
 
-#### Consensus Worker (`consensus_worker.py`)
-- **Purpose**: Calculate voting consensus using V3 voting algorithm
-- **Trigger**: Queue-based processing via `queue_consensus`
-- **Algorithm**: Democratic voting with evidence weighting from spatial and semantic services
-- **Output**: Consensus results stored in `consensus` table
+## Tier System
 
-#### Postprocessing Workers (Queue-Based Spatial Analysis)
-- **Bbox Colors Worker** (`bbox_colors_worker.py`): Processes `queue_bbox_colors` for cropped bounding box color analysis
-- **Bbox Face Worker** (`bbox_face_worker.py`): Processes `queue_bbox_face` for person bounding boxes only  
-- **Bbox Pose Worker** (`bbox_pose_worker.py`): Processes `queue_bbox_pose` for person bounding boxes only
-- **Architecture**: Pure queue-based workers consuming from dedicated postprocessing queues
-- **Processing**: POST cropped images to existing ML services (colors:7770, face:7772, pose:7786)
-- **Output**: Results stored in `postprocessing` table with service-specific naming
+Services are gated by tier. The `tier` field is set at image submission time.
 
-### 3. Database Schema
+| Tier | Included services |
+|------|------------------|
+| free | colors, metadata, ocr, nudenet |
+| basic | free + blip, moondream, ollama, qwen, yolo_v8 |
+| premium | basic + haiku, gemini, gpt_nano |
+| cloud | colors, metadata, ocr, nudenet, haiku, gemini, gpt_nano, yolo_v8 |
 
-**Complete schema documentation:** See `database_schema.sql` for detailed table definitions, indexes, and foreign key relationships.
+Tiers are defined in `service_config.yaml`. Adding a new tier there automatically makes it valid — no code change required.
 
-**Key Tables:**
-- `results` - Core ML service results (INSERT-only pattern)
-- `merged_boxes` - Harmonized bounding boxes (DELETE+INSERT pattern) 
-- `consensus` - Voting consensus results (DELETE+INSERT pattern)
-- `postprocessing` - Spatial analysis results (INSERT-only pattern)
-- `images` - Source images with URLs/paths for recovery operations
-
-**Key Design Decisions:**
-- **DELETE+INSERT** for merged_boxes/consensus (clean JOINs, atomic re-harmonization)
-- **INSERT-only** for postprocessing (no update conflicts, parallel worker safety)
-- **Foreign key constraints** ensure referential integrity across the pipeline
-- **Monitoring views** provide real-time processing status
-- **Performance indexes** optimize worker query patterns
+---
 
 ## Configuration
 
-### Service Configuration (`service_config.json`)
-Maps service names to ports, endpoints, and categorization:
-```json
-{
-  "services": {
-    "blip": {
-      "port": 7777,
-      "endpoint": "/v3/analyze", 
-      "category": "primary",
-      "description": "Image captioning with emoji mapping",
-      "enable_consensus_triggers": true
-    },
-    "face": {
-      "port": 7772,
-      "endpoint": "/v3/analyze",
-      "category": "spatial_only", 
-      "description": "Face detection",
-      "enable_consensus_triggers": true
-    }
-  }
-}
+### `service_config.yaml`
+
+Defines all services: ports, endpoints, service types, queue names, and tier assignments. Consumed by workers, api.py, and the producer.
+
+```yaml
+services:
+  primary:
+    blip:
+      queue_name: blip
+      host: localhost
+      port: 7777
+      endpoint: /v3/analyze
+      service_type: semantic, vlm
+      tier: [basic, premium]
+  postprocessing:
+    ...
+  system:
+    ...
 ```
 
-**Service Categories:**
-- **`primary`**: Whole-image ML services, included in default job submission
-- **`spatial_only`**: Bbox-region services (face/pose), handled by postprocessing workers
-- **`postprocessing`**: Caption scoring and other post-ML analysis services
+### `.env`
 
-### Worker Configuration
-Workers load configuration from `service_config.json` for service definitions and `.env` files for credentials:
+Copy `.env.example` to `.env` and fill in your values.
 
-**Service Configuration (`service_config.json`):**
-```json
-{
-  "services": {
-    "yolov8": {
-      "host": "localhost", 
-      "port": 7773,
-      "endpoint": "/v3/analyze",
-      "category": "primary",
-      "service_type": "spatial",
-      "enable_triggers": true
-    }
-  }
-}
-```
-
-**Infrastructure Configuration (`.env`):**
 ```bash
-# Infrastructure endpoints
-QUEUE_HOST=192.168.0.122
-DB_HOST=192.168.0.121
-
-# Credentials
-QUEUE_USER=animal_farm
-QUEUE_PASSWORD=your_secure_queue_password
+# Database
+DB_HOST=db.ice9.ai
+DB_NAME=animal_farm_dev
 DB_USER=animal_farm_user
-DB_PASSWORD=your_secure_db_password
+DB_PASSWORD=...
+DB_SSLMODE=prefer
+
+# RabbitMQ
+QUEUE_HOST=ice9.ai
+QUEUE_PORT=5671
+QUEUE_SSL=true
+QUEUE_USER=animal_farm
+QUEUE_PASSWORD=...
+
+# API port (default 9999)
+API_PORT=9997
 ```
 
-## Usage
+All VLM services (haiku, gemini, gpt_nano) communicate through Animal Farm service endpoints — no API keys are configured in windmill.
 
-### 1. Single Image API
+---
 
-A Flask API for submitting individual images and retrieving progressive results.
+## API
 
+Start the API server:
 ```bash
-# Start the API server (default port 9999, configurable via API_PORT)
 python api.py
+# or set API_PORT in .env
 ```
 
-#### Submit an image
+### POST /analyze
 
-File upload:
+Submit an image for processing.
+
 ```bash
-curl -X POST -F "image=@photo.jpg" http://localhost:9999/analyze
+curl -X POST \
+  -F "file=@photo.jpg" \
+  -F "tier=basic" \
+  http://localhost:9997/analyze
 ```
 
-URL-based:
-```bash
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"image_url": "http://example.com/photo.jpg"}' \
-  http://localhost:9999/analyze
-```
+Form fields:
+- `file` — image file (required)
+- `tier` — free / basic / premium / cloud (default: free)
+- `services` — comma-separated override list (default: all services for the tier)
+- `image_group` — group tag (default: api)
 
-Response (202):
+Response `202`:
 ```json
 {
-  "image_id": 391978,
+  "image_id": 517,
   "trace_id": "a1b2c3d4-...",
-  "services_submitted": ["blip", "colors", "detectron2", "..."]
+  "services_submitted": ["blip", "colors", "moondream", "yolo_v8"],
+  "image_width": 1280,
+  "image_height": 720
 }
 ```
 
-Optional parameters:
-- `services` - comma-separated list (default: all primary services)
-- `image_group` - group tag (default: `"api"`)
+### GET /status/{image_id}
 
-#### Poll for status and progressive results
+Poll for progressive results. Returns all completed data immediately, with completeness flags for each downstream step.
 
 ```bash
-curl http://localhost:9999/status/391978
+curl http://localhost:9997/status/517
 ```
-
-Returns status metadata and full results as they arrive. Clients can start using partial results immediately (e.g. show captions while waiting for object detection):
 
 ```json
 {
-  "image_id": 391978,
-  "progress": "10/14",
+  "image_id": 517,
+  "progress": "3/4",
   "is_complete": false,
-  "services_pending": ["clip", "nsfw2", "ollama", "rtmdet"],
-  "services_completed": {"blip": {"status": "success", "..."}, "..."},
-  "harmony_complete": true,
+  "primary_complete": false,
+  "downstream_pending": ["noun_consensus", "caption_summary"],
+  "services_submitted": ["blip", "colors", "moondream", "yolo_v8"],
+  "services_completed": {"blip": {...}, "colors": {...}},
+  "services_pending": ["moondream", "yolo_v8"],
   "consensus_complete": true,
-  "content_analysis_complete": true,
-  "service_results": {"blip": {"data": {"..."}, "..."}, "..."},
-  "merged_boxes": ["..."],
-  "consensus": {"..."},
-  "content_analysis": {"..."},
-  "postprocessing": ["..."]
+  "noun_consensus_complete": false,
+  "verb_consensus_complete": false,
+  "sam3_complete": false,
+  "caption_summary_complete": false,
+  "content_analysis_complete": false,
+  "service_results": {...},
+  "merged_boxes": [...],
+  "consensus": {...},
+  "postprocessing": [...],
+  "service_dispatch": [
+    {"service": "blip", "status": "complete", "dispatched_at": "..."},
+    {"service": "moondream", "status": "pending", "dispatched_at": "..."}
+  ]
 }
 ```
 
-#### Fetch final results
+### GET /results/{image_id}
+
+Full results without status metadata. Use when processing is confirmed complete.
+
+---
+
+## Batch Processing
 
 ```bash
-curl http://localhost:9999/results/391978
-```
+# Submit all unprocessed images for all primary services
+./producer.sh --limit 1000
 
-Returns the full analysis output without status metadata. Use this when processing is complete and you just need the data.
-
-### 2. Batch Processing
-```bash
-# Submit jobs to all PRIMARY services (safe default)
-./producer.sh --limit 100000
-
-# Process a specific image group
+# Submit a specific image group
 ./producer.sh --group coco2017 --limit 10000
+
+# Resume from a specific image_id
+./producer.sh --start-id 50000 --limit 5000
 ```
 
-Note: Selecting individual services has been intentionally removed to prevent data inconsistencies. The producer now targets the primary, safe set by design.
+The producer reads from the `images` table and dispatches to all primary service queues for the configured tier.
 
-### 2. Worker Management
+---
+
+## Worker Management
+
 ```bash
 # Start all workers
 ./windmill.sh start
 
-# Start specific workers  
-./windmill.sh start bbox_merger
-./windmill.sh start blip
-./windmill.sh start consensus
+# Start a specific worker
+./windmill.sh start harmony_worker
+./windmill.sh start noun_consensus_worker
 
 # Stop all workers
 ./windmill.sh stop
 
-# Stop specific worker
-./windmill.sh stop ollama
+# Stop a specific worker
+./windmill.sh stop blip_worker
 
-# Reset all workers (stop and start)
+# Restart all workers
 ./windmill.sh reset
 
-# Check worker status
+# Check status (reads from worker_registry table)
 ./windmill.sh status
 ```
 
-**Available Workers (Dynamically Detected):**
-- **ML Service Workers**: blip, clip, colors, detectron2, xception, metadata, nsfw2, ocr, ollama, rtdetr, yolov8, yolo_365, yolo_oi7
-- **Processing Workers**: harmony (harmonization), consensus (voting), caption_score
-- **Postprocessing Workers**: bbox_colors, bbox_face, bbox_pose (spatial analysis)
+Worker state is persisted in `.windmill_state`. Workers auto-register in the `worker_registry` table and send heartbeats every 30 seconds. The `registry_sweeper_worker` marks stale workers (no heartbeat for 90s) as offline.
 
-**Note**: The `windmill.sh` script automatically detects all available worker files and can start/stop/reset individual workers or all workers. ML service workers will only start successfully if the corresponding services are running on their configured ports.
+---
 
-### 3. Monitor Progress
+## Job Lifecycle
+
+Every primary service dispatch is tracked in `service_dispatch`:
+
+| Status | Meaning |
+|--------|---------|
+| pending | Dispatched to queue, not yet processed |
+| complete | Worker wrote a result successfully |
+| failed | Worker caught an error and nacked the message |
+| dead-lettered | Message exceeded retries and landed in the DLQ |
+
+The `dlq_worker` consumes from all `.dlq` queues and writes `dead-lettered` with the x-death reason. This makes `service_dispatch` the authoritative lifecycle view — polling `results` for stale detection is no longer needed.
+
+---
+
+## Observability
+
+### Check service dispatch status
 ```sql
--- Check processing status
-SELECT service, COUNT(*), 
-       COUNT(*) FILTER (WHERE status = 'success') as success_count
-FROM results GROUP BY service;
-
--- Check harmonization status
-SELECT COUNT(*) as total_merged_boxes FROM merged_boxes;
-
--- Check spatial enrichment status
-SELECT COUNT(*) as total_enrichments FROM postprocessing;
+SELECT service, status, count(*)
+FROM service_dispatch
+GROUP BY service, status
+ORDER BY service, status;
 ```
 
-## Key Features
-
-### Fault Tolerance
-- Services can fail independently without blocking others
-- Workers automatically retry failed jobs
-- Bbox harmonization works with any subset of services (1, 2, or 3)
-
-### Horizontal Scaling  
-- Add workers by copying `.env` files to new machines
-- RabbitMQ automatically load-balances across workers
-- No coordination between workers needed
-
-### Progressive Processing
-- **Immediate results** that improve over time
-- **No blocking** - each service processes independently  
-- **Automatic re-harmonization** when new services complete
-
-### Spatial Intelligence
-- **True bbox-level analysis** via in-memory cropping
-- **Face detection** on person bounding boxes → 🙂 emoji results
-- **Color analysis** on all bounding boxes → Full Prismacolor palettes
-- **Zero file I/O** during processing (legal/performance benefits)
-
-## Complete Processing Pipeline Flow
-
-```
-1. Images → Primary Service Queues → Distributed ML Workers
-    ↓        ↓         ↓            ↓            ↓
-  BLIP   CLIP   Colors  Detectron2  Xception  Metadata  
-  OCR    NSFW2  Ollama  RT-DETR     YOLOv8    YOLO_365  YOLO_OI7
-                     ↓
-2. All Primary Results → PostgreSQL results table
-                     ↓  
-3. Bbox Services → queue_harmony → harmony_worker → merged_boxes table
-                     ↓ (Crops bboxes and dispatches to postprocessing queues)
-4. ALL Services → queue_consensus → consensus_worker → consensus table (V3 Voting Algorithm)
-                     ↓
-5. Cropped Bboxes → Distributed Postprocessing Queues → Postprocessing Workers:
-   • queue_bbox_colors → bbox_colors_worker → Colors Service (port 7770) → postprocessing table  
-   • queue_bbox_face → bbox_face_worker → Face Service (port 7772) → postprocessing table
-   • queue_bbox_pose → bbox_pose_worker → Pose Service (port 7786) → postprocessing table
-```
-
-**Complete Pipeline Example:**
-- T+0s: Colors, CLIP complete → queue_consensus → Consensus worker runs V3 voting on 2 services
-- T+3s: YOLOv8 completes → queue_bbox_merge → Bbox merger harmonizes YOLOv8 alone, dispatches to postprocessing queues
-- T+5s: RT-DETR, BLIP complete → queue_bbox_merge → Bbox merger re-harmonizes YOLOv8+RT-DETR
-- T+8s: All primary services complete → Final bbox harmonization and consensus across all services
-- T+10s: Postprocessing queues → Workers process cropped regions in parallel → Face/pose/color analysis
-
-## Performance Characteristics
-
-- **Throughput**: Scales linearly with worker count
-- **Latency**: Results available immediately after first service  
-- **Resource usage**: GPU services can run on dedicated hardware
-- **Storage**: ~1KB per result, ~10KB per merged box, ~5KB per enrichment
-
-## Deployment
-
-See INSTALLATION.md for a setup guide (RabbitMQ/PostgreSQL anywhere, single‑machine or split infra).
-
-See RUNBOOK.md for operations (restart order, DLQ triage, reprocessing).
-
-## Deployment Patterns
-
-### Single Machine Development
+### Check queue depths
 ```bash
-# Terminal 1: Start ML services (blip:7777, clip:7788, yolov8:7773, face:7772, etc.)
-# Terminal 2: ./windmill.sh start harmony consensus
-# Terminal 3: ./windmill.sh start blip clip colors yolov8
-# Terminal 4: ./windmill.sh start bbox_colors bbox_face bbox_pose
-```
+# Via RabbitMQ management UI
+http://your-host:15672
 
-### Cloud Scaling
-- **Queue workers** scale elastically based on queue depth
-- **GPU workers** can use spot instances for cost optimization
-- **Storage tier** can use managed PostgreSQL for reliability
-
-## Troubleshooting
-
-### Common Issues
-
-**Worker stops processing:**
-```bash
-# Check queue has jobs
-curl -u animal_farm:your_secure_queue_password [server]:15672/api/queues
-
-# Check service is responding  
-curl http://localhost:7770/analyze
-```
-
-**Bbox merger not running:**
-```sql
--- Check for new bbox results
-SELECT COUNT(*) FROM results WHERE service IN ('yolov8','rtdetr','detectron2');
-
--- Check merger processed them
-SELECT COUNT(*) FROM merged_boxes;
-```
-
-**Spatial enrichment failing:**
-```bash  
-# Check face/colors services
-curl -X POST -F "file=@test.jpg" http://localhost:7772/analyze
-curl -X POST -F "file=@test.jpg" http://localhost:7770/analyze
-```
-
-### Monitoring Commands
-```bash
-# Queue depths
+# Via CLI
 rabbitmqctl list_queues name messages
-
-# Processing rates  
-watch 'psql -c "SELECT COUNT(*) FROM results"'
-
-# Worker logs
-tail -f /var/log/animal-farm/workers.log
 ```
 
-### Dead Letter Queues (DLQ)
+### Check processing rates
+```sql
+-- Results per service
+SELECT service, COUNT(*), COUNT(*) FILTER (WHERE status = 'success') AS success_count
+FROM results GROUP BY service ORDER BY service;
 
-All queues are created with a paired DLQ and sane defaults (TTL/max length). Each queue `X` has a dead-letter queue `X.dlq`.
+-- Harmonized boxes
+SELECT COUNT(*) FROM merged_boxes;
 
-Inspect DLQs via RabbitMQ UI (Queues tab) or CLI:
+-- Postprocessing results
+SELECT service, COUNT(*) FROM postprocessing GROUP BY service;
+```
+
+### Worker logs
 ```bash
-# List DLQs quickly via utility
-QUEUE_HOST=... QUEUE_USER=... QUEUE_PASSWORD=... \
-python utils/list_dlqs.py
+tail -f logs/harmony_worker.log
+tail -f logs/noun_consensus_worker.log
 ```
 
-Requeue items from a DLQ back to the original queue:
-- Recommended: Use the RabbitMQ UI (Queues → <queue>.dlq → Get messages → Requeue to original)
-- Or use the utility script:
+---
 
+## Dead Letter Queues
+
+Every queue `X` has a paired `X.dlq`. The `dlq_worker` automatically consumes all DLQs and records the failure reason.
+
+To inspect DLQs:
+```bash
+QUEUE_HOST=... QUEUE_USER=... QUEUE_PASSWORD=... python utils/list_dlqs.py
+```
+
+To requeue from a DLQ:
 ```bash
 QUEUE_HOST=... QUEUE_USER=... QUEUE_PASSWORD=... \
-python utils/requeue_from_dlq.py queue_harmony --limit 500
+  python utils/requeue_from_dlq.py harmony --limit 500
 ```
 
-Notes:
-- DLQs accumulate messages that exceeded retries/TTL or were negatively acknowledged repeatedly.
-- Investigate root-cause via worker logs before mass requeueing.
+Alternatively use the RabbitMQ management UI: Queues → select a `.dlq` → Get messages or enable the Shovel plugin for bulk requeue.
 
-#### Using RabbitMQ Web UI
+Investigate the failure reason (logged in `service_dispatch.failed_reason`) before mass requeueing.
 
-1) Inspect DLQs
-- Go to Queues → filter for `.dlq` queues → click a DLQ
-- Check “Messages” panel for total, ready/unacked, and rates
+---
 
-2) Peek messages
-- In the DLQ page, click “Get messages”, set a small count (e.g., 10)
-- Ack mode:
-  - “Ack & remove” to drain samples
-  - “Requeue” puts them back into the same DLQ (not original queue)
+## Database Schema
 
-3) Purge a DLQ
-- DLQ page → “Purge Messages” (deletes all messages in the DLQ)
+Full schema in `db/db.sql`. Key tables:
 
-4) Bulk requeue DLQ → original queue (UI shovel)
-- Enable shovels (one-time on the RabbitMQ host):
-  ```bash
-  rabbitmq-plugins enable rabbitmq_shovel rabbitmq_shovel_management
-  ```
-- UI → Admin → Shovels → Add new:
-  - Source: Queue = <queue>.dlq
-  - Destination: Queue = <queue>
-  - Prefetch = 100 (example), “Delete when” = idle
-  - Create; it will drain DLQ to the original queue and self-delete when idle
+| Table | Pattern | Contents |
+|-------|---------|---------|
+| images | INSERT | Source image metadata, tier, services_submitted |
+| results | INSERT | Per-service ML results |
+| service_dispatch | UPDATE | Job lifecycle per service (pending → complete/failed/dead-lettered) |
+| merged_boxes | DELETE+INSERT | Harmonized bounding boxes |
+| postprocessing | INSERT | Per-bbox service results |
+| consensus | DELETE+INSERT | V3 voting consensus |
+| noun_consensus | UPSERT | Extracted nouns, categories, confidence |
+| verb_consensus | UPSERT | Extracted verbs, SVO triples |
+| sam3_results | UPSERT | SAM3 segmentation per noun |
+| caption_summary | UPSERT | LLM-synthesized caption |
+| content_analysis | UPSERT | Scene classification |
+| worker_registry | UPSERT | Live worker heartbeats |
+
+> **Note**: `db/db.sql` may not match the live schema exactly. Always check live column names before writing queries.
+
+---
+
+## Multi-Node Deployment
+
+Workers are stateless — any machine with `.env` credentials and a `*_worker.py` matching the worker name can join the fleet. RabbitMQ load-balances across all consumers of the same queue automatically.
+
+```bash
+# Machine A: heavy semantic workers
+./windmill.sh start blip_worker moondream_worker ollama_worker
+
+# Machine B: spatial + postprocessing
+./windmill.sh start yolo_v8_worker harmony_worker face_worker pose_worker
+
+# Machine C: system workers
+./windmill.sh start consensus_worker noun_consensus_worker caption_summary_worker
+```
+
+---
+
+## Code Layout
+
+```
+api.py                    Flask gateway (submit, status, results)
+core/
+  image.py                Image validation and phash (no Flask dependency)
+  dispatch.py             Service resolution and downstream computation
+  results.py              All DB result queries
+workers/
+  base_worker.py          BaseWorker — shared queue/DB/HTTP plumbing
+  service_config.py       ServiceConfig class, get_service_config()
+  harmony_worker.py       IoU clustering and postprocessing dispatch
+  consensus_worker.py     V3 voting
+  noun_consensus_worker.py Noun extraction, category tally
+  verb_consensus_worker.py Verb/SVO extraction
+  noun_extractor.py       spaCy-based noun/verb extraction
+  noun_utils.py           ConceptNet synonym collapse
+  caption_summary_worker.py LLM caption synthesis
+  sam3_worker.py          SAM3 segmentation dispatcher
+  dlq_worker.py           Dead-letter queue consumer
+  registry_sweeper_worker.py Stale worker cleanup
+  producer.py             Batch job submission
+service_config.yaml       Service definitions, tiers, ports
+db/db.sql                 Reference schema (not safe to run on live DB)
+utils/                    CLI utilities (list_dlqs, requeue_from_dlq, etc.)
+```
