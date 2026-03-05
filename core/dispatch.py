@@ -46,6 +46,11 @@ def compute_expected_downstream(services_submitted, config):
         for s in services_submitted
     )
 
+    has_spatial_service = any(
+        config.is_spatial_service(f'primary.{s}')
+        for s in services_submitted
+    )
+
     vlm_services = [
         s for s in services_submitted
         if config.is_vlm_service(f'primary.{s}')
@@ -55,7 +60,7 @@ def compute_expected_downstream(services_submitted, config):
 
     return {
         'consensus':        has_consensus_service,
-        'content_analysis': has_consensus_service,
+        'content_analysis': has_spatial_service,
         'noun_consensus':   has_vlm,
         'verb_consensus':   has_vlm,
         'sam3':             has_vlm,
