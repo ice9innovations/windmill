@@ -114,17 +114,17 @@ Copy `.env.example` to `.env` and fill in your values.
 
 ```bash
 # Database
-DB_HOST=db.ice9.ai
-DB_NAME=animal_farm_dev
-DB_USER=animal_farm_user
+DB_HOST=your-db-host
+DB_NAME=your_db_name
+DB_USER=your_db_user
 DB_PASSWORD=...
 DB_SSLMODE=prefer
 
 # RabbitMQ
-QUEUE_HOST=ice9.ai
+QUEUE_HOST=your-queue-host
 QUEUE_PORT=5671
 QUEUE_SSL=true
-QUEUE_USER=animal_farm
+QUEUE_USER=your_queue_user
 QUEUE_PASSWORD=...
 
 # API port (default 9999)

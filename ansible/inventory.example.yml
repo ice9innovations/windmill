@@ -1,0 +1,88 @@
+# Windmill Worker Inventory — EXAMPLE
+# Copy this file to inventory.yml and fill in your own hosts, users, and worker assignments.
+# inventory.yml is gitignored — do not commit it.
+#
+# Run playbooks from the control node:
+#   ansible-playbook ansible/windmill.yml -i ansible/inventory.yml -e op=status
+#   ansible-playbook ansible/windmill.yml -i ansible/inventory.yml -e op=start
+#   ansible-playbook ansible/windmill.yml -i ansible/inventory.yml -e op=stop
+#   ansible-playbook ansible/windmill.yml -i ansible/inventory.yml -e op=update
+#
+# Ansible is agentless — no installation needed on worker nodes.
+# Requirements on each target: SSH access + Python 3.
+
+all:
+  children:
+    # Infrastructure nodes (no windmill workers — just queue/DB hosts)
+    infra:
+      hosts:
+        db-host.local:
+          ansible_host: 192.168.1.10
+          ansible_user: youruser
+          worker_types: []  # PostgreSQL host — no windmill workers
+        queue-host.local:
+          ansible_host: 192.168.1.11
+          ansible_user: youruser
+          worker_types: []  # RabbitMQ host — no windmill workers
+
+    # ARM / edge nodes (face, pose, postprocessing)
+    edge_nodes:
+      hosts:
+        edge1.local:
+          ansible_host: 192.168.1.20
+          ansible_user: youruser
+          worker_types:
+            - face_worker
+            - pose_worker
+            - colors_worker
+            - colors_post_worker
+            - nudenet_worker
+
+        edge2.local:
+          ansible_host: 192.168.1.21
+          ansible_user: youruser
+          worker_types:
+            - yolo_v8_worker
+            - colors_worker
+
+    # Primary x86 processing node
+    primary:
+      hosts:
+        primary.local:
+          ansible_host: primary.local
+          ansible_user: youruser
+          ansible_connection: local  # if running Ansible from this machine
+          worker_types:
+            - blip_worker
+            - caption_score_worker
+            - caption_summary_worker
+            - colors_worker
+            - consensus_worker
+            - content_analysis_worker
+            - dlq_worker
+            - gemini_worker
+            - gpt_nano_worker
+            - haiku_worker
+            - harmony_worker
+            - metadata_worker
+            - moondream_worker
+            - noun_consensus_worker
+            - nudenet_worker
+            - ocr_worker
+            - ollama_worker
+            - qwen_worker
+            - registry_sweeper_worker
+            - rembg_worker
+            - sam3_worker
+            - verb_consensus_worker
+
+    # All compute nodes
+    windmill_workers:
+      children:
+        infra: {}
+        edge_nodes: {}
+        primary: {}
+      vars:
+        ansible_ssh_private_key_file: ~/.ssh/id_rsa
+        ansible_python_interpreter: /usr/bin/python3
+        windmill_path: "/home/{{ ansible_user }}/windmill"
