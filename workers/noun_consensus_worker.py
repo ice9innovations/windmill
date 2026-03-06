@@ -132,9 +132,19 @@ class NounConsensusWorker(BaseWorker):
             # Waiting for all VLMs would mean one slow or down service silently
             # kills SAM3 for the entire image.
             if self._count_vlm_results(image_id) > 0 and image_data:
+                # Adaptive threshold: always require at least 2 votes; for 5+
+                # VLMs require a majority.
+                #   n=3 → 2/3 ≈ 0.667   n=4 → 2/4 = 0.5   n=5 → 3/5 = 0.6
+                n_vlms = len(service_noun_map)
+                min_votes = max(2, (n_vlms + 1) // 2)
+                sam3_threshold = min_votes / n_vlms if n_vlms else 1.0
+                self.logger.debug(
+                    f"noun_consensus: SAM3 threshold for image {image_id}: "
+                    f">= {sam3_threshold:.3f} ({min_votes}/{n_vlms} VLMs)"
+                )
                 consensus_nouns = [
                     n['canonical'] for n in collapsed
-                    if n.get('confidence', 0) > 0.5
+                    if n.get('confidence', 0) >= sam3_threshold
                 ]
                 previous_nouns = self._sam3_previous_nouns(image_id)
                 if previous_nouns is not None and set(consensus_nouns) == previous_nouns:
@@ -176,8 +186,9 @@ class NounConsensusWorker(BaseWorker):
                             )
                             self._trigger_sam3(image_id, image_data, [top], subject_noun, tier)
 
-            # Direct caption_summary update path — catches stragglers that arrive after
-            # SAM3's noun-dedup has stabilised and won't re-trigger caption_summary.
+            # Trigger caption_summary directly — fires as soon as enough captions are
+            # available, and re-fires progressively as stragglers arrive. No longer
+            # depends on SAM3 completing first.
             if tier != 'free' and image_data:
                 self._maybe_update_caption_summary(image_id, image_data, tier)
 
@@ -231,9 +242,12 @@ class NounConsensusWorker(BaseWorker):
             return None
 
     def _maybe_update_caption_summary(self, image_id: int, image_data: str, tier: str):
-        """Trigger caption_summary re-synthesis if more VLM captions are available than
-        the last synthesis used. Covers the straggler case where a slow VLM (e.g. gpt_nano)
-        reports after SAM3 has already stabilised and won't re-trigger."""
+        """Trigger caption_summary synthesis when new VLM captions are available.
+
+        Fires on every noun_consensus message. On first run (no existing synthesis)
+        it triggers as soon as MIN_CAPTIONS are available. On subsequent runs it
+        re-triggers only when additional captions have arrived since the last synthesis,
+        covering stragglers (e.g. gpt_nano) progressively."""
         try:
             # Count captions from tier VLMs available right now
             tier_vlms = [
