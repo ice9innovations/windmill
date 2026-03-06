@@ -48,7 +48,7 @@ _mwe_set: set = set()
 _mwe_loaded: bool = False
 
 _MWE_GITHUB_URL = "https://raw.githubusercontent.com/ice9innovations/animal-farm/refs/heads/main/config/mwe.txt"
-_MWE_CACHE = os.path.join(os.path.dirname(__file__), 'mwe.txt')
+_MWE_CACHE = os.path.join(os.path.dirname(__file__), '..', 'config', 'mwe.txt')
 _MWE_AUTO_UPDATE = os.environ.get('AUTO_UPDATE', 'True').lower() == 'true'
 _MWE_TIMEOUT = float(os.environ.get('TIMEOUT', '10.0'))
 
@@ -104,6 +104,17 @@ def load_mwe() -> int:
     _mwe_loaded = True
     logger.info(f"noun_utils: {len(_mwe_set)} MWE entries ready")
     return len(_mwe_set)
+
+
+def is_mwe(phrase: str) -> bool:
+    """Return True if phrase is a recognized multi-word expression.
+
+    Accepts space- or underscore-separated input, e.g. 'qr code' or 'qr_code'.
+    Returns False if the MWE list has not been loaded yet.
+    """
+    if not _mwe_loaded:
+        return False
+    return '_'.join(phrase.lower().split()) in _mwe_set
 
 
 def _mwe_normalize(noun: str) -> str:

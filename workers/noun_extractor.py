@@ -16,6 +16,7 @@ import re
 import logging
 from collections import deque
 from typing import Dict, List, Optional
+from noun_utils import is_mwe
 
 logger = logging.getLogger(__name__)
 
@@ -357,6 +358,11 @@ def _extract_nouns_from_doc(doc) -> List[str]:
         if chunk.root.pos_ == 'PRON':
             continue
 
+        # Skip verb-rooted chunks ("looking at", "standing in") — spaCy
+        # occasionally produces noun chunks whose root is a verb or gerund.
+        if chunk.root.pos_ == 'VERB':
+            continue
+
         raw_tokens = chunk.text.lower().strip().split()
 
         # Skip negated chunks ("no people", "no text", "no nudity").
@@ -383,43 +389,50 @@ def _extract_nouns_from_doc(doc) -> List[str]:
             candidate = surface if surface in _PLURALE_TANTUM else chunk.root.lemma_.lower()
 
         else:
-            # Multi-word chunk: inspect modifier dependency types.
-            # If every non-root token is a purely adjectival/functional
-            # modifier, reduce the chunk to just the root noun — this
-            # strips colour/size/comparative adjectives that add noise
-            # without semantic distinctiveness across VLMs.
-            # If any non-root token has dep_='compound' (noun modifying
-            # noun), strip adjectival tokens and rebuild from compound+root
-            # tokens only:
-            #   "white filing cabinet"  → "filing cabinet"
-            #   "beige cardboard boxes" → "cardboard boxes"
-            #   "metal arm"             → "metal arm"  (no amod, unchanged)
-            non_root_tokens = [t for t in chunk if t != chunk.root]
-            all_adjectival = all(t.dep_ in _ADJ_DEPS for t in non_root_tokens)
-
-            if all_adjectival:
-                root = chunk.root
-                surface = root.text.lower()
-                candidate = surface if surface in _PLURALE_TANTUM else root.lemma_.lower()
+            # Multi-word chunk: check MWE list before any modifier stripping.
+            # Recognized compounds (e.g. "qr code") bypass the synset filter
+            # entirely — acronyms and technical terms often lack WordNet entries
+            # but are still valid compound nouns.
+            if is_mwe(' '.join(raw_tokens)):
+                candidate = ' '.join(raw_tokens)
             else:
-                # Keep only compound modifiers and the root — drop amod etc.
-                content_tokens = [t for t in chunk
-                                  if (t.dep_ == 'compound'
-                                      and _has_noun_synsets(t.lemma_.lower()))
-                                  or t == chunk.root]
-                if len(content_tokens) == 1:
-                    # Only the root survived stripping; reduce to root lemma
+                # Inspect modifier dependency types.
+                # If every non-root token is a purely adjectival/functional
+                # modifier, reduce the chunk to just the root noun — this
+                # strips colour/size/comparative adjectives that add noise
+                # without semantic distinctiveness across VLMs.
+                # If any non-root token has dep_='compound' (noun modifying
+                # noun), strip adjectival tokens and rebuild from compound+root
+                # tokens only:
+                #   "white filing cabinet"  → "filing cabinet"
+                #   "beige cardboard boxes" → "cardboard boxes"
+                #   "metal arm"             → "metal arm"  (no amod, unchanged)
+                non_root_tokens = [t for t in chunk if t != chunk.root]
+                all_adjectival = all(t.dep_ in _ADJ_DEPS for t in non_root_tokens)
+
+                if all_adjectival:
                     root = chunk.root
                     surface = root.text.lower()
                     candidate = surface if surface in _PLURALE_TANTUM else root.lemma_.lower()
                 else:
-                    phrase = " ".join(t.text.lower() for t in content_tokens)
-                    # Drop phrases with punctuation bleed or disjunctions
-                    if any(c in phrase for c in ('"', "'", ',')):
-                        continue
-                    if ' or ' in phrase or ' and ' in phrase:
-                        continue
-                    candidate = phrase
+                    # Keep only compound modifiers and the root — drop amod etc.
+                    content_tokens = [t for t in chunk
+                                      if (t.dep_ == 'compound'
+                                          and _has_noun_synsets(t.lemma_.lower()))
+                                      or t == chunk.root]
+                    if len(content_tokens) == 1:
+                        # Only the root survived stripping; reduce to root lemma
+                        root = chunk.root
+                        surface = root.text.lower()
+                        candidate = surface if surface in _PLURALE_TANTUM else root.lemma_.lower()
+                    else:
+                        phrase = " ".join(t.text.lower() for t in content_tokens)
+                        # Drop phrases with punctuation bleed or disjunctions
+                        if any(c in phrase for c in ('"', "'", ',')):
+                            continue
+                        if ' or ' in phrase or ' and ' in phrase:
+                            continue
+                        candidate = phrase
 
         # Strip any surviving leading/trailing punctuation and validate.
         candidate = _clean_surface(candidate)
@@ -442,22 +455,55 @@ def _extract_nouns_from_doc(doc) -> List[str]:
             if surface in _PLURALE_TANTUM:
                 seen_lemmas.add(surface)
 
-    # Capture standalone nouns not already covered by a chunk
+    # Sliding window MWE scan: catch recognized compounds that spaCy's chunker
+    # missed. This is the sentence-level pass that was present in Animal Farm's
+    # individual VLM services (via NLTK MWETokenizer) but was not carried over
+    # when noun extraction was centralized into Windmill.
+    #
+    # Scans windows of 2–4 tokens against _mwe_set. Found compounds are added
+    # to nouns and their component token lemmas are marked as seen so the
+    # standalone pass below does not re-add bare head words (e.g. "retriever"
+    # after "golden retriever" is found here).
+    _MAX_MWE_LEN = 4  # no entry in the MWE set exceeds 4 words
+    doc_tokens = list(doc)
+    for start in range(len(doc_tokens)):
+        for length in range(_MAX_MWE_LEN, 1, -1):
+            end = start + length
+            if end > len(doc_tokens):
+                continue
+            window = doc_tokens[start:end]
+            phrase = ' '.join(t.text.lower() for t in window)
+            # Only accept MWE matches that are noun-headed: the last token
+            # must be a NOUN or PROPN. Filters verb-phrase MWEs like
+            # "looking_at" that exist in the list but aren't noun compounds.
+            if (is_mwe(phrase)
+                    and phrase not in seen
+                    and window[-1].pos_ in ('NOUN', 'PROPN')):
+                seen.add(phrase)
+                nouns.append(phrase)
+                for t in window:
+                    seen_lemmas.add(t.lemma_.lower())
+                    seen_lemmas.add(t.text.lower())
+                break  # don't try shorter windows starting at this position
+
+    # Capture standalone nouns not already covered by a chunk or MWE scan.
     for token in doc:
         if token.pos_ == "NOUN" and not token.is_stop:
             surface = token.text.lower().strip()
             # Preserve plurale tantum as-is; lemmatize everything else
             candidate = surface if surface in _PLURALE_TANTUM else token.lemma_.lower().strip()
             candidate = _clean_surface(candidate)
-            if (candidate
-                    and len(candidate) > 1
-                    and _VALID_NOUN_RE.match(candidate)
-                    and candidate not in seen
-                    and candidate not in seen_lemmas
-                    and candidate not in _STOP_NOUNS):
-                seen.add(candidate)
-                seen_lemmas.add(candidate)
-                nouns.append(candidate)
+            if (not candidate
+                    or len(candidate) < 2
+                    or not _VALID_NOUN_RE.match(candidate)
+                    or candidate in seen
+                    or candidate in seen_lemmas
+                    or candidate in _STOP_NOUNS):
+                continue
+
+            seen.add(candidate)
+            seen_lemmas.add(candidate)
+            nouns.append(candidate)
 
     return nouns
 
