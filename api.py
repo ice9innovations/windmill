@@ -193,7 +193,6 @@ def analyze():
     URL-based submission is not supported — send the image bytes directly.
 
     Optional form fields:
-      - services:     comma-separated service list (default: tier-appropriate primary services)
       - image_group:  group tag for the image (default: 'api')
       - tier:         customer tier — free, basic, premium, cloud (default: 'free')
     """
@@ -209,7 +208,6 @@ def analyze():
 
     image_bytes    = file.read()
     image_filename = file.filename or 'upload.jpg'
-    services_param = request.form.get('services')
     image_group    = request.form.get('image_group', 'api')
     tier           = request.form.get('tier', 'free')
 
@@ -233,10 +231,7 @@ def analyze():
     except Exception as e:
         app.logger.warning("Perceptual hash computation failed: %s", e)
 
-    # Validate services
-    service_names, err = resolve_services(services_param, tier, config)
-    if err:
-        return jsonify({"error": err}), 400
+    service_names = resolve_services(tier, config)
 
     # Register image metadata — bytes are never stored anywhere
     try:
@@ -321,7 +316,7 @@ def status(image_id):
 
         # Image metadata
         cur.execute(
-            """SELECT image_filename, image_group, services_submitted, image_created
+            """SELECT image_filename, image_group, services_submitted, image_created, tier
                FROM images WHERE image_id = %s""",
             (image_id,),
         )
@@ -330,6 +325,7 @@ def status(image_id):
             return jsonify({"error": "Image not found"}), 404
 
         services_submitted = image_row['services_submitted'] or []
+        tier = image_row['tier'] or 'free'
 
         # Per-service completion status
         cur.execute(
@@ -356,7 +352,7 @@ def status(image_id):
         vlm_services = [s for s in services_submitted if s in vlm_short_names]
 
         primary_complete     = done == total and total > 0
-        expected_downstream  = compute_expected_downstream(services_submitted, config)
+        expected_downstream  = compute_expected_downstream(services_submitted, config, tier)
         downstream_pending   = [
             svc for svc, expected in expected_downstream.items()
             if expected and results_data.get(svc) is None

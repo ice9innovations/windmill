@@ -2,14 +2,14 @@
 """
 CaptionSummaryWorker - Synthesize VLM captions into a single description.
 
-Triggered by SAM3 after it has finalized noun consensus for an image.
-By that point all VLMs that will return for this image have returned,
-and SAM3-validated noun data is available.
+Triggered by noun_consensus_worker as VLM captions arrive. Fires as soon
+as MIN_CAPTIONS are available and re-fires progressively as stragglers
+arrive. Does not depend on SAM3 completing first.
 
 Collects:
   - All available VLM captions (from results table)
-  - Noun consensus with SAM3-validated nouns and vote counts
-  - Verb consensus with vote counts
+  - Noun consensus with vote counts (from noun_consensus table)
+  - Verb consensus with vote counts (from verb_consensus table)
 
 Sends captions and consensus data to the caption-synthesis Animal Farm
 service, which synthesizes them into a single sentence and returns it.

@@ -7,36 +7,30 @@ service_config.yaml location).
 """
 
 
-def resolve_services(services_param, tier, config):
-    """Resolve a comma-separated service list, or return tier-appropriate primary services.
+def resolve_services(tier, config):
+    """Return the tier-appropriate primary services.
 
-    Returns (service_names, error_string_or_None).
-    On success error is None; on failure service_names is None.
+    Tier is the sole control over which services run. There is no mechanism
+    for callers to request a specific service list — that would allow tier bypass.
+
+    Returns a sorted list of short service names (e.g. ['blip', 'colors', ...]).
     """
-    primary   = config.get_services_by_category('primary')
-    available = sorted(name.split('.', 1)[1] for name in primary.keys())
-
-    if not services_param:
-        tier_services = config.get_services_by_tier(tier)
-        return sorted(
-            name.split('.', 1)[1]
-            for name in tier_services.keys()
-            if name.startswith('primary.')
-        ), None
-
-    requested = [s.strip() for s in services_param.split(',')]
-    invalid   = [s for s in requested if s not in available]
-    if invalid:
-        return None, f"Unknown services: {', '.join(invalid)}. Available: {', '.join(available)}"
-    return requested, None
+    tier_services = config.get_services_by_tier(tier)
+    return sorted(
+        name.split('.', 1)[1]
+        for name in tier_services.keys()
+        if name.startswith('primary.')
+    )
 
 
-def compute_expected_downstream(services_submitted, config):
-    """Determine which downstream services are expected based on submitted primary services.
+def compute_expected_downstream(services_submitted, config, tier='free'):
+    """Determine which downstream services are expected based on submitted primary services and tier.
 
     Returns a dict of {downstream_name: bool} indicating whether each downstream
     service is expected to eventually produce a result for this image.
-    Uses service_config so the logic adapts when services change.
+
+    SAM3, content_analysis, and caption_summary are basic+ only — they are never
+    triggered for free-tier images regardless of which primary services ran.
     """
     if not services_submitted:
         return {}
@@ -57,12 +51,13 @@ def compute_expected_downstream(services_submitted, config):
     ]
     has_vlm       = len(vlm_services) > 0
     has_multi_vlm = len(vlm_services) >= 2
+    premium       = tier != 'free'
 
     return {
         'consensus':        has_consensus_service,
-        'content_analysis': has_spatial_service,
+        'content_analysis': has_spatial_service and premium,
         'noun_consensus':   has_vlm,
         'verb_consensus':   has_vlm,
-        'sam3':             has_vlm,
-        'caption_summary':  has_multi_vlm,
+        'sam3':             has_vlm and premium,
+        'caption_summary':  has_multi_vlm and premium,
     }
