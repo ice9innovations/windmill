@@ -57,6 +57,18 @@ services:
         - premium
         - cloud
 
+    qr:
+      queue_name: qr
+      host: localhost
+      port: 7801
+      endpoint: /v3/analyze
+      service_type: specialized
+      tier:
+        - free
+        - basic
+        - premium
+        - cloud
+
     nudenet:
       queue_name: nudenet
       host: localhost
