@@ -14,7 +14,6 @@ import psycopg2
 import argparse
 import base64
 import requests
-import imagehash
 from datetime import datetime
 from dotenv import load_dotenv
 from PIL import Image
@@ -252,20 +251,6 @@ class GenericProducer:
             print(f"❌ Database error: {e}")
             return None
     
-    def _backfill_phash(self, image_id, image_bytes):
-        """Compute and store pHash for an image if not already set."""
-        try:
-            phash = str(imagehash.phash(Image.open(io.BytesIO(image_bytes))))
-            cursor = self.db_conn.cursor()
-            cursor.execute(
-                "UPDATE images SET image_phash = %s WHERE image_id = %s AND image_phash IS NULL",
-                (phash, image_id)
-            )
-            self.db_conn.commit()
-            cursor.close()
-        except Exception as e:
-            print(f"⚠️  Failed to backfill pHash for image {image_id}: {e}")
-
     def process_image_row(self, row):
         """Process a single database row into image data"""
         image_data = {
@@ -291,7 +276,6 @@ class GenericProducer:
                 image_data["image_data"] = base64.b64encode(image_bytes).decode('utf-8')
                 image_data["image_width"] = width
                 image_data["image_height"] = height
-                self._backfill_phash(image_data["image_id"], image_bytes)
                 return image_data
             except Exception as e:
                 print(f"⚠️  Failed to fetch image from URL {image_url}: {e}")
@@ -308,7 +292,6 @@ class GenericProducer:
                     image_data["image_data"] = base64.b64encode(image_bytes).decode('utf-8')
                     image_data["image_width"] = width
                     image_data["image_height"] = height
-                self._backfill_phash(image_data["image_id"], image_bytes)
                 return image_data
             except Exception as e:
                 print(f"⚠️  Failed to read image {image_path}: {e}")

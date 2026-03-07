@@ -22,7 +22,7 @@ from flask import Flask, request, jsonify
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'workers'))
 sys.path.insert(0, os.path.dirname(__file__))
 from service_config import get_service_config
-from core.image import validate_and_normalize_image, compute_phash
+from core.image import validate_and_normalize_image
 from core.dispatch import resolve_services, compute_expected_downstream
 from core.results import fetch_results
 
@@ -224,13 +224,6 @@ def analyze():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    # Perceptual hash — computed from the normalized image
-    phash = None
-    try:
-        phash = compute_phash(image_bytes)
-    except Exception as e:
-        app.logger.warning("Perceptual hash computation failed: %s", e)
-
     service_names = resolve_services(tier, config)
 
     # Register image metadata — bytes are never stored anywhere
@@ -238,10 +231,10 @@ def analyze():
         db  = get_db()
         cur = db.cursor()
         cur.execute(
-            """INSERT INTO images (image_filename, image_group, services_submitted, image_phash, tier)
-               VALUES (%s, %s, %s, %s, %s)
+            """INSERT INTO images (image_filename, image_group, services_submitted, tier)
+               VALUES (%s, %s, %s, %s)
                RETURNING image_id""",
-            (image_filename, image_group, service_names, phash, tier),
+            (image_filename, image_group, service_names, tier),
         )
         image_id = cur.fetchone()[0]
         # Record pending dispatch for all primary services — best-effort tracking.

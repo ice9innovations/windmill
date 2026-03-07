@@ -44,16 +44,12 @@ CREATE TABLE images (
     -- CLIP image embedding (ViT-L/14, 768-dimensional, normalized)
     -- Written once on first caption score; used for image similarity search
     image_clip_embedding  vector(768),
-    -- Perceptual hash (pHash) for duplicate detection across formats/resolutions
-    -- 16-char hex string; compare via Hamming distance (0-4 bits = same image)
-    image_phash           VARCHAR(16),
     -- Customer tier at submission time; gates which downstream services fire
     tier                  VARCHAR(20) DEFAULT 'free'
 );
 
 CREATE INDEX idx_images_group ON images(image_group);
 CREATE INDEX idx_images_filename ON images(image_filename);
-CREATE INDEX idx_images_phash ON images(image_phash);
 -- HNSW index for fast approximate cosine similarity search across image embeddings
 CREATE INDEX idx_images_clip_embedding ON images USING hnsw (image_clip_embedding vector_cosine_ops);
 

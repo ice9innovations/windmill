@@ -6,7 +6,6 @@ No Flask dependency. All operations are in-memory — no temp files, no disk I/O
 import io
 import os
 
-import imagehash
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 
@@ -73,8 +72,3 @@ def validate_and_normalize_image(image_bytes, max_dimension=None):
     img.save(buf, format=save_format)
     return buf.getvalue(), width, height
 
-
-def compute_phash(image_bytes):
-    """Compute a 64-bit perceptual hash of the image. Returns a 16-char hex string."""
-    img = Image.open(io.BytesIO(image_bytes))
-    return str(imagehash.phash(img))
