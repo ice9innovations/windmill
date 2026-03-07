@@ -478,6 +478,7 @@ def _extract_nouns_from_doc(doc) -> List[str]:
             # "looking_at" that exist in the list but aren't noun compounds.
             if (is_mwe(phrase)
                     and phrase not in seen
+                    and not all(t.lemma_.lower() in seen_lemmas for t in window)
                     and window[-1].pos_ in ('NOUN', 'PROPN')):
                 seen.add(phrase)
                 nouns.append(phrase)
