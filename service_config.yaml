@@ -24,7 +24,7 @@ services:
       queue_name: florence2
       host: localhost
       port: 7803
-      endpoint: /v3/analyze?task=DETAILED_CAPTION
+      endpoint: /v3/analyze?task=CAPTION
       service_type: semantic, vlm
       tier:
         - basic
