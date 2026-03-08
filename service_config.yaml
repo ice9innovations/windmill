@@ -20,6 +20,16 @@ services:
         - basic
         - premium
 
+    florence2:
+      queue_name: florence2
+      host: localhost
+      port: 7803
+      endpoint: /v3/analyze?task=DETAILED_CAPTION
+      service_type: semantic, vlm
+      tier:
+        - basic
+        - premium
+
     colors:
       queue_name: colors
       host: localhost
@@ -253,6 +263,15 @@ services:
       host: localhost
       port: 9779
       endpoint: /analyze
+      tier:
+        - system
+
+    florence2_grounding:
+      queue_name: florence2_grounding
+      host: localhost
+      port: 7803
+      endpoint: /v3/analyze
+      service_type: grounding
       tier:
         - system
 
