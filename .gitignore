@@ -6,6 +6,7 @@ del/
 windmill_venv/
 workers/conceptnet_cache.pkl
 workers/mwe.txt
+config/mwe.txt
 .windmill_state
 ansible/inventory.yml
 
