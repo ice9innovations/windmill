@@ -23,14 +23,15 @@ from datetime import datetime
 sys.path.append(os.path.dirname(__file__))
 
 from base_worker import BaseWorker
+from service_config import get_service_config
 from noun_utils import collapse_synonyms, warmup_wordnet, load_conceptnet, load_mwe, apply_mwe_normalization
 from noun_extractor import extract_nouns, categorize_nouns, extract_subject, extract_nouns_and_subject, warmup_noun_extractor
 
 logger = logging.getLogger(__name__)
 
 # Services whose noun lists participate in consensus.
-# Matches the 'vlm' service_type entries in service_config.yaml.
-VLM_SERVICES = ['blip', 'gemini', 'gpt_nano', 'haiku', 'moondream', 'ollama', 'qwen']
+# Derived from service_type: vlm entries in service_config.yaml — do not hardcode here.
+VLM_SERVICES = get_service_config().get_vlm_service_names()
 
 
 class NounConsensusWorker(BaseWorker):
@@ -132,19 +133,23 @@ class NounConsensusWorker(BaseWorker):
             # Waiting for all VLMs would mean one slow or down service silently
             # kills SAM3 for the entire image.
             if self._count_vlm_results(image_id) > 0 and image_data:
-                # Adaptive threshold: always require at least 2 votes; for 5+
-                # VLMs require a majority.
-                #   n=3 → 2/3 ≈ 0.667   n=4 → 2/4 = 0.5   n=5 → 3/5 = 0.6
-                n_vlms = len(service_noun_map)
-                min_votes = max(2, (n_vlms + 1) // 2)
-                sam3_threshold = min_votes / n_vlms if n_vlms else 1.0
+                # Threshold based on tier's total expected VLM count, not how
+                # many have reported so far. This keeps the bar stable across
+                # all progressive triggers — a noun that passes on trigger 1
+                # should still pass on trigger 5, and vice versa.
+                tier_vlm_count = len([
+                    name for name in self.config.get_services_by_tier(tier)
+                    if name.startswith('primary.')
+                    and name.split('.', 1)[1] in VLM_SERVICES
+                ]) or len(service_noun_map)
+                min_votes = max(2, (tier_vlm_count + 1) // 2)
                 self.logger.debug(
-                    f"noun_consensus: SAM3 threshold for image {image_id}: "
-                    f">= {sam3_threshold:.3f} ({min_votes}/{n_vlms} VLMs)"
+                    f"noun_consensus: grounding threshold for image {image_id}: "
+                    f">= {min_votes} votes (tier has {tier_vlm_count} VLMs)"
                 )
                 consensus_nouns = [
                     n['canonical'] for n in collapsed
-                    if n.get('confidence', 0) >= sam3_threshold
+                    if n.get('vote_count', 0) >= min_votes
                 ]
                 previous_nouns = self._sam3_previous_nouns(image_id)
                 if previous_nouns is not None and set(consensus_nouns) == previous_nouns:
@@ -154,6 +159,7 @@ class NounConsensusWorker(BaseWorker):
                     )
                 elif consensus_nouns:
                     self._trigger_sam3(image_id, image_data, consensus_nouns, subject_noun, tier)
+                    self._trigger_florence2_grounding(image_id, image_data, consensus_nouns, subject_noun, tier)
                 else:
                     # No consensus reached — promote the top noun if it's a clear
                     # leader (strictly ahead of second place). Fires only when the
@@ -185,6 +191,7 @@ class NounConsensusWorker(BaseWorker):
                                 category_tally=category_tally,
                             )
                             self._trigger_sam3(image_id, image_data, [top], subject_noun, tier)
+                            self._trigger_florence2_grounding(image_id, image_data, [top], subject_noun, tier)
 
             # Trigger caption_summary directly — fires as soon as enough captions are
             # available, and re-fires progressively as stragglers arrive. No longer
@@ -328,6 +335,32 @@ class NounConsensusWorker(BaseWorker):
         except Exception as e:
             self.logger.error(f"noun_consensus: failed to trigger SAM3 for image {image_id}: {e}")
 
+    def _trigger_florence2_grounding(self, image_id: int, image_data: str, nouns: list, subject_noun: str = None, tier: str = 'free'):
+        """Publish a Florence-2 grounding request for the final noun consensus (basic+ only)."""
+        if tier == 'free':
+            self.logger.debug(f"noun_consensus: skipping Florence-2 grounding for free tier image {image_id}")
+            return
+        try:
+            queue_name = self._get_queue_by_service_type('grounding')
+            self._record_service_dispatch(image_id, 'florence2_grounding', None)
+            self._enqueue_publish(
+                queue_name,
+                json.dumps({
+                    'image_id': image_id,
+                    'image_data': image_data,
+                    'nouns': nouns,
+                    'subject_noun': subject_noun,
+                    'triggered_at': datetime.now().isoformat(),
+                    'tier': tier,
+                }),
+            )
+            self.logger.info(
+                f"noun_consensus: triggered Florence-2 grounding for image {image_id} "
+                f"with {len(nouns)} nouns: {nouns}"
+            )
+        except Exception as e:
+            self.logger.error(f"noun_consensus: failed to trigger Florence-2 grounding for image {image_id}: {e}")
+
 
     def _fetch_vlm_nouns(self, image_id: int) -> tuple:
         """
@@ -470,21 +503,31 @@ class NounConsensusWorker(BaseWorker):
                 VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
                 ON CONFLICT (image_id) DO UPDATE SET
                     nouns = (
-                        -- Preserve sam3_validated=true from the existing row.
-                        -- noun_consensus runs once per VLM completion; SAM3 can
-                        -- validate between the first and last VLM triggers, so
-                        -- later upserts must not clear flags set by SAM3.
+                        -- Preserve sam3_validated and grounding_validated from
+                        -- the existing row. noun_consensus runs once per VLM
+                        -- completion; SAM3 and Florence-2 grounding can validate
+                        -- between the first and last VLM triggers, so later
+                        -- upserts must not clear flags set by those workers.
                         SELECT jsonb_agg(
-                            CASE
-                                WHEN EXISTS (
+                            new_n
+                            || CASE WHEN EXISTS (
                                     SELECT 1
                                     FROM jsonb_array_elements(noun_consensus.nouns) old_n
                                     WHERE (old_n->>'canonical') = (new_n->>'canonical')
                                       AND (old_n->>'sam3_validated')::boolean = true
                                 )
-                                THEN new_n || '{"sam3_validated": true}'::jsonb
-                                ELSE new_n
-                            END
+                                THEN '{"sam3_validated": true}'::jsonb
+                                ELSE '{}'::jsonb
+                               END
+                            || CASE WHEN EXISTS (
+                                    SELECT 1
+                                    FROM jsonb_array_elements(noun_consensus.nouns) old_n
+                                    WHERE (old_n->>'canonical') = (new_n->>'canonical')
+                                      AND (old_n->>'grounding_validated')::boolean = true
+                                )
+                                THEN '{"grounding_validated": true}'::jsonb
+                                ELSE '{}'::jsonb
+                               END
                         )
                         FROM jsonb_array_elements(EXCLUDED.nouns) new_n
                     ),

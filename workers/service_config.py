@@ -166,6 +166,13 @@ class ServiceConfig:
         """Get list of all spatial service names"""
         return list(self.get_services_by_type('spatial').keys())
 
+    def get_vlm_service_names(self) -> List[str]:
+        """Get sorted short names of all VLM services (matches service column in results table)"""
+        return sorted(
+            name.split('.', 1)[1]
+            for name in self.get_services_by_type('vlm')
+        )
+
     def get_services_by_tier(self, tier: str) -> Dict[str, Dict[str, Any]]:
         """Get all services available in a specific tier"""
         matching_services = {}

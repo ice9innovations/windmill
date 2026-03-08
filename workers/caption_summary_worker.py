@@ -32,10 +32,12 @@ from datetime import datetime
 sys.path.append(os.path.dirname(__file__))
 
 from base_worker import BaseWorker
+from service_config import get_service_config
 
 logger = logging.getLogger(__name__)
 
-VLM_SERVICES = ['blip', 'gemini', 'gpt_nano', 'haiku', 'moondream', 'ollama', 'qwen']
+# Derived from service_type: vlm entries in service_config.yaml — do not hardcode here.
+VLM_SERVICES = get_service_config().get_vlm_service_names()
 
 MIN_CAPTIONS = 2  # Skip synthesis if fewer than this many VLMs returned
 

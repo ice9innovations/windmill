@@ -121,15 +121,18 @@ def _mwe_normalize(noun: str) -> str:
     """Strip adjective modifiers from compound nouns not in the MWE list.
 
     Single-word nouns are returned unchanged.
-    Multi-word nouns in MWE are returned unchanged (recognized compounds).
+    Multi-word nouns in MWE are returned unchanged (recognized compounds),
+    with one exception: plural MWEs are normalized to their singular form
+    when the singular is also in the MWE list (e.g. 'ram modules' → 'ram module').
     Multi-word nouns NOT in MWE are reduced to their head noun (last word).
 
     Examples (with MWE loaded):
-        'dirt path'  -> 'path'       (not in MWE)
-        'dirt road'  -> 'road'       (not in MWE)
-        'dirt track' -> 'dirt track' (in MWE as dirt_track)
-        'rain forest'-> 'rain forest'(in MWE as rain_forest)
-        'pangolin'   -> 'pangolin'   (single word, unchanged)
+        'dirt path'   -> 'path'       (not in MWE)
+        'dirt road'   -> 'road'       (not in MWE)
+        'dirt track'  -> 'dirt track' (in MWE as dirt_track)
+        'rain forest' -> 'rain forest'(in MWE as rain_forest)
+        'ram modules' -> 'ram module' (plural MWE → singular MWE)
+        'pangolin'    -> 'pangolin'   (single word, unchanged)
     """
     parts = noun.replace('_', ' ').split()
     if len(parts) <= 1:
@@ -138,6 +141,12 @@ def _mwe_normalize(noun: str) -> str:
         return noun
     mwe_key = '_'.join(p.lower() for p in parts)
     if mwe_key in _mwe_set:
+        # Prefer singular form when the last word is plural and singular MWE exists
+        last = parts[-1].lower()
+        if last.endswith('s') and len(last) > 2:
+            singular_key = '_'.join(p.lower() for p in parts[:-1]) + '_' + last[:-1]
+            if singular_key in _mwe_set:
+                return ' '.join(parts[:-1] + [last[:-1]])
         return noun
     return parts[-1]
 
@@ -365,6 +374,18 @@ def _find_groups(all_nouns: Set[str],
                     neighbors[n1].add(n2)
                     neighbors[n2].add(n1)
 
+    # MWE head-word pass: connect a single-word noun to any recognized MWE
+    # whose last word it is (e.g. "module" ↔ "ram module", "code" ↔ "qr code").
+    # Handles the case where some VLMs extract the full compound and others
+    # extract only the head noun — both sets of votes merge into one entry.
+    single_nouns = {n for n in all_nouns if ' ' not in n}
+    mwe_nouns = {n for n in all_nouns if ' ' in n and is_mwe(n)}
+    for mwe in mwe_nouns:
+        head = mwe.split()[-1]
+        if head in single_nouns and head not in neighbors[mwe]:
+            neighbors[mwe].add(head)
+            neighbors[head].add(mwe)
+
     # BFS connected components
     visited: Set[str] = set()
     groups: List[Set[str]] = []
@@ -419,10 +440,14 @@ def _count_noun_services(service_noun_map: Dict[str, List[str]], all_nouns: set)
 
 
 def _select_canonical(group: set, noun_service_count: Dict[str, int]) -> str:
-    """Pick the canonical form for a group: most frequent surface form, ties broken alphabetically."""
+    """Pick the canonical form for a group: most frequent surface form.
+
+    Ties broken by preferring the more specific (longer) form — e.g. "ram module"
+    over "module" — then alphabetically.
+    """
     return min(
         group,
-        key=lambda n: (-noun_service_count.get(n, 0), n.lower().strip())
+        key=lambda n: (-noun_service_count.get(n, 0), -len(n.split()), n.lower().strip())
     ).lower().strip()
 
 

@@ -26,13 +26,14 @@ from datetime import datetime
 sys.path.append(os.path.dirname(__file__))
 
 from base_worker import BaseWorker
+from service_config import get_service_config
 from verb_utils import collapse_synonyms, warmup_wordnet
 from verb_extractor import extract_verbs_and_svo, warmup_verb_extractor
 
 logger = logging.getLogger(__name__)
 
-# Must match VLM_SERVICES in noun_consensus_worker.py
-VLM_SERVICES = ['blip', 'gemini', 'gpt_nano', 'haiku', 'moondream', 'ollama', 'qwen']
+# Derived from service_type: vlm entries in service_config.yaml — do not hardcode here.
+VLM_SERVICES = get_service_config().get_vlm_service_names()
 
 
 class VerbConsensusWorker(BaseWorker):
