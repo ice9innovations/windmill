@@ -62,7 +62,6 @@ services:
       endpoint: /v3/analyze
       service_type: specialized
       tier:
-        - free
         - basic
         - premium
         - cloud
