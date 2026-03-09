@@ -827,8 +827,12 @@ class BaseWorker:
             # from the same result without a separate queue/worker
             self.after_result_stored(image_id, result, message)
 
-            # Trigger post-processing for bbox services (async via background publish thread)
-            if self.service_name in self.bbox_services and self.enable_triggers:
+            # Trigger post-processing for bbox services (async via background publish thread).
+            # Harmony is only useful when multiple spatial services can contribute results.
+            # For free tier (single spatial service), skip harmony entirely.
+            tier = message.get('tier', 'free')
+            if self.service_name in self.bbox_services and self.enable_triggers \
+                    and self.config.is_available_for_tier('system.harmony', tier):
                 bbox_message = {
                     'image_id': image_id,
                     'image_filename': message.get('image_filename', f'image_{image_id}'),
@@ -837,7 +841,7 @@ class BaseWorker:
                     'service': self.service_name,
                     'worker_id': self.worker_id,
                     'processed_at': datetime.now().isoformat(),
-                    'tier': message.get('tier', 'free'),
+                    'tier': tier,
                 }
 
                 self._enqueue_publish(

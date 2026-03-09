@@ -166,6 +166,7 @@ services:
       service_type: spatial
       consensus: true
       tier:
+        - free
         - basic
         - premium
         - cloud
@@ -241,6 +242,9 @@ services:
       queue_name: harmony
       service_type: harmonization
       tier:
+        - basic
+        - premium
+        - cloud
         - system
       # prefetch: 1  # default; keep single in-flight message per worker
 
