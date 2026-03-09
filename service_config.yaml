@@ -239,6 +239,7 @@ services:
       queue_name: content_analysis
       service_type: content_analysis
       tier:
+        - free
         - basic
         - premium
         - cloud
