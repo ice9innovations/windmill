@@ -42,11 +42,6 @@ def compute_expected_downstream(services_submitted, config, tier='free'):
         for s in services_submitted
     )
 
-    has_spatial_service = any(
-        config.is_spatial_service(f'primary.{s}')
-        for s in services_submitted
-    )
-
     vlm_services = [
         s for s in services_submitted
         if config.is_vlm_service(f'primary.{s}')
