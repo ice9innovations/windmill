@@ -27,7 +27,7 @@ from PIL import Image
 
 from base_worker import BaseWorker
 from utils.semantic_validation import infer_gender_from_anatomy
-from utils.spatial_analysis import detect_sexual_activities
+from utils.spatial_analysis import detect_person_containment, detect_sexual_activities
 from utils.framing_analysis import classify_framing
 
 SPATIAL_ANALYSIS_VERSION = 'spatial_1.0'
@@ -73,11 +73,17 @@ class NudenetWorker(BaseWorker):
                 })
                 return
 
-            image_width, image_height = self._image_dimensions(message['image_data'])
+            image_width  = message.get('image_width', 0)
+            image_height = message.get('image_height', 0)
+            if not image_width or not image_height:
+                image_width, image_height = self._image_dimensions(message['image_data'])
 
-            # Pass 1 works purely from NudeNet detections — no waiting for other services.
-            # Person bbox data from YOLO/harmony is available in Pass 2 (content_analysis_worker).
-            person_bboxes, containment_relationships, person_bboxes_deduplicated = [], [], []
+            # Single non-blocking check for YOLO person bboxes. YOLO (32-62ms) typically
+            # completes before nudenet (66ms) so this usually succeeds without waiting.
+            person_bboxes = self._fetch_yolo_person_bboxes(image_id) or []
+            containment_relationships = detect_person_containment(person_bboxes)
+            contained_ids = {c['contained_bbox_id'] for c in containment_relationships}
+            person_bboxes_deduplicated = [p for p in person_bboxes if p['id'] not in contained_ids]
 
             spatial_gender = infer_gender_from_anatomy(nudenet_detections)
             anatomy_labels = [d['label'] for d in nudenet_detections]
@@ -149,6 +155,42 @@ class NudenetWorker(BaseWorker):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _fetch_yolo_person_bboxes(self, image_id):
+        """Single non-blocking query for YOLO person bboxes. Returns [] if not yet in DB."""
+        _PERSON_EMOJIS = frozenset(['🧑', '👩', '🧒'])
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                "SELECT data FROM results WHERE image_id = %s AND service = 'yolo_v8' AND status = 'success' LIMIT 1",
+                (image_id,),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+        except Exception as e:
+            self.logger.warning(f"Error fetching YOLO result for image {image_id}: {e}")
+            return []
+
+        if row is None:
+            return []
+
+        person_bboxes = []
+        for i, pred in enumerate(row[0].get('predictions', [])):
+            raw_emoji = pred.get('emoji', '')
+            clean_emoji = ''.join(c for c in raw_emoji if ord(c) < 0xFE00 or ord(c) > 0xFE0F)
+            if clean_emoji not in _PERSON_EMOJIS:
+                continue
+            raw_bbox = pred.get('bbox')
+            if not raw_bbox:
+                continue
+            if isinstance(raw_bbox, list) and len(raw_bbox) == 4:
+                bbox = {'x': raw_bbox[0], 'y': raw_bbox[1], 'width': raw_bbox[2], 'height': raw_bbox[3]}
+            elif isinstance(raw_bbox, dict) and all(k in raw_bbox for k in ('x', 'y', 'width', 'height')):
+                bbox = raw_bbox
+            else:
+                continue
+            person_bboxes.append({'id': i, 'bbox': bbox})
+        return person_bboxes
 
     def _extract_detections(self, result):
         detections = []
