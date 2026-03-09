@@ -280,7 +280,11 @@ class HarmonyWorker(BaseWorker):
                 # Crop the bbox region
                 crop_box = (x, y, x + width, y + height)
                 cropped_img = img.crop(crop_box)
-                
+
+                # JPEG requires RGB or L mode — convert RGBA/P/etc. before saving
+                if cropped_img.mode not in ('RGB', 'L'):
+                    cropped_img = cropped_img.convert('RGB')
+
                 # Convert to base64 encoded bytes for JSON transport
                 img_buffer = io.BytesIO()
                 cropped_img.save(img_buffer, format='JPEG', quality=90)
@@ -1161,22 +1165,28 @@ class HarmonyWorker(BaseWorker):
                 else:
                     self.logger.info(f"Harmonized boxes for {image_filename} ({detection_count} detections → {merged_box_count} merged boxes from {services})")
                 
+                # Commit merged_boxes BEFORE dispatching to face/pose queues.
+                # Face/pose workers may consume the RabbitMQ message and attempt
+                # to INSERT a postprocessing row (which FK-references merged_box_id)
+                # before our transaction commits — causing a spurious FK violation
+                # that silently drops the result.  Commit first to guarantee the
+                # FK target is visible when the workers arrive.
+                self.db_conn.commit()
+
                 # Dispatch bbox postprocessing jobs for each merged box
                 if merged_box_count > 0 and image_data:
                     try:
                         self.dispatch_bbox_postprocessing(image_id, image_filename, merged_data, image_data)
+                        # Commit service_dispatch records written during dispatch
+                        self.db_conn.commit()
                     except Exception as e:
                         self.logger.error(f"Failed to dispatch postprocessing for {image_filename}: {e}")
-                        # Rollback transaction and fail - postprocessing dispatch is critical
+                        # merged_boxes are already committed; dispatch failed but harmonization succeeded.
+                        # Do not return False — the merge is done, dispatch can be retried via reharmonization.
                         try:
-                            if self.db_conn:
-                                self.db_conn.rollback()
-                        except:
+                            self.db_conn.rollback()
+                        except Exception:
                             pass
-                        return {'success': False, 'merged_boxes_created': False}
-                
-                # Commit the transaction only after successful postprocessing dispatch
-                self.db_conn.commit()
                 
                 if attempt > 0:
                     self.logger.info(f"Successfully processed {image_filename} after {attempt + 1} attempts")
