@@ -693,21 +693,22 @@ class BaseWorker:
         Ensure database connection is healthy, reconnect if needed.
         Returns True if connection is healthy, False otherwise.
         Implements exponential backoff on consecutive failures.
+
+        Uses psycopg2's conn.closed attribute (0=open, 1=closed, 2=broken)
+        to avoid a SELECT 1 round-trip on every call. The round-trip only
+        fires when the connection looks suspect — not on the hot path.
         """
         try:
-            # Check if connection exists and is open
-            if not self.db_conn or self.db_conn.closed:
-                self.logger.warning("Database connection is closed")
+            # conn.closed == 0: open and healthy (no round-trip needed)
+            # conn.closed == 1: cleanly closed
+            # conn.closed == 2: broken (e.g. server went away)
+            if not self.db_conn or self.db_conn.closed != 0:
+                self.logger.warning("Database connection is closed or broken, reconnecting")
                 return self._reconnect_database()
 
-            # Validate connection with a test query
-            cursor = self.db_conn.cursor()
-            cursor.execute("SELECT 1")
-            cursor.close()
-
-            # Connection is healthy - reset failure tracking
+            # Connection is open — trust it. If the next real query fails,
+            # the exception handler will reconnect then.
             if self.consecutive_db_failures > 0:
-                self.logger.info("Database connection restored")
                 self.consecutive_db_failures = 0
                 self.db_backoff_delay = 1
 

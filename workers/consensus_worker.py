@@ -986,25 +986,24 @@ class ConsensusWorkerMergeFocused(BaseWorker):
     def update_consensus_for_image(self, image_id, image_filename):
         """Update consensus for a single image using DELETE+INSERT pattern"""
         try:
+            t0 = time.time()
+
             # Get all service results
             service_results = self.get_service_results_for_image(image_id)
+            t1 = time.time()
             if not service_results:
                 self.logger.debug(f"No results for image {image_id}, skipping")
                 return False
 
             # Calculate consensus
-            start_time = time.time()
             consensus_data = self.calculate_consensus(service_results, image_id)
-            processing_time = time.time() - start_time
+            t2 = time.time()
 
             if not consensus_data:
                 self.logger.warning(f"Could not calculate consensus for image {image_id}")
                 return False
 
-            # Ensure healthy database connection
-            if not self.ensure_database_connection():
-                self.logger.error("Could not establish database connection")
-                return False
+            t3 = time.time()
 
             # Atomic DELETE + INSERT
             cursor = self.db_conn.cursor()
@@ -1017,15 +1016,19 @@ class ConsensusWorkerMergeFocused(BaseWorker):
             cursor.execute("""
                 INSERT INTO consensus (image_id, consensus_data, processing_time)
                 VALUES (%s, %s, %s)
-            """, (image_id, json.dumps(consensus_data), round(processing_time, 3)))
+            """, (image_id, json.dumps(consensus_data), round(t2 - t1, 3)))
 
             # Commit the transaction
             self.db_conn.commit()
             cursor.close()
+            t4 = time.time()
 
             action = "Updated" if deleted_count > 0 else "Created"
             result_count = len(consensus_data.get('votes', {}).get('consensus', []))
-            self.logger.info(f"{action} consensus for {image_filename}: {result_count} emojis from {len(service_results)} services")
+            self.logger.info(
+                f"{action} consensus for {image_filename}: {result_count} emojis from {len(service_results)} services "
+                f"[fetch={t1-t0:.3f}s calc={t2-t1:.3f}s health={t3-t2:.3f}s write={t4-t3:.3f}s total={t4-t0:.3f}s]"
+            )
 
             return True
 
