@@ -211,11 +211,12 @@ def fetch_results(cur, image_id):
         service_results["consensus"] = consensus
     if caption_summary is not None:
         service_results["caption_summary"] = caption_summary
+    if content_analysis is not None:
+        service_results["content_analysis"] = content_analysis
 
     return {
         "service_results":  service_results,
         "merged_boxes":     merged_boxes,
-        "content_analysis": content_analysis,
         "postprocessing":   postprocessing,
         "sam3":             sam3_results,
         "service_dispatch": service_dispatch,
