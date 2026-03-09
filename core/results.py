@@ -200,15 +200,23 @@ def fetch_results(cur, image_id):
                 except (IndexError, ValueError, TypeError):
                     pass
 
+    # Aggregate results live in service_results so SDK consumers that iterate
+    # that dict (e.g. AnalysisResult._from_status()) can access them via
+    # natural attribute access (result.noun_consensus, etc.).
+    if noun_consensus is not None:
+        service_results["noun_consensus"] = noun_consensus
+    if verb_consensus is not None:
+        service_results["verb_consensus"] = verb_consensus
+    if consensus is not None:
+        service_results["consensus"] = consensus
+    if caption_summary is not None:
+        service_results["caption_summary"] = caption_summary
+
     return {
         "service_results":  service_results,
         "merged_boxes":     merged_boxes,
-        "consensus":        consensus,
         "content_analysis": content_analysis,
         "postprocessing":   postprocessing,
-        "noun_consensus":   noun_consensus,
         "sam3":             sam3_results,
-        "verb_consensus":   verb_consensus,
-        "caption_summary":  caption_summary,
         "service_dispatch": service_dispatch,
     }

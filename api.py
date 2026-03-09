@@ -346,9 +346,12 @@ def status(image_id):
 
         primary_complete     = done == total and total > 0
         expected_downstream  = compute_expected_downstream(services_submitted, config, tier)
+        # Aggregate results (consensus, noun_consensus, etc.) live in
+        # service_results after the fetch_results reshape — check both locations.
+        _sr = results_data.get('service_results', {})
         downstream_pending   = [
             svc for svc, expected in expected_downstream.items()
-            if expected and results_data.get(svc) is None
+            if expected and results_data.get(svc) is None and _sr.get(svc) is None
         ]
         is_complete = primary_complete and len(downstream_pending) == 0
 

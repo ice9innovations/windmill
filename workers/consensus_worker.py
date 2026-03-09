@@ -93,9 +93,7 @@ class ConsensusWorkerMergeFocused(BaseWorker):
             return self.connect_to_database()
 
     def trigger_content_analysis(self, image_id, image_filename, tier='free'):
-        """Trigger content analysis after consensus completes (basic+ tiers only)"""
-        if tier == 'free':
-            return True
+        """Trigger content analysis after consensus completes (all tiers)"""
 
         try:
             # Check if connection is healthy

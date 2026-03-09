@@ -29,8 +29,10 @@ def compute_expected_downstream(services_submitted, config, tier='free'):
     Returns a dict of {downstream_name: bool} indicating whether each downstream
     service is expected to eventually produce a result for this image.
 
-    SAM3, content_analysis, and caption_summary are basic+ only — they are never
-    triggered for free-tier images regardless of which primary services ran.
+    SAM3 and caption_summary are basic+ only — they are never triggered for
+    free-tier images regardless of which primary services ran.
+    content_analysis availability is read from service_config.yaml so that
+    tier membership changes there automatically flow through here.
     """
     if not services_submitted:
         return {}
@@ -51,13 +53,12 @@ def compute_expected_downstream(services_submitted, config, tier='free'):
     ]
     has_vlm       = len(vlm_services) > 0
     has_multi_vlm = len(vlm_services) >= 2
-    premium       = tier != 'free'
 
     return {
         'consensus':        has_consensus_service,
-        'content_analysis': has_spatial_service and premium,
+        'content_analysis': config.is_available_for_tier('system.content_analysis', tier) and 'nudenet' in services_submitted,
         'noun_consensus':   has_vlm,
         'verb_consensus':   has_vlm,
-        'sam3':             has_vlm and premium,
-        'caption_summary':  has_multi_vlm and premium,
+        'sam3':             config.is_available_for_tier('system.sam3', tier) and has_vlm,
+        'caption_summary':  config.is_available_for_tier('system.caption_summary', tier) and has_multi_vlm,
     }

@@ -143,9 +143,9 @@ class ServiceConfig:
         return sorted(matching_services)
     
     def should_trigger_consensus(self, service_full_name: str) -> bool:
-        """Check if service should trigger consensus (default True unless consensus: false)"""
+        """Check if service should trigger consensus. Must be explicitly opted in via consensus: true."""
         service_config = self.get_service_config(service_full_name)
-        return service_config.get('consensus', True)
+        return service_config.get('consensus', False) is True
     
     def is_spatial_service(self, service_full_name: str) -> bool:
         """Check if service is a spatial (bbox) service"""
@@ -172,6 +172,14 @@ class ServiceConfig:
             name.split('.', 1)[1]
             for name in self.get_services_by_type('vlm')
         )
+
+    def is_available_for_tier(self, service_full_name: str, tier: str) -> bool:
+        """Return True if the named service is available in the given tier."""
+        try:
+            svc = self.get_service_config(service_full_name)
+            return tier in (svc.get('tier') or [])
+        except ValueError:
+            return False
 
     def get_services_by_tier(self, tier: str) -> Dict[str, Dict[str, Any]]:
         """Get all services available in a specific tier"""

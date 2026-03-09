@@ -16,6 +16,7 @@ services:
       port: 7777
       endpoint: /v3/analyze
       service_type: semantic, vlm
+      consensus: true
       tier:
         - basic
         - premium
@@ -26,6 +27,7 @@ services:
       port: 7803
       endpoint: /v3/analyze?task=DETAILED_CAPTION
       service_type: semantic, vlm
+      consensus: true
       tier:
         - basic
         - premium
@@ -95,6 +97,7 @@ services:
       port: 7795
       endpoint: /v3/analyze
       service_type: semantic, vlm
+      consensus: true
       tier:
         - basic
         - premium
@@ -105,6 +108,7 @@ services:
       port: 7782
       endpoint: /v3/analyze
       service_type: semantic, vlm
+      consensus: true
       tier:
         - basic
         - premium
@@ -116,6 +120,7 @@ services:
       port: 7797
       endpoint: /v3/analyze
       service_type: semantic, vlm
+      consensus: true
       tier:
         - premium
         - cloud
@@ -126,6 +131,7 @@ services:
       port: 7767
       endpoint: /v3/analyze
       service_type: semantic, vlm
+      consensus: true
       tier:
         - premium
         - cloud
@@ -136,6 +142,7 @@ services:
       port: 7800
       endpoint: /v3/analyze
       service_type: semantic, vlm
+      consensus: true
       tier:
         - premium
         - cloud
@@ -146,6 +153,7 @@ services:
       port: 7796
       endpoint: /v3/analyze
       service_type: semantic, vlm
+      consensus: true
       tier:
         - basic
         - premium
@@ -156,6 +164,7 @@ services:
       port: 7773
       endpoint: /v3/analyze
       service_type: spatial
+      consensus: true
       tier:
         - basic
         - premium
@@ -262,8 +271,7 @@ services:
       host: localhost
       port: 9779
       endpoint: /analyze
-      tier:
-        - system
+      tier: []
 
     florence2_grounding:
       queue_name: florence2_grounding
@@ -281,7 +289,9 @@ services:
       port: 7799
       endpoint: /summarize
       tier:
-        - system
+        - basic
+        - premium
+        - cloud
 
     rembg:
       queue_name: rembg
