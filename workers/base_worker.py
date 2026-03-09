@@ -814,14 +814,20 @@ class BaseWorker:
                 ).get('processing_time')
             cursor = self.db_conn.cursor()
             cursor.execute("""
-                INSERT INTO results (image_id, service, data, status, worker_id, processing_time)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (image_id, self._get_clean_service_name(), json.dumps(result), 'success', self.worker_id, processing_time))
+                WITH inserted AS (
+                    INSERT INTO results (image_id, service, data, status, worker_id, processing_time)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING image_id
+                )
+                UPDATE service_dispatch SET status = 'complete'
+                WHERE image_id = (SELECT image_id FROM inserted)
+                  AND service = %s
+                  AND cluster_id IS NULL
+                  AND status = 'pending'
+            """, (image_id, self._get_clean_service_name(), json.dumps(result), 'success', self.worker_id, processing_time,
+                  self._get_clean_service_name()))
             self.db_conn.commit()  # CRITICAL: Commit the transaction!
             cursor.close()
-
-            # Mark service as complete in dispatch tracking — best-effort
-            self._update_service_dispatch(image_id)
 
             # In-place extrapolation hook: subclasses derive additional data
             # from the same result without a separate queue/worker
