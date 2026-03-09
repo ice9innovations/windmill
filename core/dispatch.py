@@ -55,7 +55,7 @@ def compute_expected_downstream(services_submitted, config, tier='free'):
     has_multi_vlm = len(vlm_services) >= 2
 
     return {
-        'consensus':        has_consensus_service,
+        'consensus':        has_consensus_service and config.is_available_for_tier('system.harmony', tier),
         'content_analysis': config.is_available_for_tier('system.content_analysis', tier) and 'nudenet' in services_submitted,
         'noun_consensus':   has_vlm,
         'verb_consensus':   has_vlm,

@@ -164,7 +164,6 @@ services:
       port: 7773
       endpoint: /v3/analyze
       service_type: spatial
-      consensus: true
       tier:
         - free
         - basic
