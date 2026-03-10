@@ -416,7 +416,7 @@ def main():
 
     parser.add_argument('--tier', '-t',
                        default='free',
-                       choices=['free', 'basic', 'premium', 'cloud'],
+                       choices=['free', 'basic', 'premium', 'batch'],
                        help='Customer tier for service selection (default: free). Ignored when --services is specified.')
 
     args = parser.parse_args()

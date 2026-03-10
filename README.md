@@ -36,17 +36,17 @@ Submit image
 | Service | Port | Type | Tiers |
 |---------|------|------|-------|
 | blip | 7777 | semantic, vlm | basic, premium |
-| colors | 7770 | colors | free, basic, premium, cloud |
-| metadata | 7781 | metadata | free, basic, premium, cloud |
-| ocr | 7775 | specialized | free, basic, premium, cloud |
-| nudenet | 7789 | specialized | free, basic, premium, cloud |
+| colors | 7770 | colors | free, basic, premium, batch |
+| metadata | 7781 | metadata | free, basic, premium, batch |
+| ocr | 7775 | specialized | free, basic, premium, batch |
+| nudenet | 7789 | specialized | free, basic, premium, batch |
 | moondream | 7795 | semantic, vlm | basic, premium |
 | ollama | 7782 | semantic, vlm | basic, premium |
-| haiku | 7797 | semantic, vlm | premium, cloud |
-| gemini | 7767 | semantic, vlm | premium, cloud |
-| gpt_nano | 7800 | semantic, vlm | premium, cloud |
+| haiku | 7797 | semantic, vlm | premium, batch |
+| gemini | 7767 | semantic, vlm | premium, batch |
+| gpt_nano | 7800 | semantic, vlm | premium, batch |
 | qwen | 7796 | semantic, vlm | basic, premium |
-| yolo_v8 | 7773 | spatial | basic, premium, cloud |
+| yolo_v8 | 7773 | spatial | basic, premium, batch |
 
 ### Postprocessing Services (run on cropped bbox regions)
 
@@ -80,7 +80,7 @@ Services are gated by tier. The `tier` field is set at image submission time.
 | free | colors, metadata, ocr, nudenet |
 | basic | free + blip, moondream, ollama, qwen, yolo_v8 |
 | premium | basic + haiku, gemini, gpt_nano |
-| cloud | colors, metadata, ocr, nudenet, haiku, gemini, gpt_nano, yolo_v8 |
+| batch | colors, metadata, ocr, nudenet, haiku, gemini, gpt_nano, yolo_v8 |
 
 Tiers are defined in `service_config.yaml`. Adding a new tier there automatically makes it valid — no code change required.
 
@@ -156,7 +156,7 @@ curl -X POST \
 
 Form fields:
 - `file` — image file (required)
-- `tier` — free / basic / premium / cloud (default: free)
+- `tier` — free / basic / premium / batch (default: free)
 - `services` — comma-separated override list (default: all services for the tier)
 - `image_group` — group tag (default: api)
 

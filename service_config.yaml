@@ -43,7 +43,7 @@ services:
         - free
         - basic
         - premium
-        - cloud
+        - batch
 
     metadata:
       queue_name: metadata
@@ -55,7 +55,7 @@ services:
         - free
         - basic
         - premium
-        - cloud
+        - batch
 
     ocr:
       queue_name: ocr
@@ -66,7 +66,7 @@ services:
       tier:
         - basic
         - premium
-        - cloud
+        - batch
 
     qr:
       queue_name: qr
@@ -77,7 +77,7 @@ services:
       tier:
         - basic
         - premium
-        - cloud
+        - batch
 
     nudenet:
       queue_name: nudenet
@@ -89,7 +89,7 @@ services:
         - free
         - basic
         - premium
-        - cloud
+        - batch
 
     moondream:
       queue_name: moondream
@@ -123,7 +123,7 @@ services:
       consensus: true
       tier:
         - premium
-        - cloud
+        - batch
 
     gemini:
       queue_name: gemini
@@ -134,7 +134,7 @@ services:
       consensus: true
       tier:
         - premium
-        - cloud
+        - batch
 
     gpt_nano:
       queue_name: gpt_nano
@@ -145,7 +145,7 @@ services:
       consensus: true
       tier:
         - premium
-        - cloud
+        - batch
 
     qwen:
       queue_name: qwen
@@ -168,7 +168,7 @@ services:
         - free
         - basic
         - premium
-        - cloud
+        - batch
 
   postprocessing:
     # Postprocessing Services - Run on cropped bbox regions or captions
@@ -191,7 +191,7 @@ services:
       tier:
         - basic
         - premium
-        - cloud
+        - batch
 
     pose:
       queue_name: pose
@@ -203,7 +203,7 @@ services:
       tier:
         - basic
         - premium
-        - cloud
+        - batch
 
     caption_score:
       queue_name: caption_score
@@ -243,7 +243,7 @@ services:
       tier:
         - basic
         - premium
-        - cloud
+        - batch
         - system
       # prefetch: 1  # default; keep single in-flight message per worker
 
@@ -254,7 +254,7 @@ services:
         - free
         - basic
         - premium
-        - cloud
+        - batch
 
     noun_consensus:
       queue_name: noun_consensus
@@ -294,7 +294,7 @@ services:
       tier:
         - basic
         - premium
-        - cloud
+        - batch
 
     rembg:
       queue_name: rembg
@@ -305,4 +305,4 @@ services:
       tier:
         - basic
         - premium
-        - cloud
+        - batch

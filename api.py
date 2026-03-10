@@ -194,7 +194,7 @@ def analyze():
 
     Optional form fields:
       - image_group:  group tag for the image (default: 'api')
-      - tier:         customer tier — free, basic, premium, cloud (default: 'free')
+      - tier:         customer tier — free, basic, premium, batch (default: 'free')
     """
     if not request.content_type or 'multipart/form-data' not in request.content_type:
         return jsonify({"error": "Request must be multipart/form-data with a 'file' field"}), 400
