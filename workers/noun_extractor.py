@@ -487,18 +487,30 @@ def _extract_nouns_from_doc(doc) -> List[str]:
                     seen_lemmas.add(t.text.lower())
                 break  # don't try shorter windows starting at this position
 
-    # Words that spaCy en_core_web_sm incorrectly tags as non-NOUN.
+    # Words that spaCy en_core_web_sm incorrectly tags as non-NOUN/PROPN.
     # These are forced through the noun extraction pipeline regardless of POS tag.
+    # Discovered via systematic testing in utils/test_spacy_noun_accuracy.py
     _MISCLASSIFIED_NOUNS = frozenset({
-        "tattoo",  # spaCy tags as ADV in all contexts
+        "tattoo",     # spaCy tags as ADV in all contexts
+        "piercing",   # spaCy tags as VERB (80% of contexts) - but often used as noun ("nose piercing")
+        "pendant",    # spaCy tags as ADJ in all contexts
+        "ornament",   # spaCy tags as ADJ (60% of contexts)
+        "bedspread",  # spaCy tags as ADJ - found in production captions
+        # Note: PROPN words (menu, api, samsung, etc.) now extracted automatically
+        # Note: Colors (blue, white, brown) remain ADJ - correct in most contexts
+        # Note: Gerunds (grooming, setting, served) excluded - correctly VERB in most contexts
     })
 
     # Capture standalone nouns not already covered by a chunk or MWE scan.
+    # Treat NOUN and PROPN the same - both are nouns for our purposes.
     for token in doc:
-        if (token.pos_ == "NOUN" or token.text.lower() in _MISCLASSIFIED_NOUNS) and not token.is_stop:
+        if (token.pos_ in ("NOUN", "PROPN") or token.text.lower() in _MISCLASSIFIED_NOUNS) and not token.is_stop:
             surface = token.text.lower().strip()
-            # Preserve plurale tantum as-is; lemmatize everything else
-            candidate = surface if surface in _PLURALE_TANTUM else token.lemma_.lower().strip()
+            # Preserve surface form for plurale tantum and misclassified nouns; lemmatize everything else
+            if surface in _PLURALE_TANTUM or surface in _MISCLASSIFIED_NOUNS:
+                candidate = surface
+            else:
+                candidate = token.lemma_.lower().strip()
             candidate = _clean_surface(candidate)
             if (not candidate
                     or len(candidate) < 2
