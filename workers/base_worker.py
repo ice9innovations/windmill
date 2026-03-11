@@ -294,18 +294,26 @@ class BaseWorker:
             )
 
     def _safe_ack(self, ch, delivery_tag):
-        """Ack a message, logging instead of raising if the channel is dead."""
+        """Ack a message, logging instead of raising if the channel is dead.
+
+        Uses self.channel instead of ch parameter to avoid ACKing on stale channels
+        after reconnect. The ch parameter is kept for API compatibility but not used.
+        """
         try:
-            ch.basic_ack(delivery_tag=delivery_tag)
+            self.channel.basic_ack(delivery_tag=delivery_tag)
         except (pika.exceptions.AMQPChannelError, pika.exceptions.AMQPConnectionError,
                 pika.exceptions.StreamLostError) as e:
             self.logger.warning(f"Channel dead during ack (message will be redelivered): {e}")
             raise  # Let it propagate to start()'s reconnect loop
 
     def _safe_nack(self, ch, delivery_tag, requeue=True):
-        """Nack a message, swallowing channel errors since we're already in an error path."""
+        """Nack a message, swallowing channel errors since we're already in an error path.
+
+        Uses self.channel instead of ch parameter to avoid NACKing on stale channels
+        after reconnect. The ch parameter is kept for API compatibility but not used.
+        """
         try:
-            ch.basic_nack(delivery_tag=delivery_tag, requeue=requeue)
+            self.channel.basic_nack(delivery_tag=delivery_tag, requeue=requeue)
         except (pika.exceptions.AMQPChannelError, pika.exceptions.AMQPConnectionError,
                 pika.exceptions.StreamLostError) as e:
             self.logger.warning(

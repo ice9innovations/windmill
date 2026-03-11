@@ -69,9 +69,7 @@ def fetch_results(cur, image_id):
 
     # Content analysis
     cur.execute(
-        """SELECT scene_type, intimacy_level, activities_detected, people_count,
-                  gender_breakdown, anatomy_exposed, spatial_relationships,
-                  person_attributions, semantic_validation, full_analysis, created
+        """SELECT full_analysis, created, analysis_version
            FROM content_analysis WHERE image_id = %s""",
         (image_id,),
     )

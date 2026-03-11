@@ -131,31 +131,13 @@ CREATE TABLE content_analysis (
     analysis_id                BIGSERIAL PRIMARY KEY,
     image_id                   BIGINT NOT NULL REFERENCES images(image_id),
 
-    -- Scene classification
-    scene_type                 TEXT,       -- 'simple_nudity', 'sexually_explicit', etc.
-    intimacy_level             TEXT,       -- 'solo', 'intimate', 'explicit_sexual', 'group'
-
-    -- Activity detection
-    activities_detected        TEXT[],
-
-    -- People analysis
-    people_count               INTEGER,    -- deduplicated count of distinct people
-    gender_breakdown           JSONB,
-    anatomy_exposed            TEXT[],
-
-    -- Spatial relationships
-    spatial_relationships      JSONB,
-    person_attributions        JSONB,
-
-    -- Semantic validation
-    semantic_validation        JSONB,
-
-    -- Extended analysis columns (added post-launch)
-    framing_analysis           JSONB,      -- camera framing / composition analysis
-    face_correlations          JSONB,      -- face detection correlated to person bboxes
-    nsfw2_correlation          JSONB,      -- NSFW2 signal correlation (decommissioned service)
-
-    -- Full raw analysis output
+    -- Canonical schema: all analysis data in full_analysis JSONB
+    -- Contains: anatomy_exposed, gender_breakdown, person_attributions,
+    --           activity_analysis (scene_type, intimacy_level, activities, spatial_relationships),
+    --           semantic_validations, gender_vote, vlm_hallucinations,
+    --           framing_analysis, face_correlations, nsfw2_correlation,
+    --           person_deduplication (raw_count, deduplicated_count, containments),
+    --           keyword_extraction, spatial_gender_inference
     full_analysis              JSONB,
 
     -- Metadata
@@ -167,8 +149,6 @@ CREATE TABLE content_analysis (
 );
 
 CREATE INDEX idx_content_analysis_image ON content_analysis(image_id);
-CREATE INDEX idx_content_analysis_scene_type ON content_analysis(scene_type);
-CREATE INDEX idx_content_analysis_intimacy ON content_analysis(intimacy_level);
 CREATE INDEX idx_content_analysis_created ON content_analysis(created);
 
 
