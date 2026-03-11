@@ -309,14 +309,29 @@ def detect_sexual_activities(anatomy_bboxes, person_bboxes, captions_text):
 
     # Determine scene type based on anatomical evidence
     # Check for actual exposed anatomy (not just COVERED or FACE)
-    exposed_labels = [label for label in anatomy_labels if 'EXPOSED' in label]
+    # Only count SEXUAL anatomy - exclude armpits, feet, hands, etc.
+    SEXUAL_EXPOSED_ANATOMY = {
+        'FEMALE_BREAST_EXPOSED',
+        'BUTTOCKS_EXPOSED',
+        'FEMALE_GENITALIA_EXPOSED',
+        'MALE_GENITALIA_EXPOSED',
+        'ANUS_EXPOSED'
+    }
+    exposed_labels = [label for label in anatomy_labels
+                      if any(sexual in label for sexual in SEXUAL_EXPOSED_ANATOMY)]
     has_exposed_anatomy = len(exposed_labels) > 0
     has_genitalia = any(label.startswith('FEMALE_GENITALIA') or label.startswith('MALE_GENITALIA')
                         for label in exposed_labels)
     has_exposed_breasts = any('BREAST_EXPOSED' in label for label in exposed_labels)
     has_exposed_buttocks = any('BUTTOCKS_EXPOSED' in label for label in exposed_labels)
 
-    intimacy_level = 'solo' if deduplicated_people_count == 1 else 'multiple_people'
+    # Set baseline intimacy level based on person count
+    if deduplicated_people_count == 0:
+        intimacy_level = 'none'  # No people detected
+    elif deduplicated_people_count == 1:
+        intimacy_level = 'solo'
+    else:
+        intimacy_level = 'multiple_people'
 
     if activities:
         # Has sexual activities detected
@@ -336,9 +351,11 @@ def detect_sexual_activities(anatomy_bboxes, person_bboxes, captions_text):
     elif has_genitalia:
         # Exposed genitalia = softcore
         scene_type = 'softcore_pornography'
+        # Keep solo/multiple_people from line 319
     else:
         # Exposed breasts/buttocks but no genitalia = simple nudity
         scene_type = 'simple_nudity'
+        # Keep solo/multiple_people from line 319
 
     return {
         'activities': list(set(activities)),  # Deduplicate

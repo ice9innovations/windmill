@@ -499,6 +499,9 @@ class ContentAnalysisWorker(BaseWorker):
                 'image_id': image_id,
                 'version': ANALYSIS_VERSION,
                 'timestamp': datetime.now().isoformat(),
+                'anatomy_exposed': anatomy_exposed,
+                'gender_breakdown': gender_breakdown,
+                'person_attributions': person_attributions,
                 'keyword_extraction': extracted_keywords,
                 'semantic_validations': semantic_validations,
                 'spatial_gender_inference': spatial_gender,
@@ -517,22 +520,6 @@ class ContentAnalysisWorker(BaseWorker):
 
             return {
                 'image_id': image_id,
-                'gender_breakdown': gender_breakdown,
-                'anatomy_exposed': anatomy_exposed,
-                'scene_type': scene_type,
-                'intimacy_level': intimacy_level,
-                'activities_detected': activity_analysis['activities'],
-                'spatial_relationships': activity_analysis['spatial_relationships'],
-                'person_bboxes_raw': person_bboxes_raw,
-                'person_bboxes_deduplicated': person_bboxes_deduplicated,
-                'containment_relationships': containment_relationships,
-                'semantic_validation': semantic_validation,
-                'vlm_hallucinations': vlm_hallucinations,
-                'people_count': person_bboxes_deduplicated,
-                'person_attributions': person_attributions,
-                'framing_analysis': framing_analysis,
-                'face_correlations': face_correlations,
-                'nsfw2_correlation': nsfw2_correlation,
                 'full_analysis': full_analysis,
                 'analysis_version': ANALYSIS_VERSION
             }
@@ -548,56 +535,19 @@ class ContentAnalysisWorker(BaseWorker):
         try:
             cursor = self.db_conn.cursor()
 
-            # Use INSERT ... ON CONFLICT UPDATE to handle re-analysis
+            # Write only to canonical full_analysis schema
             cursor.execute("""
                 INSERT INTO content_analysis (
-                    image_id, gender_breakdown, anatomy_exposed, scene_type, intimacy_level,
-                    activities_detected, spatial_relationships, person_bboxes_raw,
-                    person_bboxes_deduplicated, containment_relationships, semantic_validation,
-                    vlm_hallucinations, people_count, person_attributions, framing_analysis,
-                    face_correlations, nsfw2_correlation, full_analysis, analysis_version,
-                    processing_time
+                    image_id, full_analysis, analysis_version, processing_time
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s
                 )
                 ON CONFLICT (image_id) DO UPDATE SET
-                    gender_breakdown = EXCLUDED.gender_breakdown,
-                    anatomy_exposed = EXCLUDED.anatomy_exposed,
-                    scene_type = EXCLUDED.scene_type,
-                    intimacy_level = EXCLUDED.intimacy_level,
-                    activities_detected = EXCLUDED.activities_detected,
-                    spatial_relationships = EXCLUDED.spatial_relationships,
-                    person_bboxes_raw = EXCLUDED.person_bboxes_raw,
-                    person_bboxes_deduplicated = EXCLUDED.person_bboxes_deduplicated,
-                    containment_relationships = EXCLUDED.containment_relationships,
-                    semantic_validation = EXCLUDED.semantic_validation,
-                    vlm_hallucinations = EXCLUDED.vlm_hallucinations,
-                    people_count = EXCLUDED.people_count,
-                    person_attributions = EXCLUDED.person_attributions,
-                    framing_analysis = EXCLUDED.framing_analysis,
-                    face_correlations = EXCLUDED.face_correlations,
-                    nsfw2_correlation = EXCLUDED.nsfw2_correlation,
                     full_analysis = EXCLUDED.full_analysis,
                     analysis_version = EXCLUDED.analysis_version,
                     processing_time = EXCLUDED.processing_time
             """, (
                 analysis['image_id'],
-                json.dumps(analysis['gender_breakdown']),
-                analysis['anatomy_exposed'],
-                analysis['scene_type'],
-                analysis['intimacy_level'],
-                analysis['activities_detected'],
-                json.dumps(analysis['spatial_relationships']),
-                analysis['person_bboxes_raw'],
-                analysis['person_bboxes_deduplicated'],
-                json.dumps(analysis['containment_relationships']),
-                json.dumps(analysis['semantic_validation']),
-                json.dumps(analysis['vlm_hallucinations']),
-                analysis['people_count'],
-                json.dumps(analysis['person_attributions']),
-                json.dumps(analysis['framing_analysis']),
-                json.dumps(analysis['face_correlations']),
-                json.dumps(analysis['nsfw2_correlation']),
                 json.dumps(analysis['full_analysis']),
                 analysis['analysis_version'],
                 processing_time
@@ -606,18 +556,23 @@ class ContentAnalysisWorker(BaseWorker):
             self.db_conn.commit()
             cursor.close()
 
-            # Build log message
+            # Build log message from nested full_analysis structure
+            full = analysis['full_analysis']
+            scene_type = full['activity_analysis']['scene_type']
+            activities_count = len(full['activity_analysis']['activities'])
+            people_count = full['person_deduplication']['deduplicated_count']
+
             nsfw2_info = ""
-            nsfw2_corr = analysis.get('nsfw2_correlation', {})
+            nsfw2_corr = full.get('nsfw2_correlation', {})
             if nsfw2_corr.get('override_scene_type'):
                 nsfw2_info = f", nsfw2_override={nsfw2_corr.get('reasoning', 'unknown')}"
             elif nsfw2_corr.get('reasoning') == 'nsfw2_low_confidence_disagreement':
                 nsfw2_info = f", nsfw2_disagrees_low_conf"
 
             self.logger.info(f"Stored content analysis for image {analysis['image_id']}: "
-                           f"scene={analysis['scene_type']}, "
-                           f"activities={len(analysis['activities_detected'])}, "
-                           f"people={analysis['people_count']}{nsfw2_info}")
+                           f"scene={scene_type}, "
+                           f"activities={activities_count}, "
+                           f"people={people_count}{nsfw2_info}")
 
             return True
 

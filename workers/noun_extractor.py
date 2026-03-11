@@ -487,9 +487,15 @@ def _extract_nouns_from_doc(doc) -> List[str]:
                     seen_lemmas.add(t.text.lower())
                 break  # don't try shorter windows starting at this position
 
+    # Words that spaCy en_core_web_sm incorrectly tags as non-NOUN.
+    # These are forced through the noun extraction pipeline regardless of POS tag.
+    _MISCLASSIFIED_NOUNS = frozenset({
+        "tattoo",  # spaCy tags as ADV in all contexts
+    })
+
     # Capture standalone nouns not already covered by a chunk or MWE scan.
     for token in doc:
-        if token.pos_ == "NOUN" and not token.is_stop:
+        if (token.pos_ == "NOUN" or token.text.lower() in _MISCLASSIFIED_NOUNS) and not token.is_stop:
             surface = token.text.lower().strip()
             # Preserve plurale tantum as-is; lemmatize everything else
             candidate = surface if surface in _PLURALE_TANTUM else token.lemma_.lower().strip()
