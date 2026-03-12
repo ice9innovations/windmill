@@ -30,12 +30,12 @@ def _load_model():
         return True
     try:
         import spacy
-        _nlp = spacy.load("en_core_web_sm")
-        logger.info("noun_extractor: en_core_web_sm loaded")
+        _nlp = spacy.load("en_core_web_lg")
+        logger.info("noun_extractor: en_core_web_lg loaded")
         return True
     except OSError:
-        logger.error("noun_extractor: en_core_web_sm not found - run: "
-                     "python -m spacy download en_core_web_sm")
+        logger.error("noun_extractor: en_core_web_lg not found - run: "
+                     "python -m spacy download en_core_web_lg")
         return False
     except ImportError:
         logger.error("noun_extractor: spacy not installed")
@@ -97,6 +97,20 @@ _ADJ_DEPS = frozenset({
     'case',     # case marker               "'s"
 })
 
+# Words that spaCy en_core_web_sm incorrectly tags as non-NOUN/PROPN.
+# These are forced through the noun extraction pipeline regardless of POS tag.
+# Discovered via systematic testing in utils/test_spacy_noun_accuracy.py
+_MISCLASSIFIED_NOUNS = frozenset({
+    "tattoo",     # spaCy tags as ADV in all contexts
+    "piercing",   # spaCy tags as VERB (80% of contexts) - but often used as noun ("nose piercing")
+    "pendant",    # spaCy tags as ADJ in all contexts
+    "ornament",   # spaCy tags as ADJ (60% of contexts)
+    "bedspread",  # spaCy tags as ADJ - found in production captions
+    # Note: PROPN words (menu, api, samsung, etc.) now extracted automatically
+    # Note: Colors (blue, white, brown) remain ADJ - correct in most contexts
+    # Note: Gerunds (grooming, setting, served) excluded - correctly VERB in most contexts
+})
+
 # A valid extracted noun contains only letters, digits, spaces, and hyphens.
 # Rejects candidates that still contain punctuation after edge-stripping.
 _VALID_NOUN_RE = re.compile(r'^[a-z0-9][a-z0-9 \-]*$')
@@ -115,6 +129,37 @@ def _has_noun_synsets(lemma: str) -> bool:
         return bool(wn.synsets(lemma, pos=wn.NOUN))
     except Exception:
         return True
+
+
+def _is_material_or_fabric(lemma: str) -> bool:
+    """Return True if lemma is a material/fabric (lace, silk, cotton, leather, etc.).
+
+    Checks if the word's WordNet synsets are hyponyms of fabric/material/textile.
+    Used to strip material modifiers from clothing compounds (e.g. "lace bra top" → "bra top").
+    """
+    try:
+        from nltk.corpus import wordnet as wn
+
+        # Material/fabric anchor synsets
+        material_anchors = {
+            'fabric.n.01',      # cloth/textile
+            'leather.n.01',     # leather material
+            'fabric.n.02',      # structure/texture
+            'material.n.01',    # substance
+        }
+
+        synsets = wn.synsets(lemma, pos=wn.NOUN)
+        for synset in synsets:
+            # Check direct match
+            if synset.name() in material_anchors:
+                return True
+            # Check hypernym path (up to 3 levels)
+            for hypernym in synset.closure(lambda s: s.hypernyms(), depth=3):
+                if hypernym.name() in material_anchors:
+                    return True
+        return False
+    except Exception:
+        return False  # Fail closed - don't strip if unsure
 
 
 def _clean_surface(s: str) -> str:
@@ -416,9 +461,11 @@ def _extract_nouns_from_doc(doc) -> List[str]:
                     candidate = surface if surface in _PLURALE_TANTUM else root.lemma_.lower()
                 else:
                     # Keep only compound modifiers and the root — drop amod etc.
+                    # Also strip leading material/fabric modifiers (lace, silk, cotton, etc.)
                     content_tokens = [t for t in chunk
                                       if (t.dep_ == 'compound'
-                                          and _has_noun_synsets(t.lemma_.lower()))
+                                          and _has_noun_synsets(t.lemma_.lower())
+                                          and not _is_material_or_fabric(t.lemma_.lower()))
                                       or t == chunk.root]
                     if len(content_tokens) == 1:
                         # Only the root survived stripping; reduce to root lemma
@@ -446,6 +493,24 @@ def _extract_nouns_from_doc(doc) -> List[str]:
 
         seen.add(candidate)
         nouns.append(candidate)
+
+        # Extract coordinated nouns (conj/nmod dependencies) before marking as seen.
+        # Handles cases like "bra and underwear" where spaCy creates one chunk with
+        # root=underwear and bra as nmod — both are nouns and should be extracted.
+        for token in chunk:
+            if token != chunk.root and token.pos_ in ('NOUN', 'PROPN'):
+                if token.dep_ in ('conj', 'nmod'):
+                    coord_surface = token.text.lower()
+                    coord_candidate = (coord_surface if coord_surface in _PLURALE_TANTUM or coord_surface in _MISCLASSIFIED_NOUNS
+                                      else token.lemma_.lower())
+                    coord_candidate = _clean_surface(coord_candidate)
+                    if (coord_candidate
+                            and len(coord_candidate) >= 2
+                            and _VALID_NOUN_RE.match(coord_candidate)
+                            and coord_candidate not in seen
+                            and coord_candidate not in _STOP_NOUNS):
+                        seen.add(coord_candidate)
+                        nouns.append(coord_candidate)
 
         # Mark every lemma AND every plurale tantum surface form in this
         # chunk as consumed so the standalone pass doesn't re-add them.
@@ -486,20 +551,6 @@ def _extract_nouns_from_doc(doc) -> List[str]:
                     seen_lemmas.add(t.lemma_.lower())
                     seen_lemmas.add(t.text.lower())
                 break  # don't try shorter windows starting at this position
-
-    # Words that spaCy en_core_web_sm incorrectly tags as non-NOUN/PROPN.
-    # These are forced through the noun extraction pipeline regardless of POS tag.
-    # Discovered via systematic testing in utils/test_spacy_noun_accuracy.py
-    _MISCLASSIFIED_NOUNS = frozenset({
-        "tattoo",     # spaCy tags as ADV in all contexts
-        "piercing",   # spaCy tags as VERB (80% of contexts) - but often used as noun ("nose piercing")
-        "pendant",    # spaCy tags as ADJ in all contexts
-        "ornament",   # spaCy tags as ADJ (60% of contexts)
-        "bedspread",  # spaCy tags as ADJ - found in production captions
-        # Note: PROPN words (menu, api, samsung, etc.) now extracted automatically
-        # Note: Colors (blue, white, brown) remain ADJ - correct in most contexts
-        # Note: Gerunds (grooming, setting, served) excluded - correctly VERB in most contexts
-    })
 
     # Capture standalone nouns not already covered by a chunk or MWE scan.
     # Treat NOUN and PROPN the same - both are nouns for our purposes.

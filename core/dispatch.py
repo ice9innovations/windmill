@@ -56,4 +56,5 @@ def compute_expected_downstream(services_submitted, config, tier='free'):
         'verb_consensus':   has_vlm,
         'sam3':             config.is_available_for_tier('system.sam3', tier) and has_vlm,
         'caption_summary':  config.is_available_for_tier('system.caption_summary', tier) and has_multi_vlm,
+        'florence2_grounding': 'florence2' in services_submitted,
     }

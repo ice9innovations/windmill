@@ -12,6 +12,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 import json
 import time
 import psycopg2
+import yaml
 from datetime import datetime
 from base_worker import BaseWorker
 
@@ -31,7 +32,76 @@ from utils.spatial_analysis import (
 from utils.framing_analysis import classify_framing
 from utils.face_correlation import correlate_faces, get_face_gender_attribution
 
-ANALYSIS_VERSION = '1.4.4'
+ANALYSIS_VERSION = '1.4.5'  # Added content_flags based on noun extraction
+
+
+def load_content_flags():
+    """Load content flagging configuration from YAML file.
+
+    Returns dict mapping category -> list of trigger words, or None on error.
+    """
+    # Config is in project root, not workers directory
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    config_path = os.path.join(project_root, 'moderation.yaml')
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+
+        # Extract just the triggers from each category
+        flags = {}
+        if config and 'flag_categories' in config:
+            for category, data in config['flag_categories'].items():
+                if 'triggers' in data:
+                    flags[category] = data['triggers']
+
+        return flags
+    except Exception as e:
+        # Log error but don't crash - flagging is optional
+        print(f"Warning: Could not load content_flags.yaml: {e}")
+        return None
+
+
+def check_content_flags(noun_consensus_data, flag_config):
+    """Check extracted nouns against content flag triggers.
+
+    Args:
+        noun_consensus_data: List of noun entries from noun_consensus.nouns
+        flag_config: Dict from load_content_flags()
+
+    Returns:
+        List of flag dicts with category, value, vote_count, service_count
+    """
+    if not flag_config or not noun_consensus_data:
+        return []
+
+    flags = []
+
+    for noun_entry in noun_consensus_data:
+        canonical = noun_entry.get('canonical', '').lower()
+        vote_count = noun_entry.get('vote_count', 1)
+        services = noun_entry.get('services', [])
+        service_count = len(services)
+
+        if not canonical:
+            continue
+
+        # Check against all flag triggers
+        for category, triggers in flag_config.items():
+            for trigger in triggers:
+                trigger_lower = trigger.lower()
+
+                # Match if trigger appears in noun or noun contains trigger
+                # Examples: "gun" matches "gun", "guns", "handgun"
+                if trigger_lower in canonical or canonical in trigger_lower:
+                    flags.append({
+                        'category': category,
+                        'value': canonical,
+                        'vote_count': vote_count,
+                        'service_count': service_count
+                    })
+                    break  # Don't match same noun multiple times in same category
+
+    return flags
 
 
 class ContentAnalysisWorker(BaseWorker):
@@ -42,6 +112,15 @@ class ContentAnalysisWorker(BaseWorker):
 
         # Dual database connections for read/write separation
         self.read_db_conn = None
+
+        # Load content flagging config into memory once at startup
+        self.content_flag_config = load_content_flags()
+        if self.content_flag_config:
+            category_count = len(self.content_flag_config)
+            trigger_count = sum(len(triggers) for triggers in self.content_flag_config.values())
+            self.logger.info(f"Loaded content flags: {category_count} categories, {trigger_count} triggers")
+        else:
+            self.logger.warning("Content flagging disabled (config not loaded)")
 
     def connect_to_database(self):
         """Connect to PostgreSQL database with dual connections"""
@@ -207,7 +286,7 @@ class ContentAnalysisWorker(BaseWorker):
                                 'label': pred.get('label', 'face')
                             })
 
-            # Fetch SAM3-validated gendered nouns from noun_consensus
+            # Fetch noun consensus data
             GENDERED_NOUNS = {
                 'male':   {'man', 'men', 'boy', 'boys', 'gentleman', 'father',
                            'son', 'brother', 'husband', 'male'},
@@ -215,11 +294,16 @@ class ContentAnalysisWorker(BaseWorker):
                            'daughter', 'sister', 'wife', 'female'},
             }
             validated_gendered_nouns = []
+            noun_consensus_nouns = []
+
             cursor.execute("""
-                SELECT nouns FROM noun_consensus WHERE image_id = %s
+                SELECT nouns, service_count FROM noun_consensus WHERE image_id = %s
             """, (image_id,))
             nc_row = cursor.fetchone()
             if nc_row and nc_row[0]:
+                noun_consensus_nouns = nc_row[0]  # Full noun list for flag checking
+
+                # Extract SAM3-validated gendered nouns for gender analysis
                 for entry in nc_row[0]:
                     if not entry.get('sam3_validated'):
                         continue
@@ -246,6 +330,7 @@ class ContentAnalysisWorker(BaseWorker):
                 'image_width': image_width,
                 'image_height': image_height,
                 'validated_gendered_nouns': validated_gendered_nouns,
+                'noun_consensus_nouns': noun_consensus_nouns,
             }
 
         except Exception as e:
@@ -494,6 +579,10 @@ class ContentAnalysisWorker(BaseWorker):
                 'confidence': sum(v['confidence'] for v in semantic_validations) / len(semantic_validations) if semantic_validations else 0.0
             }
 
+            # Check for content flags based on extracted nouns
+            noun_consensus_nouns = image_data.get('noun_consensus_nouns', [])
+            content_flags = check_content_flags(noun_consensus_nouns, self.content_flag_config)
+
             # Full analysis output
             full_analysis = {
                 'image_id': image_id,
@@ -502,6 +591,7 @@ class ContentAnalysisWorker(BaseWorker):
                 'anatomy_exposed': anatomy_exposed,
                 'gender_breakdown': gender_breakdown,
                 'person_attributions': person_attributions,
+                'content_flags': content_flags,
                 'keyword_extraction': extracted_keywords,
                 'semantic_validations': semantic_validations,
                 'spatial_gender_inference': spatial_gender,

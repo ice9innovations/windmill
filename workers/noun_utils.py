@@ -34,7 +34,11 @@ CONTENT_MODERATION_SYNONYMS = {
     'dick':      'penis',
     'pussy':     'vagina',
     'cunt':      'vagina',
-    'marijuana': 'cannabis'
+    'marijuana': 'cannabis',
+    'panty':     'underwear',
+    'panties':   'underwear',
+    'bra top':   'bra',
+    'bikini top': 'bra',
 }
 
 _wordnet_available = None
@@ -411,15 +415,23 @@ def _normalize_slang(n: str) -> str:
     pussy=cat) so it will not link them to their clinical equivalents.
     Applied as a pre-pass before any collapsing strategy.
 
-    For compound nouns (e.g. "man cock"), scans word-by-word and replaces
-    the whole compound with the clinical term.
+    Checks for multi-word synonyms as word-bounded substrings to handle
+    compounds with modifiers (e.g. "lace bra top" contains "bra top" → "bra").
     """
     key = n.lower().strip()
+
+    # Exact match first
     if key in CONTENT_MODERATION_SYNONYMS:
         return CONTENT_MODERATION_SYNONYMS[key]
-    for word in key.split():
-        if word in CONTENT_MODERATION_SYNONYMS:
-            return CONTENT_MODERATION_SYNONYMS[word]
+
+    # Check for multi-word synonyms as word-bounded substrings (longest first)
+    words = key.split()
+    for length in range(len(words), 1, -1):
+        for i in range(len(words) - length + 1):
+            phrase = ' '.join(words[i:i+length])
+            if phrase in CONTENT_MODERATION_SYNONYMS:
+                return CONTENT_MODERATION_SYNONYMS[phrase]
+
     return n
 
 
