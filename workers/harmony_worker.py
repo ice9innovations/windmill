@@ -171,7 +171,7 @@ class HarmonyWorker(BaseWorker):
             # Removed old downstream queue
             
             # Declare bbox postprocessing queues - read from config
-            colors_queue = self._get_queue_name('postprocessing.colors')
+            colors_queue = self._get_queue_name('postprocessing.colors_post')
             face_queue = self._get_queue_name('postprocessing.face')
             pose_queue = self._get_queue_name('postprocessing.pose')
             declare_with_dlq(self.queue_channel, colors_queue)

@@ -172,7 +172,7 @@ services:
 
   postprocessing:
     # Postprocessing Services - Run on cropped bbox regions or captions
-    colors:
+    colors_post:
       queue_name: colors_post
       host: localhost
       port: 7770
