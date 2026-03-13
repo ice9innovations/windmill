@@ -239,7 +239,7 @@ start_worker() {
     state_add "$log_name"
 
     echo "  Starting $worker..."
-    nohup python $worker_file > logs/${log_name}.log 2>&1 &
+    nohup python $worker_file >> logs/${log_name}.log 2>&1 &
     echo "✅ Started $worker"
 }
 
