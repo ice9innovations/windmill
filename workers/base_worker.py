@@ -907,11 +907,31 @@ class BaseWorker:
         """Start the worker"""
         self.logger.info(f"Starting {self.service_name} worker ({self.worker_id})")
 
-        # Connect to services
-        if not self.connect_to_database():
-            sys.exit(1)
-        if not self.connect_to_queue():
-            sys.exit(1)
+        # Connect to services — retry with backoff on transient failures (e.g. DNS not yet
+        # available at boot) rather than exiting immediately.
+        startup_delay = 5
+        while True:
+            try:
+                if self.connect_to_database():
+                    break
+            except KeyboardInterrupt:
+                self.logger.info("Interrupted during startup, exiting")
+                sys.exit(0)
+            self.logger.warning(f"Database connection failed at startup, retrying in {startup_delay}s...")
+            time.sleep(startup_delay)
+            startup_delay = min(startup_delay * 2, self.max_db_backoff_delay)
+
+        startup_delay = 5
+        while True:
+            try:
+                if self.connect_to_queue():
+                    break
+            except KeyboardInterrupt:
+                self.logger.info("Interrupted during startup, exiting")
+                sys.exit(0)
+            self.logger.warning(f"Queue connection failed at startup, retrying in {startup_delay}s...")
+            time.sleep(startup_delay)
+            startup_delay = min(startup_delay * 2, self.max_db_backoff_delay)
 
         # Start background publish thread
         self._running = True
