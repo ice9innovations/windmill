@@ -143,7 +143,11 @@ class BaseWorker:
         if '.' in self.service_name:
             return self.service_name.split('.', 1)[1]  # Return part after first dot
         return self.service_name
-    
+
+    def _declare_additional_queues(self, declare_with_dlq):
+        """Override in subclasses to declare additional downstream queues on the publish channel."""
+        pass
+
     def setup_logging(self):
         """Setup logging for this worker"""
         self.logger = logging.getLogger(self.service_name)
@@ -208,6 +212,8 @@ class BaseWorker:
             declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('verb_consensus'))
         if self.enable_noun_consensus:
             declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('sam3'))
+
+        self._declare_additional_queues(declare_with_dlq)
 
         self.logger.info("Publish thread connected to RabbitMQ")
 

@@ -20,10 +20,13 @@ import os
 import sys
 import time
 import requests
+from PIL import Image
 
 sys.path.append(os.path.dirname(__file__))
 
 from base_worker import BaseWorker
+
+MIN_COLORS_SIZE = (8, 8)
 
 
 class Florence2GroundingWorker(BaseWorker):
@@ -31,6 +34,11 @@ class Florence2GroundingWorker(BaseWorker):
 
     def __init__(self):
         super().__init__('system.florence2_grounding')
+        self._colors_post_queue = self._get_queue_name('postprocessing.colors_post')
+
+    def _declare_additional_queues(self, declare_with_dlq):
+        """Declare colors_post queue on the publish channel — we are the trigger."""
+        declare_with_dlq(self._publish_channel, self._colors_post_queue)
 
     def process_message(self, ch, method, properties, body):
         start_time = time.time()
@@ -91,6 +99,7 @@ class Florence2GroundingWorker(BaseWorker):
 
             self._store_result(image_id, result, processing_time)
             self._update_service_dispatch(image_id)
+            self._dispatch_colors_post(image_id, image_data, result.get('predictions', []), tier)
 
             # Mark nouns that were successfully grounded back in noun_consensus
             grounded_labels = [
@@ -259,6 +268,76 @@ class Florence2GroundingWorker(BaseWorker):
             self.logger.error(
                 f"florence2_grounding: failed to write validation "
                 f"for image {image_id}: {e}"
+            )
+
+
+    def _dispatch_colors_post(self, image_id: int, image_data_b64: str, predictions: list, tier: str = 'free'):
+        """Crop each grounded bbox and dispatch to colors_post queue.
+
+        Each prediction becomes one colors_post job. merged_box_id is NULL since
+        florence2_grounding boxes do not go through harmony — the postprocessing
+        table allows this.
+        """
+        if not predictions:
+            return
+
+        try:
+            image_bytes = base64.b64decode(image_data_b64)
+            img = Image.open(io.BytesIO(image_bytes))
+            if img.mode not in ('RGB', 'L'):
+                img = img.convert('RGB')
+            img_width, img_height = img.size
+        except Exception as e:
+            self.logger.warning(
+                f"florence2_grounding: could not open image for colors dispatch "
+                f"(image {image_id}): {e}"
+            )
+            return
+
+        dispatched = 0
+        for pred in predictions:
+            bbox_arr = pred.get('bbox')
+            label = pred.get('label', 'unknown')
+            if not bbox_arr or len(bbox_arr) < 4:
+                continue
+
+            x, y, w, h = bbox_arr[0], bbox_arr[1], bbox_arr[2], bbox_arr[3]
+
+            if w < MIN_COLORS_SIZE[0] or h < MIN_COLORS_SIZE[1]:
+                continue
+
+            try:
+                x1 = max(0, int(x))
+                y1 = max(0, int(y))
+                x2 = min(img_width, int(x + w))
+                y2 = min(img_height, int(y + h))
+                cropped = img.crop((x1, y1, x2, y2))
+                buf = io.BytesIO()
+                cropped.save(buf, format='JPEG', quality=90)
+                buf.seek(0)
+                cropped_b64 = base64.b64encode(buf.getvalue()).decode('latin-1')
+            except Exception as e:
+                self.logger.warning(
+                    f"florence2_grounding: crop failed for '{label}' "
+                    f"(image {image_id}): {e}"
+                )
+                continue
+
+            message = {
+                'merged_box_id': None,
+                'image_id': image_id,
+                'cluster_id': f'grounding_{label}',
+                'bbox': {'x': x, 'y': y, 'width': w, 'height': h},
+                'cropped_image_data': cropped_b64,
+                'tier': tier,
+            }
+            self._enqueue_publish(self._colors_post_queue, json.dumps(message))
+            dispatched += 1
+
+        if dispatched:
+            self.logger.info(
+                f"florence2_grounding: dispatched {dispatched} colors_post jobs "
+                f"for image {image_id}"
             )
 
 

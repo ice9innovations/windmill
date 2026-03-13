@@ -171,16 +171,13 @@ class HarmonyWorker(BaseWorker):
             # Removed old downstream queue
             
             # Declare bbox postprocessing queues - read from config
-            colors_queue = self._get_queue_name('postprocessing.colors_post')
             face_queue = self._get_queue_name('postprocessing.face')
             pose_queue = self._get_queue_name('postprocessing.pose')
-            declare_with_dlq(self.queue_channel, colors_queue)
             declare_with_dlq(self.queue_channel, face_queue)
             declare_with_dlq(self.queue_channel, pose_queue)
 
             # Store queue names for later use
             self.postprocessing_queues = {
-                'colors': colors_queue,
                 'face': face_queue,
                 'pose': pose_queue,
             }
@@ -190,7 +187,7 @@ class HarmonyWorker(BaseWorker):
 
             self.logger.info(f"Connected to RabbitMQ at {self.queue_host}")
             self.logger.info(f"Consuming from: {self.queue_name}")
-            self.logger.info(f"Publishing to postprocessing queues: {colors_queue}, {face_queue}, {pose_queue}")
+            self.logger.info(f"Publishing to postprocessing queues: {face_queue}, {pose_queue}")
             return True
             
         except Exception as e:
@@ -248,8 +245,6 @@ class HarmonyWorker(BaseWorker):
                     if width < MIN_POSTPROCESSING_SIZE[0] or height < MIN_POSTPROCESSING_SIZE[1]:
                         self.logger.debug(f"Skipped postprocessing for {width}x{height} box (below 8x8 minimum)")
                         continue
-
-                    self.publish_bbox_message(self.postprocessing_queues['colors'], base_message)
 
                     box_emoji = normalize_person_emoji(instance.get('emoji', ''))
                     if box_emoji == '🧑':
