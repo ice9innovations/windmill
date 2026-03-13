@@ -363,6 +363,7 @@ class CaptionScoreWorker(BaseWorker):
                 return
 
             self.logger.info(f"Saved caption score for {service}: {image_filename}")
+            self._update_service_dispatch(image_id, service=f'caption_score_{actual_service_name}')
 
             # Save image embedding once — idempotent, so safe to call on every message
             image_embedding = clip_result.get('image_embedding')

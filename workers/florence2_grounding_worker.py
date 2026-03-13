@@ -77,6 +77,7 @@ class Florence2GroundingWorker(BaseWorker):
                     f"florence2_grounding: image {image_id} already grounded "
                     f"with same {len(nouns)} nouns, skipping"
                 )
+                self._update_service_dispatch(image_id)
                 self._safe_ack(ch, method.delivery_tag)
                 return
 

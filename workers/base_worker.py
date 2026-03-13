@@ -399,6 +399,12 @@ class BaseWorker:
                     json.dumps(caption_score_message)
                 )
 
+                # Record pending dispatch so the API can track completion
+                self._record_service_dispatch(
+                    image_id,
+                    f'caption_score_{self._get_clean_service_name()}',
+                )
+
                 self.logger.debug(f"Enqueued caption scoring trigger for {self.service_name} image {image_id}")
 
             except Exception as e:
