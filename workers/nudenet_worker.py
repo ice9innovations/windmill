@@ -212,65 +212,49 @@ class NudenetWorker(BaseWorker):
     def _store_spatial_analysis_dict(self, analysis):
         """Write Pass 1 result to content_analysis.
 
-        The WHERE guard on ON CONFLICT prevents overwriting a completed Pass 2
-        result if a retry races with it.
+        All data is packed into the full_analysis JSONB column, matching the
+        canonical schema introduced in commit a286104. The WHERE guard on
+        ON CONFLICT prevents overwriting a completed Pass 2 result if a retry
+        races with it.
         """
         try:
+            full_analysis = {
+                'anatomy_exposed': analysis['anatomy_exposed'],
+                'gender_breakdown': analysis['gender_breakdown'],
+                'person_attributions': [],
+                'keyword_extraction': {},
+                'semantic_validations': {'corroborated': False, 'conflicts': [], 'confidence': 0.0},
+                'spatial_gender_inference': analysis['full_analysis']['spatial_gender_inference'],
+                'gender_vote': {'gender': 'unknown', 'confidence': 0.0, 'reasoning': 'pass_1_no_vlm'},
+                'vlm_hallucinations': {},
+                'activity_analysis': analysis['full_analysis']['activity_analysis'],
+                'framing_analysis': analysis['full_analysis']['framing_analysis'],
+                'face_correlations': {},
+                'nsfw2_correlation': {
+                    'agreement': None, 'nsfw2_verdict': 'unknown',
+                    'nsfw2_confidence': 0.0, 'override_scene_type': False,
+                    'new_scene_type': None, 'new_intimacy_level': None,
+                    'reasoning': 'no_nsfw2_data',
+                },
+                'person_deduplication': analysis['full_analysis']['person_deduplication'],
+            }
+
             cursor = self.db_conn.cursor()
             cursor.execute("""
                 INSERT INTO content_analysis (
-                    image_id, gender_breakdown, anatomy_exposed, scene_type, intimacy_level,
-                    activities_detected, spatial_relationships, person_bboxes_raw,
-                    person_bboxes_deduplicated, containment_relationships, semantic_validation,
-                    vlm_hallucinations, people_count, person_attributions, framing_analysis,
-                    face_correlations, nsfw2_correlation, full_analysis, analysis_version
+                    image_id, full_analysis, analysis_version
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s
                 )
                 ON CONFLICT (image_id) DO UPDATE SET
-                    gender_breakdown           = EXCLUDED.gender_breakdown,
-                    anatomy_exposed            = EXCLUDED.anatomy_exposed,
-                    scene_type                 = EXCLUDED.scene_type,
-                    intimacy_level             = EXCLUDED.intimacy_level,
-                    activities_detected        = EXCLUDED.activities_detected,
-                    spatial_relationships      = EXCLUDED.spatial_relationships,
-                    person_bboxes_raw          = EXCLUDED.person_bboxes_raw,
-                    person_bboxes_deduplicated = EXCLUDED.person_bboxes_deduplicated,
-                    containment_relationships  = EXCLUDED.containment_relationships,
-                    semantic_validation        = EXCLUDED.semantic_validation,
-                    vlm_hallucinations         = EXCLUDED.vlm_hallucinations,
-                    people_count               = EXCLUDED.people_count,
-                    person_attributions        = EXCLUDED.person_attributions,
-                    framing_analysis           = EXCLUDED.framing_analysis,
-                    face_correlations          = EXCLUDED.face_correlations,
-                    nsfw2_correlation          = EXCLUDED.nsfw2_correlation,
-                    full_analysis              = EXCLUDED.full_analysis,
-                    analysis_version           = EXCLUDED.analysis_version
+                    full_analysis    = EXCLUDED.full_analysis,
+                    analysis_version = EXCLUDED.analysis_version
                 WHERE content_analysis.analysis_version = 'spatial_1.0'
                    OR content_analysis.analysis_version IS NULL
             """, (
                 analysis['image_id'],
-                json.dumps(analysis['gender_breakdown']),
-                analysis['anatomy_exposed'],
-                analysis['scene_type'],
-                analysis['intimacy_level'],
-                analysis['activities_detected'],
-                json.dumps(analysis['spatial_relationships']),
-                analysis['person_bboxes_raw'],
-                analysis['person_bboxes_deduplicated'],
-                json.dumps(analysis['containment_relationships']),
-                json.dumps({'corroborated': False, 'conflicts': [], 'confidence': 0.0}),
-                json.dumps({}),
-                analysis['people_count'],
-                json.dumps([]),
-                json.dumps(analysis['framing_analysis']),
-                json.dumps({}),
-                json.dumps({'agreement': None, 'nsfw2_verdict': 'unknown',
-                            'nsfw2_confidence': 0.0, 'override_scene_type': False,
-                            'new_scene_type': None, 'new_intimacy_level': None,
-                            'reasoning': 'no_nsfw2_data'}),
-                json.dumps(analysis['full_analysis']),
-                SPATIAL_ANALYSIS_VERSION
+                json.dumps(full_analysis),
+                SPATIAL_ANALYSIS_VERSION,
             ))
             self.db_conn.commit()
             cursor.close()
