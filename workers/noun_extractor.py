@@ -65,10 +65,11 @@ _STOP_NOUNS = {
 # to the standalone-noun pass where token.lemma_ is used.
 _PLURALE_TANTUM = {
     # Eyewear / optical
-    "glasses", "spectacles", "goggles", "binoculars",
+    "glasses", "sunglasses", "spectacles", "goggles", "binoculars",
     # Clothing
     "pants", "trousers", "jeans", "shorts", "tights", "leggings",
     "overalls", "pajamas", "pyjamas", "knickers",
+    "sweatpants", "jorts", "pantyhose", "lederhosen", "bellbottoms", "earmuffs",
     # Food (plurale tantum — "fries" must not lemmatize to "fry", a fish)
     "fries",
     # Tools / implements
