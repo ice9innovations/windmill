@@ -95,12 +95,22 @@ class Florence2GroundingWorker(BaseWorker):
 
             processing_time = round(time.time() - start_time, 3)
 
-            # Embed the noun set in metadata so dedup can read it back next trigger
+            # Embed the noun set in metadata so dedup can read it back next trigger.
+            # Also record the colors_post dispatch count so the API can gate
+            # is_complete on all bbox-level color jobs finishing.
+            predictions = result.get('predictions', [])
+            colors_post_count = sum(
+                1 for p in predictions
+                if p.get('bbox') and len(p['bbox']) >= 4
+                and p['bbox'][2] >= MIN_COLORS_SIZE[0]
+                and p['bbox'][3] >= MIN_COLORS_SIZE[1]
+            )
             result.setdefault('metadata', {})['nouns_queried'] = json.dumps(nouns)
+            result['metadata']['colors_post_dispatched'] = colors_post_count
 
             self._store_result(image_id, result, processing_time)
             self._update_service_dispatch(image_id)
-            self._dispatch_colors_post(image_id, image_data, result.get('predictions', []), tier)
+            self._dispatch_colors_post(image_id, image_data, predictions, tier)
 
             # Mark nouns that were successfully grounded back in noun_consensus
             grounded_labels = [
