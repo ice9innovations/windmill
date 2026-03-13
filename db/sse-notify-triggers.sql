@@ -49,3 +49,9 @@ DROP TRIGGER IF EXISTS caption_summary_notify ON caption_summary;
 CREATE TRIGGER caption_summary_notify
     AFTER INSERT OR UPDATE ON caption_summary
     FOR EACH ROW EXECUTE FUNCTION notify_result_change();
+
+-- postprocessing (INSERT only — colors_post, caption_score_*, face, pose)
+DROP TRIGGER IF EXISTS postprocessing_notify ON postprocessing;
+CREATE TRIGGER postprocessing_notify
+    AFTER INSERT ON postprocessing
+    FOR EACH ROW EXECUTE FUNCTION notify_result_change();
