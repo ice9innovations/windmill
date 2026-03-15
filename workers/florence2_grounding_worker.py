@@ -109,10 +109,11 @@ class Florence2GroundingWorker(BaseWorker):
             result['metadata']['colors_post_dispatched'] = colors_post_count
 
             self._store_result(image_id, result, processing_time)
-            self._update_service_dispatch(image_id)
             self._dispatch_colors_post(image_id, image_data, predictions, tier)
 
-            # Mark nouns that were successfully grounded back in noun_consensus
+            # Mark nouns that were successfully grounded back in noun_consensus.
+            # Must happen before _update_service_dispatch so the grounding_validated
+            # backfill is committed before the NOTIFY fires and the SSE reads results.
             grounded_labels = [
                 p['label'].lower().strip()
                 for p in result.get('predictions', [])
@@ -121,6 +122,7 @@ class Florence2GroundingWorker(BaseWorker):
             if grounded_labels:
                 self._validate_noun_consensus(image_id, nouns, grounded_labels)
 
+            self._update_service_dispatch(image_id)
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
 
