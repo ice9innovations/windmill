@@ -127,11 +127,12 @@ class NounConsensusWorker(BaseWorker):
                     f"{dict(subject_votes)} → '{subject_noun}'"
                 )
 
-            # Trigger SAM3 as soon as any VLM has reported. The dedup guard
-            # (_sam3_previous_nouns) re-triggers only when the noun set changes,
-            # so in practice SAM3 runs once or twice per image as VLMs converge.
-            # Waiting for all VLMs would mean one slow or down service silently
-            # kills SAM3 for the entire image.
+            # Trigger grounding as soon as any VLM has reported.
+            # The pending-dispatch guard ensures at most one grounding job is
+            # in-flight per image at a time. If one is already pending, the
+            # trigger is skipped — the in-flight job processes the current noun
+            # set when it runs, and later noun_consensus triggers will dispatch
+            # again once that job completes if the noun set has grown.
             if self._count_vlm_results(image_id) > 0 and image_data:
                 # Threshold based on tier's total expected VLM count, not how
                 # many have reported so far. This keeps the bar stable across
@@ -151,19 +152,18 @@ class NounConsensusWorker(BaseWorker):
                     n['canonical'] for n in collapsed
                     if n.get('vote_count', 0) >= min_votes
                 ]
-                previous_nouns = self._sam3_previous_nouns(image_id)
-                if previous_nouns is not None and set(consensus_nouns) == previous_nouns:
-                    self.logger.debug(
-                        f"noun_consensus: SAM3 already ran for image {image_id} "
-                        f"with same nouns, skipping"
-                    )
-                elif consensus_nouns:
-                    self._trigger_sam3(image_id, image_data, consensus_nouns, subject_noun, tier)
-                    self._trigger_florence2_grounding(image_id, image_data, consensus_nouns, subject_noun, tier)
+                if consensus_nouns:
+                    if self._has_pending_grounding_dispatch(image_id):
+                        self.logger.debug(
+                            f"noun_consensus: grounding already pending "
+                            f"for image {image_id}, skipping"
+                        )
+                    else:
+                        self._trigger_florence2_grounding(image_id, image_data, consensus_nouns, subject_noun, tier)
                 else:
                     # No consensus reached — promote the top noun if it's a clear
                     # leader (strictly ahead of second place). Fires only when the
-                    # normal path produced nothing, so SAM3 isn't flooded with
+                    # normal path produced nothing, so grounding isn't flooded with
                     # low-confidence hits.
                     sorted_nouns = sorted(
                         collapsed, key=lambda n: n.get('confidence', 0), reverse=True
@@ -172,25 +172,24 @@ class NounConsensusWorker(BaseWorker):
                             and sorted_nouns[0].get('confidence', 0)
                             > sorted_nouns[1].get('confidence', 0)):
                         top = sorted_nouns[0]['canonical']
-                        if previous_nouns is not None and set([top]) == previous_nouns:
+                        self.logger.info(
+                            f"noun_consensus: no consensus for image {image_id} — "
+                            f"promoting clear leader '{top}' to grounding"
+                        )
+                        # Mark the promoted noun in the stored data so the read
+                        # layer can surface it in nouns (not just nouns_all).
+                        sorted_nouns[0]['promoted'] = True
+                        self._upsert_noun_consensus(
+                            image_id, collapsed, services_present,
+                            processing_time=round(time.time() - start_time, 3),
+                            category_tally=category_tally,
+                        )
+                        if self._has_pending_grounding_dispatch(image_id):
                             self.logger.debug(
-                                f"noun_consensus: SAM3 already ran for image {image_id} "
-                                f"with promoted noun '{top}', skipping"
+                                f"noun_consensus: grounding already pending "
+                                f"for image {image_id} (promoted '{top}'), skipping"
                             )
                         else:
-                            self.logger.info(
-                                f"noun_consensus: no consensus for image {image_id} — "
-                                f"promoting clear leader '{top}' to SAM3"
-                            )
-                            # Mark the promoted noun in the stored data so the read
-                            # layer can surface it in nouns (not just nouns_all).
-                            sorted_nouns[0]['promoted'] = True
-                            self._upsert_noun_consensus(
-                                image_id, collapsed, services_present,
-                                processing_time=round(time.time() - start_time, 3),
-                                category_tally=category_tally,
-                            )
-                            self._trigger_sam3(image_id, image_data, [top], subject_noun, tier)
                             self._trigger_florence2_grounding(image_id, image_data, [top], subject_noun, tier)
 
             # Trigger caption_summary directly — fires as soon as enough captions are
@@ -226,27 +225,33 @@ class NounConsensusWorker(BaseWorker):
             self.logger.error(f"noun_consensus: result count error for image {image_id}: {e}")
             return 0
 
-    def _sam3_previous_nouns(self, image_id: int):
-        """Return the set of nouns from the last SAM3 run, or None if SAM3
-        has never run for this image."""
+    def _has_pending_grounding_dispatch(self, image_id: int) -> bool:
+        """Return True if a grounding dispatch is already pending for this image.
+
+        Used to prevent multiple simultaneous grounding jobs — noun_consensus fires
+        on every VLM completion, but only one grounding job should be in-flight at
+        a time. Safe to use as a non-atomic guard here because noun_consensus_worker
+        is single-consumer and processes one message at a time.
+        """
         try:
             cursor = self.db_conn.cursor()
             cursor.execute(
-                "SELECT nouns_queried FROM sam3_results WHERE image_id = %s LIMIT 1",
-                (image_id,)
+                """SELECT 1 FROM service_dispatch
+                   WHERE image_id = %s
+                     AND service = 'florence2_grounding'
+                     AND cluster_id IS NULL
+                     AND status = 'pending'
+                   LIMIT 1""",
+                (image_id,),
             )
             row = cursor.fetchone()
             cursor.close()
-            if row is None:
-                return None
-            # nouns_queried is stored as a list (JSON array or TEXT[])
-            prev = row[0]
-            if isinstance(prev, str):
-                prev = json.loads(prev)
-            return set(prev) if prev else set()
+            return row is not None
         except Exception as e:
-            self.logger.error(f"noun_consensus: sam3 check failed for image {image_id}: {e}")
-            return None
+            self.logger.warning(
+                f"noun_consensus: pending grounding check failed for image {image_id}: {e}"
+            )
+            return False
 
     def _maybe_update_caption_summary(self, image_id: int, image_data: str, tier: str):
         """Trigger caption_summary synthesis when new VLM captions are available.
@@ -306,34 +311,6 @@ class NounConsensusWorker(BaseWorker):
             self.logger.error(
                 f"noun_consensus: failed to check/trigger caption_summary for image {image_id}: {e}"
             )
-
-    def _trigger_sam3(self, image_id: int, image_data: str, nouns: list, subject_noun: str = None, tier: str = 'free'):
-        """Publish a SAM3 segmentation request for the final noun consensus (basic+ only)."""
-        if tier == 'free':
-            self.logger.debug(f"noun_consensus: skipping SAM3 for free tier image {image_id}")
-            return
-        try:
-            queue_name = self._get_queue_by_service_type('sam3')
-            # Record dispatch before publishing so the row exists before SAM3 can complete.
-            # autocommit=True on this connection so the INSERT is immediately visible.
-            self._record_service_dispatch(image_id, 'sam3', None)
-            self._enqueue_publish(
-                queue_name,
-                json.dumps({
-                    'image_id': image_id,
-                    'image_data': image_data,
-                    'nouns': nouns,
-                    'subject_noun': subject_noun,
-                    'triggered_at': datetime.now().isoformat(),
-                    'tier': tier,
-                }),
-            )
-            self.logger.info(
-                f"noun_consensus: triggered SAM3 for image {image_id} "
-                f"with {len(nouns)} nouns: {nouns}"
-            )
-        except Exception as e:
-            self.logger.error(f"noun_consensus: failed to trigger SAM3 for image {image_id}: {e}")
 
     def _trigger_florence2_grounding(self, image_id: int, image_data: str, nouns: list, subject_noun: str = None, tier: str = 'free'):
         """Publish a Florence-2 grounding request for the final noun consensus (basic+ only).

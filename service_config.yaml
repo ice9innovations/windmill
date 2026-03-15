@@ -249,14 +249,6 @@ services:
       tier:
         - system
 
-    sam3:
-      queue_name: sam3
-      service_type: sam3
-      host: localhost
-      port: 9779
-      endpoint: /analyze
-      tier: []
-
     florence2_grounding:
       queue_name: florence2_grounding
       host: localhost
