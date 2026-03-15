@@ -55,3 +55,9 @@ DROP TRIGGER IF EXISTS postprocessing_notify ON postprocessing;
 CREATE TRIGGER postprocessing_notify
     AFTER INSERT ON postprocessing
     FOR EACH ROW EXECUTE FUNCTION notify_result_change();
+
+-- rembg_results (ON CONFLICT DO UPDATE)
+DROP TRIGGER IF EXISTS rembg_results_notify ON rembg_results;
+CREATE TRIGGER rembg_results_notify
+    AFTER INSERT OR UPDATE ON rembg_results
+    FOR EACH ROW EXECUTE FUNCTION notify_result_change();
