@@ -322,8 +322,8 @@ class NounConsensusWorker(BaseWorker):
         dispatch_id, the first completion would bulk-clear all pending rows and the SSE
         stream would fire complete with only the partial first result.
         """
-        if tier == 'free':
-            self.logger.debug(f"noun_consensus: skipping Florence-2 grounding for free tier image {image_id}")
+        if not self.config.is_available_for_tier('primary.florence2', tier):
+            self.logger.debug(f"noun_consensus: skipping Florence-2 grounding for tier '{tier}' image {image_id}")
             return
         try:
             queue_name = self._get_queue_by_service_type('grounding')
