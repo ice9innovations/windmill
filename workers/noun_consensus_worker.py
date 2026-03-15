@@ -336,13 +336,21 @@ class NounConsensusWorker(BaseWorker):
             self.logger.error(f"noun_consensus: failed to trigger SAM3 for image {image_id}: {e}")
 
     def _trigger_florence2_grounding(self, image_id: int, image_data: str, nouns: list, subject_noun: str = None, tier: str = 'free'):
-        """Publish a Florence-2 grounding request for the final noun consensus (basic+ only)."""
+        """Publish a Florence-2 grounding request for the final noun consensus (basic+ only).
+
+        The dispatch_id (service_dispatch PK) is embedded in the queue message so the
+        worker can use targeted completion tracking rather than the bulk-clear path.
+        This is required because noun_consensus fires florence2_grounding progressively
+        (once per VLM completion), creating multiple pending rows per image. Without
+        dispatch_id, the first completion would bulk-clear all pending rows and the SSE
+        stream would fire complete with only the partial first result.
+        """
         if tier == 'free':
             self.logger.debug(f"noun_consensus: skipping Florence-2 grounding for free tier image {image_id}")
             return
         try:
             queue_name = self._get_queue_by_service_type('grounding')
-            self._record_service_dispatch(image_id, 'florence2_grounding', None)
+            dispatch_id = self._record_service_dispatch(image_id, 'florence2_grounding', None)
             self._enqueue_publish(
                 queue_name,
                 json.dumps({
@@ -352,11 +360,12 @@ class NounConsensusWorker(BaseWorker):
                     'subject_noun': subject_noun,
                     'triggered_at': datetime.now().isoformat(),
                     'tier': tier,
+                    'dispatch_id': dispatch_id,
                 }),
             )
             self.logger.info(
                 f"noun_consensus: triggered Florence-2 grounding for image {image_id} "
-                f"with {len(nouns)} nouns: {nouns}"
+                f"with {len(nouns)} nouns: {nouns} (dispatch_id={dispatch_id})"
             )
         except Exception as e:
             self.logger.error(f"noun_consensus: failed to trigger Florence-2 grounding for image {image_id}: {e}")

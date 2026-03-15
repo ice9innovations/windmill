@@ -54,6 +54,7 @@ class Florence2GroundingWorker(BaseWorker):
             image_data = message.get('image_data')
             nouns = message.get('nouns', [])
             tier = message.get('tier', 'free')
+            dispatch_id = message.get('dispatch_id')
 
             if not image_data:
                 self.logger.error(
@@ -77,7 +78,7 @@ class Florence2GroundingWorker(BaseWorker):
                     f"florence2_grounding: image {image_id} already grounded "
                     f"with same {len(nouns)} nouns, skipping"
                 )
-                self._update_service_dispatch(image_id)
+                self._update_service_dispatch(image_id, dispatch_id=dispatch_id)
                 self._safe_ack(ch, method.delivery_tag)
                 return
 
@@ -122,7 +123,7 @@ class Florence2GroundingWorker(BaseWorker):
             if grounded_labels:
                 self._validate_noun_consensus(image_id, nouns, grounded_labels)
 
-            self._update_service_dispatch(image_id)
+            self._update_service_dispatch(image_id, dispatch_id=dispatch_id)
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
 

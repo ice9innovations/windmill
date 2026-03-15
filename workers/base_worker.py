@@ -440,6 +440,11 @@ class BaseWorker:
     def _record_service_dispatch(self, image_id, service, cluster_id=None):
         """Insert a pending service_dispatch record. Best-effort; errors swallowed.
 
+        Returns the dispatch_id (bigint PK) of the inserted row, or None on failure.
+        Callers that need targeted completion tracking (e.g. progressively-triggered
+        services like florence2_grounding) should embed this ID in their queue message
+        and pass it to _update_service_dispatch via the dispatch_id parameter.
+
         On autocommit=False connections the INSERT is wrapped in a SAVEPOINT so
         that a failure (e.g. FK violation) rolls back only this INSERT and leaves
         the parent transaction alive.
@@ -449,10 +454,12 @@ class BaseWorker:
             if not self.db_conn.autocommit:
                 cursor.execute("SAVEPOINT before_service_dispatch")
             cursor.execute(
-                "INSERT INTO service_dispatch (image_id, service, cluster_id) VALUES (%s, %s, %s)",
+                "INSERT INTO service_dispatch (image_id, service, cluster_id) VALUES (%s, %s, %s) RETURNING dispatch_id",
                 (image_id, service, cluster_id),
             )
+            row = cursor.fetchone()
             cursor.close()
+            return row[0] if row else None
         except Exception as e:
             self.logger.warning(
                 f"Failed to record service_dispatch for {service}/{image_id}: {e}"
@@ -462,21 +469,41 @@ class BaseWorker:
                     self.db_conn.cursor().execute("ROLLBACK TO SAVEPOINT before_service_dispatch")
                 except Exception:
                     pass
+            return None
 
-    def _update_service_dispatch(self, image_id, service=None, cluster_id=None, status='complete', reason=None):
+    def _update_service_dispatch(self, image_id, service=None, cluster_id=None, status='complete', reason=None, dispatch_id=None):
         """Update service_dispatch to the given status. Best-effort; errors swallowed.
+
+        dispatch_id: when provided, targets exactly this row by PK — safe for
+        progressively-triggered services (e.g. florence2_grounding) where multiple
+        pending rows can exist for the same image+service. Without dispatch_id the
+        update bulk-clears all pending rows matching (image_id, service, cluster_id),
+        which is correct for services that dispatch at most once per image.
 
         cluster_id=None matches rows WHERE cluster_id IS NULL (image-level services).
         Provide cluster_id for bbox-level services such as face and pose.
         service defaults to this worker's clean service name.
-        reason is written to failed_reason when provided (requires schema migration).
+        reason is written to failed_reason when provided.
 
         On autocommit=False connections the UPDATE is committed automatically.
         """
         service = service or self._get_clean_service_name()
         try:
             cursor = self.db_conn.cursor()
-            if cluster_id is None:
+            if dispatch_id is not None:
+                if reason is not None:
+                    cursor.execute(
+                        """UPDATE service_dispatch SET status = %s, failed_reason = %s
+                           WHERE dispatch_id = %s AND status = 'pending'""",
+                        (status, reason, dispatch_id),
+                    )
+                else:
+                    cursor.execute(
+                        """UPDATE service_dispatch SET status = %s
+                           WHERE dispatch_id = %s AND status = 'pending'""",
+                        (status, dispatch_id),
+                    )
+            elif cluster_id is None:
                 if reason is not None:
                     cursor.execute(
                         """UPDATE service_dispatch SET status = %s, failed_reason = %s
