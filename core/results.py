@@ -113,7 +113,7 @@ def fetch_results(cur, image_id):
 
     # SAM3 segmentation results
     cur.execute(
-        """SELECT nouns_queried, data, instance_count, processing_time, created_at, updated_at
+        """SELECT nouns_queried, data, instance_count, dispatched_face_pose, processing_time, created_at, updated_at
            FROM sam3_results WHERE image_id = %s""",
         (image_id,),
     )
@@ -121,12 +121,13 @@ def fetch_results(cur, image_id):
     sam3_results = None
     if sam3_row:
         sam3_results = {
-            "nouns_queried":   sam3_row['nouns_queried'],
-            "results":         sam3_row['data'],
-            "instance_count":  sam3_row['instance_count'],
-            "processing_time": sam3_row['processing_time'],
-            "created_at":      sam3_row['created_at'].isoformat() if sam3_row['created_at'] else None,
-            "updated_at":      sam3_row['updated_at'].isoformat() if sam3_row['updated_at'] else None,
+            "nouns_queried":        sam3_row['nouns_queried'],
+            "results":              sam3_row['data'],
+            "instance_count":       sam3_row['instance_count'],
+            "dispatched_face_pose": sam3_row['dispatched_face_pose'] or 0,
+            "processing_time":      sam3_row['processing_time'],
+            "created_at":           sam3_row['created_at'].isoformat() if sam3_row['created_at'] else None,
+            "updated_at":           sam3_row['updated_at'].isoformat() if sam3_row['updated_at'] else None,
         }
 
     # Verb consensus
