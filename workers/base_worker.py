@@ -907,13 +907,13 @@ class BaseWorker:
             self.logger.info(f"Successfully processed {self.service_name} request for image {image_id}")
 
         except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-            # Database connection errors - don't requeue to prevent CPU spin
+            # Database connection error mid-message — requeue so the job is not lost,
+            # then reconnect with backoff. The backoff delay prevents CPU spin while
+            # the database is unavailable.
             self.logger.error(f"Database error processing {self.service_name} message: {e}")
-            self.logger.warning("Rejecting message without requeue due to database error")
-            self._safe_nack(ch, method.delivery_tag, requeue=False)
-            if image_id is not None:
-                # Best-effort — will silently fail if the DB connection is fully dead
-                self._update_service_dispatch(image_id, status='failed', reason=str(e))
+            self.logger.warning("Requeueing message and attempting database reconnect...")
+            self._safe_nack(ch, method.delivery_tag, requeue=True)
+            self._reconnect_database()
             self.job_failed(str(e))
         except Exception as e:
             # Other errors (ML service, parsing, etc.) - requeue for retry
