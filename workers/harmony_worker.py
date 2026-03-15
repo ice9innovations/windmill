@@ -247,11 +247,14 @@ class HarmonyWorker(BaseWorker):
                         continue
 
                     box_emoji = normalize_person_emoji(instance.get('emoji', ''))
+                    tier = getattr(self, 'current_tier', 'free')
                     if box_emoji == '🧑':
-                        self.publish_bbox_message(self.postprocessing_queues['face'], base_message)
-                        self.publish_bbox_message(self.postprocessing_queues['pose'], base_message)
-                        self._record_service_dispatch(image_id, 'face', cluster_id)
-                        self._record_service_dispatch(image_id, 'pose', cluster_id)
+                        if self.config.is_available_for_tier('postprocessing.face', tier):
+                            self.publish_bbox_message(self.postprocessing_queues['face'], base_message)
+                            self._record_service_dispatch(image_id, 'face', cluster_id)
+                        if self.config.is_available_for_tier('postprocessing.pose', tier):
+                            self.publish_bbox_message(self.postprocessing_queues['pose'], base_message)
+                            self._record_service_dispatch(image_id, 'pose', cluster_id)
                     
         except Exception as e:
             self.logger.error(f"Error in dispatch_bbox_postprocessing: {e}")
