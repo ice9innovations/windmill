@@ -218,7 +218,7 @@ services:
     clip_score:
       host: localhost
       port: 7798
-      endpoint: /v3/score
+      endpoint: /score
       service_type: clip_score
       consensus: false
       tier:

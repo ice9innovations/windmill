@@ -156,8 +156,6 @@ class CaptionScoreWorker(BaseWorker):
 
         Returns a dict with:
             similarity_score  - cosine similarity float
-            image_embedding   - 768-dim normalized float list (ViT-L/14)
-            caption_embedding - 768-dim normalized float list for the caption text
         Returns None on failure.
         """
         try:
@@ -183,8 +181,6 @@ class CaptionScoreWorker(BaseWorker):
                 if result.get('status') == 'success':
                     return {
                         'similarity_score': result.get('similarity_score', 0.0),
-                        'image_embedding': result.get('image_embedding'),
-                        'caption_embedding': result.get('text_embedding'),
                     }
                 else:
                     self.logger.warning(f"CLIP score API error: {result.get('error', {}).get('message', 'Unknown error')}")
@@ -215,14 +211,11 @@ class CaptionScoreWorker(BaseWorker):
 
                 cursor = self.db_conn.cursor()
 
-                # Store caption embedding alongside the score so it travels with the caption
                 score_data = {
                     'caption_score': caption_score,
                     'processing_algorithm': 'clip_similarity_v1',
                     'processed_at': datetime.now().isoformat()
                 }
-                if caption_score.get('caption_embedding') is not None:
-                    score_data['caption_embedding'] = caption_score['caption_embedding']
 
                 cursor.execute("""
                     INSERT INTO postprocessing (image_id, service, data, status)
@@ -258,55 +251,6 @@ class CaptionScoreWorker(BaseWorker):
 
         return False
 
-    def save_image_embedding(self, image_id, image_embedding):
-        """Write the CLIP image embedding to the images table, once per image.
-
-        Uses an idempotent UPDATE that only fires when image_clip_embedding is NULL,
-        so concurrent caption score workers for the same image are safe.
-        The embedding list is serialized to pgvector's text format and cast in SQL.
-        """
-        max_retries = 3
-
-        for attempt in range(max_retries):
-            try:
-                if not self.ensure_database_connection():
-                    self.logger.error("Could not establish database connection for image embedding save")
-                    if attempt < max_retries - 1:
-                        time.sleep(2)
-                        continue
-                    return False
-
-                cursor = self.db_conn.cursor()
-
-                # json.dumps produces '[1.0, 2.0, ...]' — valid pgvector text input
-                embedding_str = json.dumps(image_embedding)
-
-                cursor.execute("""
-                    UPDATE images
-                    SET image_clip_embedding = %s::vector
-                    WHERE image_id = %s AND image_clip_embedding IS NULL
-                """, (embedding_str, image_id))
-
-                self.db_conn.commit()
-                cursor.close()
-
-                return True
-
-            except Exception as e:
-                self.logger.error(f"Error saving image embedding (attempt {attempt + 1}/{max_retries}): {e}")
-
-                try:
-                    if self.db_conn:
-                        self.db_conn.rollback()
-                except:
-                    pass
-
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-                    continue
-
-        return False
-    
     def process_message(self, ch, method, properties, body):
         """Process a message from the caption score queue"""
         try:
@@ -352,11 +296,10 @@ class CaptionScoreWorker(BaseWorker):
                 'service': service,
                 'caption': caption,
                 'similarity_score': similarity_score,
-                'caption_embedding': clip_result.get('caption_embedding'),
                 'scored_at': datetime.now().isoformat()
             }
 
-            # Save caption score (includes caption embedding) — only ack if this succeeds
+            # Save caption score — only ack if this succeeds
             if not self.save_individual_caption_score(image_id, caption_score):
                 self.logger.error(f"Caption score database save failed for {service}: {image_filename}")
                 self._safe_nack(ch, method.delivery_tag, requeue=True)
@@ -364,13 +307,6 @@ class CaptionScoreWorker(BaseWorker):
 
             self.logger.info(f"Saved caption score for {service}: {image_filename}")
             self._update_service_dispatch(image_id, service=f'caption_score_{actual_service_name}')
-
-            # Save image embedding once — idempotent, so safe to call on every message
-            image_embedding = clip_result.get('image_embedding')
-            if image_embedding is not None:
-                if not self.save_image_embedding(image_id, image_embedding):
-                    # Non-fatal: caption score is already committed; log and continue
-                    self.logger.warning(f"Image embedding save failed for {image_filename} (image_id={image_id}); will be written on next caption score")
 
             # Only acknowledge message when caption score is durably saved
             self._safe_ack(ch, method.delivery_tag)
