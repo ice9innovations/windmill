@@ -23,6 +23,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 import json
 import base64
 import io
+import time
 from PIL import Image
 
 from base_worker import BaseWorker
@@ -43,6 +44,7 @@ class NudenetWorker(BaseWorker):
     def after_result_stored(self, image_id, result, message):
         """Run spatial content analysis immediately after the NudeNet result is stored."""
         try:
+            start_time = time.time()
             nudenet_detections = self._extract_detections(result)
             if not nudenet_detections:
                 # No detections — write a clean SFW record so Pass 2 has a row to update
@@ -70,7 +72,7 @@ class NudenetWorker(BaseWorker):
                         'framing_analysis': {},
                         'person_deduplication': {'raw_count': 0, 'deduplicated_count': 0, 'containments': []},
                     },
-                })
+                }, processing_time=round(time.time() - start_time, 3))
                 return
 
             image_width  = message.get('image_width', 0)
@@ -144,7 +146,7 @@ class NudenetWorker(BaseWorker):
                 },
             }
 
-            self._store_spatial_analysis_dict(analysis)
+            self._store_spatial_analysis_dict(analysis, processing_time=round(time.time() - start_time, 3))
 
         except Exception as e:
             # Never fail the NudeNet job over analysis errors — log and move on
@@ -209,7 +211,7 @@ class NudenetWorker(BaseWorker):
         with Image.open(io.BytesIO(img_bytes)) as img:
             return img.size  # (width, height)
 
-    def _store_spatial_analysis_dict(self, analysis):
+    def _store_spatial_analysis_dict(self, analysis, processing_time=None):
         """Write Pass 1 result to content_analysis.
 
         All data is packed into the full_analysis JSONB column, matching the
@@ -242,19 +244,21 @@ class NudenetWorker(BaseWorker):
             cursor = self.db_conn.cursor()
             cursor.execute("""
                 INSERT INTO content_analysis (
-                    image_id, full_analysis, analysis_version
+                    image_id, full_analysis, analysis_version, processing_time
                 ) VALUES (
-                    %s, %s, %s
+                    %s, %s, %s, %s
                 )
                 ON CONFLICT (image_id) DO UPDATE SET
                     full_analysis    = EXCLUDED.full_analysis,
-                    analysis_version = EXCLUDED.analysis_version
+                    analysis_version = EXCLUDED.analysis_version,
+                    processing_time  = EXCLUDED.processing_time
                 WHERE content_analysis.analysis_version = 'spatial_1.0'
                    OR content_analysis.analysis_version IS NULL
             """, (
                 analysis['image_id'],
                 json.dumps(full_analysis),
                 SPATIAL_ANALYSIS_VERSION,
+                processing_time,
             ))
             self.db_conn.commit()
             cursor.close()
