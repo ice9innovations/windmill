@@ -68,13 +68,14 @@ class Florence2GroundingWorker(BaseWorker):
             # reported than when the dispatch was created, so the DB gives a
             # fresher (and usually complete) noun set. This also means we never
             # run with more nouns than we need to — the threshold is re-applied
-            # against the service_count at this moment.
-            nouns = self._fetch_consensus_nouns(image_id)
+            # against the tier's expected VLM count at this moment.
+            nouns = self._fetch_consensus_nouns(image_id, tier)
 
             if not nouns:
                 self.logger.info(
                     f"florence2_grounding: no consensus nouns for image {image_id}, skipping"
                 )
+                self._update_service_dispatch(image_id, dispatch_id=dispatch_id)
                 self._safe_ack(ch, method.delivery_tag)
                 return
 
@@ -159,19 +160,19 @@ class Florence2GroundingWorker(BaseWorker):
             return f"{nouns[0]} and {nouns[1]}"
         return f"{', '.join(nouns[:-1])}, and {nouns[-1]}"
 
-    def _fetch_consensus_nouns(self, image_id: int) -> list:
+    def _fetch_consensus_nouns(self, image_id: int, tier: str) -> list:
         """Return consensus nouns from noun_consensus at processing time.
 
         Reads the current DB state rather than using nouns baked into the queue
-        message. Florence-2 is slower than the VLMs, so by the time this job
-        is picked up the noun set will be fuller than when the dispatch was
-        created. Applies the same majority-vote threshold as noun_consensus_worker,
-        using the service_count stored in the row.
+        message. Applies the same majority-vote threshold as noun_consensus_worker:
+        min_votes = max(2, ceil(tier_vlm_count / 2)), where tier_vlm_count is the
+        total VLMs expected for the tier — not the number that have reported so far.
+        This keeps the bar stable across progressive triggers.
         """
         try:
             cursor = self.db_conn.cursor()
             cursor.execute(
-                "SELECT nouns, service_count FROM noun_consensus WHERE image_id = %s",
+                "SELECT nouns FROM noun_consensus WHERE image_id = %s",
                 (image_id,),
             )
             row = cursor.fetchone()
@@ -179,8 +180,13 @@ class Florence2GroundingWorker(BaseWorker):
             if not row or not row[0]:
                 return []
             nouns_data = row[0]  # jsonb — already a list
-            service_count = row[1] or 1
-            min_votes = max(2, (service_count + 1) // 2)
+            vlm_names = set(self.config.get_vlm_service_names())
+            tier_vlm_count = len([
+                name for name in self.config.get_services_by_tier(tier)
+                if name.startswith('primary.')
+                and name.split('.', 1)[1] in vlm_names
+            ]) or 1
+            min_votes = max(2, (tier_vlm_count + 1) // 2)
             return [
                 n['canonical'] for n in nouns_data
                 if n.get('vote_count', 0) >= min_votes
