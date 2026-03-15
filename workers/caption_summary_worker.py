@@ -72,13 +72,6 @@ class CaptionSummaryWorker(BaseWorker):
             f"http://{synth_cfg['host']}:{synth_cfg['port']}{synth_cfg['endpoint']}"
         )
 
-        # CLIP score endpoint — same resolution pattern as caption_score_worker
-        clip_services = self.config.get_service_group('postprocessing.clip_score[]')
-        clip_cfg = self.config.get_service_config(clip_services[0])
-        self.clip_score_url = (
-            f"http://{clip_cfg['host']}:{clip_cfg['port']}{clip_cfg['endpoint']}"
-        )
-
     def process_message(self, ch, method, properties, body):
         """Override base process_message — DB fetch + caption-synthesis service call."""
         start_time = time.time()
@@ -152,13 +145,6 @@ class CaptionSummaryWorker(BaseWorker):
                          processing_time=round(time.time() - start_time, 3))
             self._update_service_dispatch(image_id, service='caption_summary')
 
-            # CLIP score the synthesized caption — non-fatal if unavailable
-            if image_data:
-                self._score_and_save(image_id, summary, image_data)
-            else:
-                self.logger.debug(
-                    f"caption_summary: no image_data for image {image_id}, skipping CLIP score"
-                )
 
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
@@ -287,62 +273,6 @@ class CaptionSummaryWorker(BaseWorker):
                 f"caption_summary: synthesis service call failed for image {image_id}: {e}"
             )
             return '', ''
-
-    # ------------------------------------------------------------------
-    # CLIP scoring
-    # ------------------------------------------------------------------
-
-    def _score_and_save(self, image_id: int, caption: str, image_data: str):
-        """Score the synthesized caption against the image via CLIP, save to postprocessing."""
-        try:
-            image_bytes = base64.b64decode(image_data)
-            resp = requests.post(
-                self.clip_score_url,
-                files={'file': ('image.jpg', io.BytesIO(image_bytes), 'image/jpeg')},
-                data={'caption': caption},
-                timeout=60,
-            )
-            resp.raise_for_status()
-            result = resp.json()
-
-            if result.get('status') != 'success':
-                self.logger.warning(
-                    f"caption_summary: CLIP score returned non-success for image {image_id}"
-                )
-                return
-
-            score = result.get('similarity_score', 0.0)
-
-            score_data = {
-                'caption_score': {
-                    'service': 'synthesis',
-                    'caption': caption,
-                    'similarity_score': score,
-                    'scored_at': datetime.now().isoformat(),
-                },
-                'processing_algorithm': 'clip_similarity_v1',
-                'processed_at': datetime.now().isoformat(),
-            }
-
-            cursor = self.db_conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO postprocessing (image_id, service, data, status)
-                VALUES (%s, %s, %s, 'success')
-                """,
-                (image_id, 'caption_score_synthesis', json.dumps(score_data))
-            )
-            self.db_conn.commit()
-            cursor.close()
-
-            self.logger.info(
-                f"caption_summary: synthesis CLIP score {score:.3f} for image {image_id}"
-            )
-
-        except Exception as e:
-            self.logger.error(
-                f"caption_summary: CLIP scoring failed for image {image_id}: {e}"
-            )
 
     # ------------------------------------------------------------------
     # DB write

@@ -110,8 +110,6 @@ class BaseWorker:
 
         # Enable triggers for spatial services (for bbox harmonization)
         self.enable_triggers = self.is_spatial
-        # Enable caption scoring for semantic services
-        self.enable_caption_scoring = self.is_semantic
         # Enable noun and verb consensus for VLM services
         self.enable_noun_consensus = self.is_vlm
         self.enable_verb_consensus = self.is_vlm
@@ -204,8 +202,6 @@ class BaseWorker:
             declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('harmonization'))
         if self.enable_consensus_triggers:
             declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('consensus'))
-        if self.enable_caption_scoring:
-            declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('caption_score'))
         if self.enable_noun_consensus:
             declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('noun_consensus'))
         if self.enable_verb_consensus:
@@ -391,36 +387,6 @@ class BaseWorker:
 
             except Exception as e:
                 self.logger.error(f"Failed to enqueue consensus message: {e}")
-    
-    def trigger_caption_scoring(self, image_id, message):
-        """Trigger caption scoring for caption generation services (async via background publish thread)"""
-        if self.enable_caption_scoring:
-            try:
-                caption_score_message = {
-                    'image_id': image_id,
-                    'image_filename': message.get('image_filename', f'image_{image_id}'),
-                    'image_data': message['image_data'],
-                    'service': self.service_name,
-                    'worker_id': self.worker_id,
-                    'processed_at': datetime.now().isoformat(),
-                    'tier': message.get('tier', 'free'),
-                }
-
-                self._enqueue_publish(
-                    self._get_queue_by_service_type('caption_score'),
-                    json.dumps(caption_score_message)
-                )
-
-                # Record pending dispatch so the API can track completion
-                self._record_service_dispatch(
-                    image_id,
-                    f'caption_score_{self._get_clean_service_name()}',
-                )
-
-                self.logger.debug(f"Enqueued caption scoring trigger for {self.service_name} image {image_id}")
-
-            except Exception as e:
-                self.logger.error(f"Failed to enqueue caption score message: {e}")
     
     def trigger_noun_consensus(self, image_id, message):
         """Trigger noun consensus for VLM services (async via background publish thread)"""
@@ -888,10 +854,6 @@ class BaseWorker:
                 )
 
                 self.logger.debug(f"Enqueued bbox completion to harmonization")
-
-            # Trigger caption scoring
-            if self.enable_caption_scoring:
-                self.trigger_caption_scoring(image_id, message)
 
             # Trigger noun and verb consensus for VLM services
             self.trigger_noun_consensus(image_id, message)

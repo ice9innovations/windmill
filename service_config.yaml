@@ -205,25 +205,6 @@ services:
         - premium
         - batch
 
-    caption_score:
-      queue_name: caption_score
-      host: localhost
-      port: 7778
-      endpoint: /score
-      service_type: caption_score
-      consensus: false
-      tier:
-        - system
-
-    clip_score:
-      host: localhost
-      port: 7798
-      endpoint: /score
-      service_type: clip_score
-      consensus: false
-      tier:
-        - system
-
   system:
 
     # Infrastructure Services - Queue processing and harmonization
