@@ -62,8 +62,8 @@ def fetch_results(cur, image_id):
     consensus = None
     if consensus_row:
         consensus = {
+            "metadata":          {"processing_time": consensus_row['processing_time']},
             "consensus_data":    consensus_row['consensus_data'],
-            "processing_time":   consensus_row['processing_time'],
             "consensus_created": consensus_row['consensus_created'].isoformat() if consensus_row['consensus_created'] else None,
         }
 
@@ -74,9 +74,12 @@ def fetch_results(cur, image_id):
         (image_id,),
     )
     content_row      = cur.fetchone()
-    content_analysis = dict(content_row) if content_row else None
-    if content_analysis and content_analysis.get('created'):
-        content_analysis['created'] = content_analysis['created'].isoformat()
+    content_analysis = None
+    if content_row:
+        content_analysis = dict(content_row)
+        content_analysis['metadata'] = {'processing_time': content_analysis.pop('processing_time', None)}
+        if content_analysis.get('created'):
+            content_analysis['created'] = content_analysis['created'].isoformat()
 
     # Postprocessing — also resolve source_bbox for canvas coordinate transforms.
     cur.execute(
@@ -101,12 +104,12 @@ def fetch_results(cur, image_id):
         all_nouns       = noun_consensus_row['nouns'] or []
         consensus_nouns = [n for n in all_nouns if n.get('confidence', 0) > 0.5 or n.get('promoted', False)]
         noun_consensus  = {
+            "metadata":         {"processing_time": noun_consensus_row['processing_time']},
             "nouns":            consensus_nouns,
             "nouns_all":        all_nouns,
             "category_tally":   noun_consensus_row['category_tally'] or [],
             "services_present": noun_consensus_row['services_present'],
             "service_count":    noun_consensus_row['service_count'],
-            "processing_time":  noun_consensus_row['processing_time'],
             "created_at":       noun_consensus_row['created_at'].isoformat() if noun_consensus_row['created_at'] else None,
             "updated_at":       noun_consensus_row['updated_at'].isoformat() if noun_consensus_row['updated_at'] else None,
         }
@@ -140,11 +143,11 @@ def fetch_results(cur, image_id):
     verb_consensus     = None
     if verb_consensus_row:
         verb_consensus = {
+            "metadata":         {"processing_time": verb_consensus_row['processing_time']},
             "verbs":            verb_consensus_row['verbs'] or [],
             "svo_triples":      verb_consensus_row['svo_triples'] or {},
             "services_present": verb_consensus_row['services_present'],
             "service_count":    verb_consensus_row['service_count'],
-            "processing_time":  verb_consensus_row['processing_time'],
             "created_at":       verb_consensus_row['created_at'].isoformat() if verb_consensus_row['created_at'] else None,
             "updated_at":       verb_consensus_row['updated_at'].isoformat() if verb_consensus_row['updated_at'] else None,
         }
@@ -159,11 +162,11 @@ def fetch_results(cur, image_id):
     caption_summary     = None
     if caption_summary_row:
         caption_summary = {
+            "metadata":         {"processing_time": caption_summary_row['processing_time']},
             "summary_caption":  caption_summary_row['summary_caption'],
             "model":            caption_summary_row['model'],
             "services_present": caption_summary_row['services_present'],
             "service_count":    caption_summary_row['service_count'],
-            "processing_time":  caption_summary_row['processing_time'],
             "created_at":       caption_summary_row['created_at'].isoformat() if caption_summary_row['created_at'] else None,
             "updated_at":       caption_summary_row['updated_at'].isoformat() if caption_summary_row['updated_at'] else None,
         }
