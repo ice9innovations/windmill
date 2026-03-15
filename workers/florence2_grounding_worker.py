@@ -52,7 +52,6 @@ class Florence2GroundingWorker(BaseWorker):
             message = json.loads(body)
             image_id = message['image_id']
             image_data = message.get('image_data')
-            nouns = message.get('nouns', [])
             tier = message.get('tier', 'free')
             dispatch_id = message.get('dispatch_id')
 
@@ -64,9 +63,17 @@ class Florence2GroundingWorker(BaseWorker):
                 self.job_failed("No image data")
                 return
 
+            # Read nouns from noun_consensus at processing time, not from the
+            # message. By the time this job is picked up, more VLMs will have
+            # reported than when the dispatch was created, so the DB gives a
+            # fresher (and usually complete) noun set. This also means we never
+            # run with more nouns than we need to — the threshold is re-applied
+            # against the service_count at this moment.
+            nouns = self._fetch_consensus_nouns(image_id)
+
             if not nouns:
                 self.logger.info(
-                    f"florence2_grounding: no nouns to ground for image {image_id}, skipping"
+                    f"florence2_grounding: no consensus nouns for image {image_id}, skipping"
                 )
                 self._safe_ack(ch, method.delivery_tag)
                 return
@@ -151,6 +158,38 @@ class Florence2GroundingWorker(BaseWorker):
         if len(nouns) == 2:
             return f"{nouns[0]} and {nouns[1]}"
         return f"{', '.join(nouns[:-1])}, and {nouns[-1]}"
+
+    def _fetch_consensus_nouns(self, image_id: int) -> list:
+        """Return consensus nouns from noun_consensus at processing time.
+
+        Reads the current DB state rather than using nouns baked into the queue
+        message. Florence-2 is slower than the VLMs, so by the time this job
+        is picked up the noun set will be fuller than when the dispatch was
+        created. Applies the same majority-vote threshold as noun_consensus_worker,
+        using the service_count stored in the row.
+        """
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                "SELECT nouns, service_count FROM noun_consensus WHERE image_id = %s",
+                (image_id,),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            if not row or not row[0]:
+                return []
+            nouns_data = row[0]  # jsonb — already a list
+            service_count = row[1] or 1
+            min_votes = max(2, (service_count + 1) // 2)
+            return [
+                n['canonical'] for n in nouns_data
+                if n.get('vote_count', 0) >= min_votes
+            ]
+        except Exception as e:
+            self.logger.warning(
+                f"florence2_grounding: could not fetch consensus nouns for image {image_id}: {e}"
+            )
+            return []
 
     def _fetch_previous_nouns(self, image_id: int) -> set:
         """Return the noun set from the most recent grounding result for this image.
