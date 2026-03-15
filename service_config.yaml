@@ -274,7 +274,7 @@ services:
       queue_name: rembg
       service_type: rembg
       host: localhost
-      port: 7769
+      port: 7768
       endpoint: /analyze
       tier:
         - basic
