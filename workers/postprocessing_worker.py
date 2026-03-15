@@ -10,6 +10,7 @@ sys.path.append(os.path.dirname(__file__))
 import json
 import base64
 import io
+import time
 import requests
 from datetime import datetime
 from base_worker import BaseWorker
@@ -39,11 +40,11 @@ class PostProcessingWorker(BaseWorker):
         """Process the cropped image with the specific service - override in subclasses"""
         raise NotImplementedError("Subclasses must implement process_service")
     
-    def save_postprocessing_result(self, merged_box_id, image_id, result_data, bbox, cluster_id):
+    def save_postprocessing_result(self, merged_box_id, image_id, result_data, bbox, cluster_id, processing_time=None):
         """Save postprocessing result to database"""
         try:
             cursor = self.db_conn.cursor()
-            
+
             # Store cluster_id in data so the API can look up the source bbox
             stored = dict(result_data) if result_data else {}
             if cluster_id:
@@ -51,14 +52,15 @@ class PostProcessingWorker(BaseWorker):
 
             # Insert postprocessing result
             cursor.execute("""
-                INSERT INTO postprocessing (merged_box_id, image_id, service, data, status)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO postprocessing (merged_box_id, image_id, service, data, status, processing_time)
+                VALUES (%s, %s, %s, %s, %s, %s)
             """, (
                 merged_box_id,
                 image_id,
                 self._get_clean_service_name(),
                 json.dumps(stored),
-                'success'
+                'success',
+                processing_time,
             ))
             
             self.db_conn.commit()
@@ -94,12 +96,14 @@ class PostProcessingWorker(BaseWorker):
             self.logger.info(f"Processing {self.service_name} for {cluster_id} (merged_box_id: {merged_box_id})")
 
             # Process with specific service
+            start_time = time.time()
             result_data = self.process_service(cropped_image_data)
+            processing_time = round(time.time() - start_time, 3)
 
             # Save result
             if result_data:
                 success = self.save_postprocessing_result(
-                    merged_box_id, image_id, result_data, bbox, cluster_id
+                    merged_box_id, image_id, result_data, bbox, cluster_id, processing_time
                 )
                 if success:
                     self._safe_ack(ch, method.delivery_tag)
@@ -110,7 +114,7 @@ class PostProcessingWorker(BaseWorker):
             else:
                 # Save empty result to avoid reprocessing
                 self.save_postprocessing_result(
-                    merged_box_id, image_id, None, bbox, cluster_id
+                    merged_box_id, image_id, None, bbox, cluster_id, processing_time
                 )
                 self._safe_ack(ch, method.delivery_tag)
                 self._update_service_dispatch(image_id, cluster_id=cluster_id)

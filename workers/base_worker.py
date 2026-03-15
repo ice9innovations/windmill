@@ -242,29 +242,41 @@ class BaseWorker:
                         self.logger.error(f"Publish thread reconnect failed: {reconnect_e}")
                 continue
 
-            try:
-                self._publish_channel.basic_publish(
-                    exchange='',
-                    routing_key=routing_key,
-                    body=body,
-                    properties=pika.BasicProperties(delivery_mode=2)
-                )
-            except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
-                    pika.exceptions.StreamLostError) as e:
-                self.logger.warning(f"Publish connection lost: {e}. Reconnecting...")
+            # Drain all waiting messages into a batch so they are published
+            # in a tight burst rather than one per loop iteration. This matters
+            # when a single worker result triggers multiple downstream messages
+            # (e.g. florence2_grounding dispatching N colors_post jobs).
+            batch = [(routing_key, body)]
+            while True:
                 try:
-                    self._connect_publish_channel()
-                    # Retry the failed publish after reconnecting
+                    batch.append(self._publish_queue.get_nowait())
+                except stdlib_queue.Empty:
+                    break
+
+            for routing_key, body in batch:
+                try:
                     self._publish_channel.basic_publish(
                         exchange='',
                         routing_key=routing_key,
                         body=body,
                         properties=pika.BasicProperties(delivery_mode=2)
                     )
-                except Exception as retry_e:
-                    self.logger.error(f"Publish retry failed after reconnect: {retry_e}")
-            except Exception as e:
-                self.logger.error(f"Publish error: {e}")
+                except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
+                        pika.exceptions.StreamLostError) as e:
+                    self.logger.warning(f"Publish connection lost: {e}. Reconnecting...")
+                    try:
+                        self._connect_publish_channel()
+                        # Retry the failed publish after reconnecting
+                        self._publish_channel.basic_publish(
+                            exchange='',
+                            routing_key=routing_key,
+                            body=body,
+                            properties=pika.BasicProperties(delivery_mode=2)
+                        )
+                    except Exception as retry_e:
+                        self.logger.error(f"Publish retry failed after reconnect: {retry_e}")
+                except Exception as e:
+                    self.logger.error(f"Publish error: {e}")
 
         # Drain remaining messages on shutdown
         drained = 0
