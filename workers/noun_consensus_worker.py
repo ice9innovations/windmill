@@ -195,7 +195,7 @@ class NounConsensusWorker(BaseWorker):
             # Trigger caption_summary directly — fires as soon as enough captions are
             # available, and re-fires progressively as stragglers arrive. No longer
             # depends on SAM3 completing first.
-            if tier != 'free' and image_data:
+            if self.config.is_available_for_tier('system.caption_summary', tier) and image_data:
                 self._maybe_update_caption_summary(image_id, image_data, tier)
 
         except Exception as e:

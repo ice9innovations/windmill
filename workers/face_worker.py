@@ -50,7 +50,7 @@ class BboxFaceWorker(PostProcessingWorker):
     def _trigger_content_analysis(self, image_id: int, tier: str = 'free'):
         """Publish to content_analysis queue so face+NudeNet correlation runs
         with face service results present (basic+ tiers only)."""
-        if tier == 'free':
+        if not self.config.is_available_for_tier('system.content_analysis', tier):
             return
 
         try:
