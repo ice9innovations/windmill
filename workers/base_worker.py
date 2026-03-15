@@ -206,8 +206,6 @@ class BaseWorker:
             declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('noun_consensus'))
         if self.enable_verb_consensus:
             declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('verb_consensus'))
-        if self.enable_noun_consensus:
-            declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('sam3'))
 
         self._declare_additional_queues(declare_with_dlq)
 
