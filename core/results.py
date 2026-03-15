@@ -69,7 +69,7 @@ def fetch_results(cur, image_id):
 
     # Content analysis
     cur.execute(
-        """SELECT full_analysis, created, analysis_version
+        """SELECT full_analysis, created, analysis_version, processing_time
            FROM content_analysis WHERE image_id = %s""",
         (image_id,),
     )
@@ -91,7 +91,7 @@ def fetch_results(cur, image_id):
 
     # Noun consensus
     cur.execute(
-        """SELECT nouns, category_tally, services_present, service_count, created_at, updated_at
+        """SELECT nouns, category_tally, services_present, service_count, processing_time, created_at, updated_at
            FROM noun_consensus WHERE image_id = %s""",
         (image_id,),
     )
@@ -106,6 +106,7 @@ def fetch_results(cur, image_id):
             "category_tally":   noun_consensus_row['category_tally'] or [],
             "services_present": noun_consensus_row['services_present'],
             "service_count":    noun_consensus_row['service_count'],
+            "processing_time":  noun_consensus_row['processing_time'],
             "created_at":       noun_consensus_row['created_at'].isoformat() if noun_consensus_row['created_at'] else None,
             "updated_at":       noun_consensus_row['updated_at'].isoformat() if noun_consensus_row['updated_at'] else None,
         }
@@ -130,7 +131,7 @@ def fetch_results(cur, image_id):
 
     # Verb consensus
     cur.execute(
-        """SELECT verbs, svo_triples, services_present, service_count, created_at, updated_at
+        """SELECT verbs, svo_triples, services_present, service_count, processing_time, created_at, updated_at
            FROM verb_consensus WHERE image_id = %s""",
         (image_id,),
     )
@@ -142,13 +143,14 @@ def fetch_results(cur, image_id):
             "svo_triples":      verb_consensus_row['svo_triples'] or {},
             "services_present": verb_consensus_row['services_present'],
             "service_count":    verb_consensus_row['service_count'],
+            "processing_time":  verb_consensus_row['processing_time'],
             "created_at":       verb_consensus_row['created_at'].isoformat() if verb_consensus_row['created_at'] else None,
             "updated_at":       verb_consensus_row['updated_at'].isoformat() if verb_consensus_row['updated_at'] else None,
         }
 
     # Caption summary
     cur.execute(
-        """SELECT summary_caption, model, services_present, service_count, created_at, updated_at
+        """SELECT summary_caption, model, services_present, service_count, processing_time, created_at, updated_at
            FROM caption_summary WHERE image_id = %s""",
         (image_id,),
     )
@@ -160,6 +162,7 @@ def fetch_results(cur, image_id):
             "model":            caption_summary_row['model'],
             "services_present": caption_summary_row['services_present'],
             "service_count":    caption_summary_row['service_count'],
+            "processing_time":  caption_summary_row['processing_time'],
             "created_at":       caption_summary_row['created_at'].isoformat() if caption_summary_row['created_at'] else None,
             "updated_at":       caption_summary_row['updated_at'].isoformat() if caption_summary_row['updated_at'] else None,
         }
