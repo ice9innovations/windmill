@@ -58,6 +58,18 @@ services:
         - premium
         - batch
 
+    nsfw2:
+      queue_name: nsfw2
+      host: localhost
+      port: 7774
+      endpoint: /analyze
+      service_type: nsfw
+      tier:
+        - free
+        - basic
+        - premium
+        - batch
+
     ocr:
       queue_name: ocr
       host: localhost
