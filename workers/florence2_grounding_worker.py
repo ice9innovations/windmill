@@ -108,6 +108,23 @@ class Florence2GroundingWorker(BaseWorker):
             # Also record the colors_post dispatch count so the API can gate
             # is_complete on all bbox-level color jobs finishing.
             predictions = result.get('predictions', [])
+
+            # Florence-2 occasionally returns inverted bbox coordinates (y2 < y1 in
+            # raw [x1,y1,x2,y2] space). REST.py converts to [x, y, w, h], so an
+            # inverted axis surfaces as a negative w or h. Correct by adjusting the
+            # origin and taking the absolute value of the dimension.
+            for p in predictions:
+                bbox = p.get('bbox')
+                if bbox and len(bbox) >= 4:
+                    x, y, w, h = bbox[:4]
+                    if w < 0:
+                        x += w
+                        w = -w
+                    if h < 0:
+                        y += h
+                        h = -h
+                    p['bbox'] = [x, y, w, h]
+
             colors_post_count = sum(
                 1 for p in predictions
                 if p.get('bbox') and len(p['bbox']) >= 4
