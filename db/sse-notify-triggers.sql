@@ -50,6 +50,12 @@ CREATE TRIGGER caption_summary_notify
     AFTER INSERT OR UPDATE ON caption_summary
     FOR EACH ROW EXECUTE FUNCTION notify_result_change();
 
+-- merged_boxes (DELETE + INSERT — INSERT trigger is sufficient)
+DROP TRIGGER IF EXISTS merged_boxes_notify ON merged_boxes;
+CREATE TRIGGER merged_boxes_notify
+    AFTER INSERT ON merged_boxes
+    FOR EACH ROW EXECUTE FUNCTION notify_result_change();
+
 -- postprocessing (INSERT only — colors_post, caption_score_*, face, pose)
 DROP TRIGGER IF EXISTS postprocessing_notify ON postprocessing;
 CREATE TRIGGER postprocessing_notify
