@@ -337,7 +337,7 @@ class ContentAnalysisWorker(BaseWorker):
             self.logger.error(f"Error fetching image data: {e}")
             return None
 
-    def correlate_with_nsfw2(self, scene_type, nsfw2_result):
+    def correlate_with_nsfw2(self, scene_type, nsfw2_result, nudenet_detections=None):
         """
         Correlate our scene classification with NSFW2's verdict.
 
@@ -348,11 +348,13 @@ class ContentAnalysisWorker(BaseWorker):
         Confidence thresholds:
         - High (>0.9): Override to 'nsfw2_flagged' - NSFW2 is very confident
         - Medium (0.7-0.9): Override to 'suggestive' - likely suggestive content
-        - Lower (0.5-0.7): Keep as sfw but flag disagreement
+        - Lower (0.5-0.7): Override to 'suggestive' if NudeNet found covered anatomy
+                           (two weak signals together are meaningful); otherwise flag only
 
         Args:
             scene_type: Our current scene classification
             nsfw2_result: NSFW2 service result dict with 'nsfw', 'confidence', 'emoji'
+            nudenet_detections: List of NudeNet detection dicts (optional, used for combined signal)
 
         Returns:
             dict: {
@@ -423,7 +425,24 @@ class ContentAnalysisWorker(BaseWorker):
                 'reasoning': 'nsfw2_medium_confidence_override'
             }
         else:
-            # Lower confidence: keep as sfw but flag the disagreement
+            # Lower confidence: check for corroborating covered anatomy from NudeNet.
+            # A weak nsfw2 signal combined with NudeNet confirming something is being
+            # covered is enough to call it suggestive (lingerie, swimwear, etc.).
+            covered_labels = [
+                d['label'] for d in (nudenet_detections or [])
+                if 'COVERED' in d.get('label', '')
+            ]
+            if covered_labels:
+                return {
+                    'agreement': False,
+                    'nsfw2_verdict': nsfw2_verdict,
+                    'nsfw2_confidence': nsfw2_confidence,
+                    'override_scene_type': True,
+                    'new_scene_type': 'suggestive',
+                    'new_intimacy_level': 'suggestive',
+                    'reasoning': 'nsfw2_covered_anatomy_combined_signal'
+                }
+            # No corroborating evidence: flag the disagreement but don't override
             return {
                 'agreement': False,
                 'nsfw2_verdict': nsfw2_verdict,
@@ -516,13 +535,16 @@ class ContentAnalysisWorker(BaseWorker):
 
             # NSFW2 correlation: when we classify as sfw, check NSFW2's verdict
             nsfw2_result = image_data.get('nsfw2_result')
-            nsfw2_correlation = self.correlate_with_nsfw2(scene_type, nsfw2_result)
+            nsfw2_correlation = self.correlate_with_nsfw2(scene_type, nsfw2_result, nudenet_detections)
 
-            # Override scene_type if NSFW2 disagrees with high confidence
+            # Override scene_type if NSFW2 disagrees — write back into activity_analysis
+            # so the stored data is consistent and downstream consumers read one truth.
             if nsfw2_correlation['override_scene_type']:
                 original_scene_type = scene_type
                 scene_type = nsfw2_correlation['new_scene_type']
                 intimacy_level = nsfw2_correlation['new_intimacy_level']
+                activity_analysis['scene_type'] = scene_type
+                activity_analysis['intimacy_level'] = intimacy_level
                 self.logger.debug(
                     f"NSFW2 override: {original_scene_type} -> {scene_type} "
                     f"(nsfw2_confidence={nsfw2_correlation['nsfw2_confidence']:.3f})"
