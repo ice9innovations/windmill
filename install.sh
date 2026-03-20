@@ -11,6 +11,7 @@ set -e
 
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 
+rm -rf "$SCRIPT_DIR/windmill_venv"
 python3.11 -m venv "$SCRIPT_DIR/windmill_venv"
 source "$SCRIPT_DIR/windmill_venv/bin/activate"
 
