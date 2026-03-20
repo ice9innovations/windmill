@@ -103,6 +103,13 @@ services:
       endpoint: /v3/analyze
       service_type: semantic, vlm
 
+    xai:
+      queue_name: xai
+      host: localhost
+      port: 7805
+      endpoint: /v3/analyze
+      service_type: semantic, vlm
+
     qwen:
       queue_name: qwen
       host: localhost
