@@ -415,8 +415,10 @@ def _normalize_slang(n: str) -> str:
     pussy=cat) so it will not link them to their clinical equivalents.
     Applied as a pre-pass before any collapsing strategy.
 
-    Checks for multi-word synonyms as word-bounded substrings to handle
-    compounds with modifiers (e.g. "lace bra top" contains "bra top" → "bra").
+    Checks for multi-word synonyms and single-word slang as word-bounded
+    substrings to handle compounds with modifiers (e.g. "lace bra top"
+    contains "bra top" → "bra") and spaCy compound-dep extractions where
+    a slang term is embedded (e.g. "man cock" contains "cock" → "penis").
     """
     key = n.lower().strip()
 
@@ -424,9 +426,10 @@ def _normalize_slang(n: str) -> str:
     if key in CONTENT_MODERATION_SYNONYMS:
         return CONTENT_MODERATION_SYNONYMS[key]
 
-    # Check for multi-word synonyms as word-bounded substrings (longest first)
+    # Check for synonyms as word-bounded substrings (longest match first,
+    # including single-word scan for slang embedded in spaCy compound nouns)
     words = key.split()
-    for length in range(len(words), 1, -1):
+    for length in range(len(words), 0, -1):
         for i in range(len(words) - length + 1):
             phrase = ' '.join(words[i:i+length])
             if phrase in CONTENT_MODERATION_SYNONYMS:

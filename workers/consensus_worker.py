@@ -100,7 +100,7 @@ class ConsensusWorkerMergeFocused(BaseWorker):
         )
 
     def trigger_content_analysis(self, image_id, image_filename, tier='free'):
-        """Trigger content analysis after consensus completes (all tiers).
+        """Trigger content analysis after consensus completes.
 
         Uses _enqueue_publish so the publish goes through the dedicated background
         connection rather than the consume channel. This prevents channel-death from

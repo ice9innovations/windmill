@@ -313,7 +313,7 @@ class NounConsensusWorker(BaseWorker):
             )
 
     def _trigger_florence2_grounding(self, image_id: int, image_data: str, nouns: list, subject_noun: str = None, tier: str = 'free'):
-        """Publish a Florence-2 grounding request for the final noun consensus (basic+ only).
+        """Publish a Florence-2 grounding request for the final noun consensus.
 
         The dispatch_id (service_dispatch PK) is embedded in the queue message so the
         worker can use targeted completion tracking rather than the bulk-clear path.
