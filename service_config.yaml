@@ -14,7 +14,7 @@ services:
       queue_name: blip # allows overrides if explicitly defined, uses service name if not
       host: localhost
       port: 7777
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: semantic, vlm
       consensus: true
       tier:
@@ -25,7 +25,7 @@ services:
       queue_name: florence2
       host: localhost
       port: 7803
-      endpoint: /v3/analyze?task=DETAILED_CAPTION
+      endpoint: /analyze?task=DETAILED_CAPTION
       service_type: semantic, vlm
       consensus: true
       tier:
@@ -37,7 +37,7 @@ services:
       queue_name: colors
       host: localhost
       port: 7770
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: colors
       consensus: false
       tier:
@@ -50,7 +50,7 @@ services:
       queue_name: metadata
       host: localhost
       port: 7781
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: metadata
       tier:
         - free
@@ -74,7 +74,7 @@ services:
       queue_name: ocr
       host: localhost
       port: 7775
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: specialized
       tier:
         - basic
@@ -85,7 +85,7 @@ services:
       queue_name: qr
       host: localhost
       port: 7801
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: specialized
       tier:
         - basic
@@ -96,7 +96,7 @@ services:
       queue_name: nudenet
       host: localhost
       port: 7789
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: specialized
       tier:
         - free
@@ -108,7 +108,7 @@ services:
       queue_name: moondream
       host: localhost
       port: 7795
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: semantic, vlm
       consensus: true
       tier:
@@ -119,7 +119,7 @@ services:
       queue_name: ollama
       host: localhost
       port: 7782
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: semantic, vlm
       consensus: true
       tier:
@@ -131,7 +131,7 @@ services:
       queue_name: haiku
       host: localhost
       port: 7797
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: semantic, vlm
       consensus: true
       tier:
@@ -142,7 +142,7 @@ services:
       queue_name: gemini
       host: localhost
       port: 7767
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: semantic, vlm
       consensus: true
       tier:
@@ -153,7 +153,7 @@ services:
       queue_name: gpt_nano
       host: localhost
       port: 7800
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: semantic, vlm
       consensus: true
       tier:
@@ -164,7 +164,7 @@ services:
       queue_name: xai
       host: localhost
       port: 7805
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: semantic, vlm
       consensus: true
       tier:
@@ -175,7 +175,7 @@ services:
       queue_name: qwen
       host: localhost
       port: 7796
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: semantic, vlm
       consensus: true
       tier:
@@ -186,7 +186,7 @@ services:
       queue_name: yolo_v8
       host: localhost
       port: 7773
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: spatial
       tier:
         - free
@@ -200,7 +200,7 @@ services:
       queue_name: colors_post
       host: localhost
       port: 7770
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: colors
       consensus: false
       tier:
@@ -210,7 +210,7 @@ services:
       queue_name: face
       host: localhost
       port: 7772
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: specialized
       tier:
         - basic
@@ -221,7 +221,7 @@ services:
       queue_name: pose
       host: localhost
       port: 7786
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: specialized
       consensus: false
       tier:
@@ -277,7 +277,7 @@ services:
       queue_name: florence2_grounding
       host: localhost
       port: 7803
-      endpoint: /v3/analyze
+      endpoint: /analyze
       service_type: grounding
       tier:
         - system
