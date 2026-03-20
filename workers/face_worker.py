@@ -10,7 +10,6 @@ import base64
 import io
 import json
 import requests
-import pika
 from postprocessing_worker import PostProcessingWorker
 
 class BboxFaceWorker(PostProcessingWorker):
@@ -47,39 +46,31 @@ class BboxFaceWorker(PostProcessingWorker):
             self.logger.error(f"Error in face message processing: {e}")
             self._safe_nack(ch, method.delivery_tag, requeue=True)
 
+    def _declare_additional_queues(self, declare_with_dlq):
+        """Declare content_analysis queue on the publish channel."""
+        declare_with_dlq(
+            self._publish_channel,
+            self._get_queue_name('system.content_analysis')
+        )
+
     def _trigger_content_analysis(self, image_id: int, tier: str = 'free'):
-        """Publish to content_analysis queue so face+NudeNet correlation runs
-        with face service results present (basic+ tiers only)."""
+        """Enqueue a content_analysis re-run so face+NudeNet correlation runs
+        with face service results present (basic+ tiers only).
+
+        Uses _enqueue_publish so the publish goes through the dedicated background
+        connection rather than the consume channel. This prevents channel-death from
+        causing message floods.
+        """
         if not self.config.is_available_for_tier('system.content_analysis', tier):
             return
 
-        try:
-            if not self.channel or self.connection.is_closed:
-                if not self.connect_to_queue():
-                    raise Exception("RabbitMQ reconnection failed")
-
-            queue_name = self._get_queue_name('system.content_analysis')
-            dlq_name = f"{queue_name}.dlq"
-            self.channel.queue_declare(queue=dlq_name, durable=True)
-            self.channel.queue_declare(
-                queue=queue_name, durable=True,
-                arguments={'x-dead-letter-exchange': '',
-                           'x-dead-letter-routing-key': dlq_name}
-            )
-            self.channel.basic_publish(
-                exchange='',
-                routing_key=queue_name,
-                body=json.dumps({'image_id': image_id, 'tier': tier}),
-                properties=pika.BasicProperties(delivery_mode=2),
-            )
-            self.logger.debug(
-                f"face: triggered content_analysis re-run for image {image_id}"
-            )
-        except Exception as e:
-            # Non-critical — the face job is already acked. Log and move on.
-            self.logger.warning(
-                f"face: failed to trigger content_analysis for image {image_id}: {e}"
-            )
+        self._enqueue_publish(
+            self._get_queue_name('system.content_analysis'),
+            json.dumps({'image_id': image_id, 'tier': tier})
+        )
+        self.logger.debug(
+            f"face: enqueued content_analysis re-run for image {image_id}"
+        )
     
     def process_service(self, cropped_image_data):
         """Process face detection on cropped image"""

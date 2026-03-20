@@ -92,39 +92,33 @@ class ConsensusWorkerMergeFocused(BaseWorker):
             self.logger.warning(f"Read database connection unhealthy: {e}")
             return self.connect_to_database()
 
+    def _declare_additional_queues(self, declare_with_dlq):
+        """Declare content_analysis queue on the publish channel."""
+        declare_with_dlq(
+            self._publish_channel,
+            self._get_queue_name('system.content_analysis')
+        )
+
     def trigger_content_analysis(self, image_id, image_filename, tier='free'):
-        """Trigger content analysis after consensus completes (all tiers)"""
+        """Trigger content analysis after consensus completes (all tiers).
 
-        try:
-            # Check if connection is healthy
-            if not self.channel or self.connection.is_closed:
-                self.logger.warning("RabbitMQ connection lost, reconnecting...")
-                if not self.connect_to_queue():
-                    self.logger.error("Failed to reconnect to RabbitMQ for content_analysis message")
-                    return False
-
-            content_analysis_message = {
-                'image_id': image_id,
-                'image_filename': image_filename,
-                'triggered_by': 'consensus',
-                'worker_id': self.worker_id,
-                'triggered_at': datetime.now().isoformat(),
-                'tier': tier,
-            }
-
-            self.channel.basic_publish(
-                exchange='',
-                routing_key='content_analysis',
-                body=json.dumps(content_analysis_message),
-                properties=pika.BasicProperties(delivery_mode=2)
-            )
-
-            self.logger.debug(f"Triggered content analysis for image {image_id}")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Error triggering content analysis: {e}")
-            return False
+        Uses _enqueue_publish so the publish goes through the dedicated background
+        connection rather than the consume channel. This prevents channel-death from
+        causing message floods when the consume connection drops mid-processing.
+        """
+        content_analysis_message = {
+            'image_id': image_id,
+            'image_filename': image_filename,
+            'triggered_by': 'consensus',
+            'worker_id': self.worker_id,
+            'triggered_at': datetime.now().isoformat(),
+            'tier': tier,
+        }
+        self._enqueue_publish(
+            self._get_queue_name('system.content_analysis'),
+            json.dumps(content_analysis_message)
+        )
+        self.logger.debug(f"Enqueued content_analysis trigger for image {image_id}")
 
     def _consensus_is_current(self, image_id):
         """Return True if the stored consensus already incorporates all current results.
