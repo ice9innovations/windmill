@@ -17,6 +17,6 @@ source "$SCRIPT_DIR/windmill_venv/bin/activate"
 pip install --upgrade pip
 pip install -r "$SCRIPT_DIR/requirements.txt"
 
-python -c "import nltk; nltk.download('punkt')"
+"$SCRIPT_DIR/windmill_venv/bin/python" -c "import nltk; nltk.download('punkt')"
 
 echo "Done. Run ./windmill.sh start to start workers."
