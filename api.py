@@ -350,24 +350,34 @@ def status(image_id):
         # service_results after the fetch_results reshape — check both locations.
         _sr = results_data.get('service_results', {})
 
-        # Index service_dispatch rows by service for terminal-state detection.
-        _sd_by_service: dict = {}
-        for _row in results_data.get('service_dispatch', []):
-            _sd_by_service.setdefault(_row['service'], []).append(_row)
+        # Mirror ice9-api's settled/dispatch_pending_services pattern.
+        # A service is settled when it has a terminal cluster_id=NULL dispatch row,
+        # unless it also has a pending cluster_id=NULL row (multi-dispatch services).
+        _terminal = {'complete', 'failed', 'dead-lettered'}
+        _sd = results_data.get('service_dispatch', [])
+        _services_with_pending = {
+            r['service'] for r in _sd
+            if r.get('cluster_id') is None and r.get('status') == 'pending'
+        }
+        settled = ({
+            r['service'] for r in _sd
+            if r.get('cluster_id') is None and r.get('status') in _terminal
+        } | set(completed.keys())) - _services_with_pending
 
-        _TERMINAL = frozenset({'failed', 'dead-lettered'})
-        downstream_failed:  list = []
-        downstream_pending: list = []
-        for svc, expected in expected_downstream.items():
-            if not expected:
-                continue
-            if results_data.get(svc) is not None or _sr.get(svc) is not None:
-                continue  # result already written
-            dispatches = _sd_by_service.get(svc, [])
-            if dispatches and all(d['status'] in _TERMINAL for d in dispatches):
-                downstream_failed.append(svc)
-            else:
-                downstream_pending.append(svc)
+        _failed_states = {'failed', 'dead-lettered'}
+        _sd_failed = {
+            r['service'] for r in _sd
+            if r.get('cluster_id') is None and r.get('status') in _failed_states
+        } - _services_with_pending
+
+        downstream_failed  = [
+            svc for svc, expected in expected_downstream.items()
+            if expected and _sr.get(svc) is None and svc in _sd_failed
+        ]
+        downstream_pending = [
+            svc for svc, expected in expected_downstream.items()
+            if expected and _sr.get(svc) is None and svc not in settled
+        ]
 
         is_complete = primary_complete and len(downstream_pending) == 0
 
