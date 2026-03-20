@@ -78,13 +78,25 @@ class PostProcessingWorker(BaseWorker):
             else:
                 self.logger.error(f"Error saving postprocessing result: {e}")
                 if self.db_conn:
-                    self.db_conn.rollback()
+                    try:
+                        self.db_conn.rollback()
+                    except Exception:
+                        pass
                 return False
     
 
     def process_message(self, ch, method, properties, body):
         """Process a postprocessing message - standard pattern for all postprocessing workers"""
         try:
+            # Ensure DB connection is healthy before doing any work — mirrors base_worker pattern.
+            # Without this, an idle-dropped connection spins in a requeue loop instead of reconnecting.
+            if not self.ensure_database_connection():
+                self.logger.error(
+                    "Database connection unavailable, rejecting message without requeue."
+                )
+                self._safe_nack(ch, method.delivery_tag, requeue=False)
+                return
+
             # Parse message
             message = json.loads(body.decode('utf-8'))
             merged_box_id = message['merged_box_id']
