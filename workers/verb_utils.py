@@ -19,6 +19,27 @@ logger = logging.getLogger(__name__)
 
 _wordnet_available = None
 
+# Domain synonym overrides — applied before WordNet grouping.
+# Locomotion verbs that WordNet splits across different first synsets
+# (trot, gallop, canter each have their own primary sense) would not be
+# grouped by the WordNet pass alone. These overrides force them to share
+# the synset of their canonical form so they collapse correctly.
+_VERB_DOMAIN_SYNONYMS: Dict[str, str] = {
+    # Locomotion — equine/animal gaits → run
+    'trot':    'run',
+    'gallop':  'run',
+    'canter':  'run',
+    'lope':    'run',
+    'scurry':  'run',
+    'scamper': 'run',
+    # Locomotion — pedestrian gaits → walk
+    'stride':  'walk',
+    'stroll':  'walk',
+    'saunter': 'walk',
+    'amble':   'walk',
+    'trudge':  'walk',
+}
+
 
 def warmup_wordnet() -> bool:
     """Load WordNet corpus at startup so the first message doesn't pay the
@@ -134,8 +155,10 @@ def collapse_synonyms(service_verb_map: Dict[str, List[str]]) -> List[dict]:
     for verbs in service_verb_map.values():
         all_verbs.update(verbs)
 
+    # Apply domain synonym overrides before WordNet lookup so that gaits like
+    # "trot" and "gallop" share synsets with their canonical form ("run").
     verb_synset_list: Dict[str, List[str]] = {
-        verb: _get_synsets(verb) for verb in all_verbs
+        verb: _get_synsets(_VERB_DOMAIN_SYNONYMS.get(verb, verb)) for verb in all_verbs
     }
 
     groups = _find_groups(all_verbs, verb_synset_list)

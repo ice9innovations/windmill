@@ -43,7 +43,7 @@ class NounConsensusWorker(BaseWorker):
     def __init__(self):
         super().__init__('system.noun_consensus')
         warmup_wordnet()         # Load WordNet corpus
-        warmup_noun_extractor()  # Load spaCy en_core_web_sm
+        warmup_noun_extractor()  # Load spaCy en_core_web_lg
         load_mwe()
         if self.connect_to_database():
             load_conceptnet(self.db_conn)

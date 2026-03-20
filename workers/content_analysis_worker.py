@@ -34,6 +34,8 @@ from utils.face_correlation import correlate_faces, get_face_gender_attribution
 
 ANALYSIS_VERSION = '1.4.5'  # Added content_flags based on noun extraction
 
+_PERSON_EMOJIS = frozenset(['🧑', '👩', '🧒'])
+
 
 def load_content_flags():
     """Load content flagging configuration from YAML file.
@@ -199,6 +201,7 @@ class ContentAnalysisWorker(BaseWorker):
             nsfw2_result = None
             image_width = 0
             image_height = 0
+            yolo_person_bboxes = []
 
             for row in cursor.fetchall():
                 service, data, status = row
@@ -238,6 +241,24 @@ class ContentAnalysisWorker(BaseWorker):
                     if predictions and 'dimensions' in predictions[0]:
                         image_width = predictions[0]['dimensions'].get('width', 0)
                         image_height = predictions[0]['dimensions'].get('height', 0)
+
+                # Extract person bboxes from YOLO (primary source for people count)
+                if service == 'yolo_v8':
+                    for i, pred in enumerate(data.get('predictions', [])):
+                        raw_emoji = pred.get('emoji', '')
+                        clean_emoji = ''.join(c for c in raw_emoji if ord(c) < 0xFE00 or ord(c) > 0xFE0F)
+                        if clean_emoji not in _PERSON_EMOJIS:
+                            continue
+                        raw_bbox = pred.get('bbox')
+                        if not raw_bbox:
+                            continue
+                        if isinstance(raw_bbox, list) and len(raw_bbox) == 4:
+                            bbox = {'x': raw_bbox[0], 'y': raw_bbox[1], 'width': raw_bbox[2], 'height': raw_bbox[3]}
+                        elif isinstance(raw_bbox, dict) and all(k in raw_bbox for k in ('x', 'y', 'width', 'height')):
+                            bbox = raw_bbox
+                        else:
+                            continue
+                        yolo_person_bboxes.append({'id': i, 'bbox': bbox})
 
             # Get merged boxes (harmonized bboxes)
             cursor.execute("""
@@ -322,6 +343,7 @@ class ContentAnalysisWorker(BaseWorker):
             return {
                 'results': results,
                 'merged_boxes': merged_boxes,
+                'yolo_person_bboxes': yolo_person_bboxes,
                 'consensus': consensus_data,
                 'captions': captions,
                 'nudenet_detections': nudenet_detections,
@@ -474,16 +496,8 @@ class ContentAnalysisWorker(BaseWorker):
             # Extract keywords from captions
             extracted_keywords = extract_keywords_from_captions(captions)
 
-            # Get person bboxes from merged_boxes
-            person_bboxes = []
-            for mb in merged_boxes:
-                merged_data = mb['data']
-                emoji = merged_data.get('emoji', '')
-                if emoji == '🧑' and merged_data.get('merged_bbox'):
-                    person_bboxes.append({
-                        'id': mb['merged_id'],
-                        'bbox': merged_data['merged_bbox']
-                    })
+            # Person bboxes come from YOLO results (available before harmony runs)
+            person_bboxes = image_data.get('yolo_person_bboxes', [])
 
             # Detect person bbox containment (same person detected multiple times)
             containment_relationships = detect_person_containment(person_bboxes)

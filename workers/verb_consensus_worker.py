@@ -45,7 +45,7 @@ class VerbConsensusWorker(BaseWorker):
     def __init__(self):
         super().__init__('system.verb_consensus')
         warmup_wordnet()         # Load WordNet corpus
-        warmup_verb_extractor()  # Load spaCy en_core_web_sm
+        warmup_verb_extractor()  # Load spaCy en_core_web_lg
 
     def process_message(self, ch, method, properties, body):
         """Override base process_message - no ML service call, DB-only logic."""

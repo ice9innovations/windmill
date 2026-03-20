@@ -16,7 +16,7 @@ from typing import List, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Loaded once at import time - en_core_web_sm is CPU-only, ~12MB
+# Loaded once at import time - en_core_web_lg, ~560MB, CPU-only
 _nlp = None
 
 
@@ -26,12 +26,12 @@ def _load_model():
         return True
     try:
         import spacy
-        _nlp = spacy.load("en_core_web_sm")
-        logger.info("verb_extractor: en_core_web_sm loaded")
+        _nlp = spacy.load("en_core_web_lg")
+        logger.info("verb_extractor: en_core_web_lg loaded")
         return True
     except OSError:
-        logger.error("verb_extractor: en_core_web_sm not found - run: "
-                     "python -m spacy download en_core_web_sm")
+        logger.error("verb_extractor: en_core_web_lg not found - run: "
+                     "python -m spacy download en_core_web_lg")
         return False
     except ImportError:
         logger.error("verb_extractor: spacy not installed")

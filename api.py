@@ -349,10 +349,26 @@ def status(image_id):
         # Aggregate results (consensus, noun_consensus, etc.) live in
         # service_results after the fetch_results reshape — check both locations.
         _sr = results_data.get('service_results', {})
-        downstream_pending   = [
-            svc for svc, expected in expected_downstream.items()
-            if expected and results_data.get(svc) is None and _sr.get(svc) is None
-        ]
+
+        # Index service_dispatch rows by service for terminal-state detection.
+        _sd_by_service: dict = {}
+        for _row in results_data.get('service_dispatch', []):
+            _sd_by_service.setdefault(_row['service'], []).append(_row)
+
+        _TERMINAL = frozenset({'failed', 'dead-lettered'})
+        downstream_failed:  list = []
+        downstream_pending: list = []
+        for svc, expected in expected_downstream.items():
+            if not expected:
+                continue
+            if results_data.get(svc) is not None or _sr.get(svc) is not None:
+                continue  # result already written
+            dispatches = _sd_by_service.get(svc, [])
+            if dispatches and all(d['status'] in _TERMINAL for d in dispatches):
+                downstream_failed.append(svc)
+            else:
+                downstream_pending.append(svc)
+
         is_complete = primary_complete and len(downstream_pending) == 0
 
         return jsonify({
@@ -368,12 +384,13 @@ def status(image_id):
             "is_complete":            is_complete,
             "primary_complete":       primary_complete,
             "downstream_pending":     downstream_pending,
-            "consensus_complete":     results_data['consensus'] is not None,
-            "content_analysis_complete": results_data['content_analysis'] is not None,
-            "noun_consensus_complete":    results_data['noun_consensus'] is not None,
-            "verb_consensus_complete":    results_data['verb_consensus'] is not None,
-            "sam3_complete":              results_data['sam3'] is not None,
-            "caption_summary_complete":   results_data['caption_summary'] is not None,
+            "downstream_failed":      downstream_failed,
+            "consensus_complete":     _sr.get('consensus') is not None,
+            "content_analysis_complete": _sr.get('content_analysis') is not None,
+            "noun_consensus_complete":    _sr.get('noun_consensus') is not None,
+            "verb_consensus_complete":    _sr.get('verb_consensus') is not None,
+            "sam3_complete":              results_data.get('sam3') is not None,
+            "caption_summary_complete":   _sr.get('caption_summary') is not None,
             **results_data,
         })
 
