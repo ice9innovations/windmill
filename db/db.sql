@@ -59,6 +59,9 @@ CREATE TABLE results (
     result_id        BIGSERIAL PRIMARY KEY,
     image_id         BIGINT NOT NULL REFERENCES images(image_id),
     service          VARCHAR(255) NOT NULL,
+    -- Stable submission identity from the producer message. Used only for
+    -- primary-worker idempotency on retry after downstream publish failure.
+    source_trace_id  UUID,
     data             JSONB NOT NULL,
     worker_id        VARCHAR(50),
     worker_hostname  VARCHAR(100),
@@ -73,6 +76,10 @@ CREATE INDEX idx_results_created ON results(result_created);
 CREATE INDEX idx_results_image_service ON results(image_id, service);
 CREATE INDEX idx_results_status ON results(status);
 CREATE INDEX idx_results_worker ON results(worker_id);
+CREATE INDEX idx_results_source_trace_id ON results(source_trace_id);
+CREATE UNIQUE INDEX idx_results_primary_idempotency
+    ON results(image_id, service, source_trace_id)
+    WHERE source_trace_id IS NOT NULL;
 
 
 -- Merged boxes table: Harmonized bounding boxes from spatial services (DELETE+INSERT per image)
@@ -316,5 +323,4 @@ CREATE TABLE IF NOT EXISTS conceptnet_edges (
 CREATE INDEX IF NOT EXISTS idx_cn_rel       ON conceptnet_edges(relation);
 CREATE INDEX IF NOT EXISTS idx_cn_start_rel ON conceptnet_edges(start_uri, relation);
 CREATE INDEX IF NOT EXISTS idx_cn_end_rel   ON conceptnet_edges(end_uri, relation);
-
 

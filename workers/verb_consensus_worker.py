@@ -74,7 +74,9 @@ class VerbConsensusWorker(BaseWorker):
                 self.logger.debug(
                     f"verb_consensus: no VLM verb data yet for image {image_id}, skipping"
                 )
+                self._update_service_dispatch(image_id, service='verb_consensus')
                 self._safe_ack(ch, method.delivery_tag)
+                self.job_completed_successfully()
                 return
 
             collapsed = collapse_synonyms(service_verb_map)

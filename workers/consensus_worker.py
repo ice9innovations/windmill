@@ -1064,6 +1064,8 @@ class ConsensusWorkerMergeFocused(BaseWorker):
                 self.trigger_content_analysis(image_id, image_filename, tier)
             else:
                 self.logger.error(f"Failed to update merge-focused consensus for {image_filename}")
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
+                return
 
             # Acknowledge the message
             self._safe_ack(ch, method.delivery_tag)

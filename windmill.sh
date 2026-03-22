@@ -29,7 +29,8 @@ state_add() {
 state_remove() {
     local name="$1"
     if [ -f "$STATE_FILE" ]; then
-        grep -vx "$name" "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+        grep -vx "$name" "$STATE_FILE" > "${STATE_FILE}.tmp" || true
+        mv "${STATE_FILE}.tmp" "$STATE_FILE"
     fi
 }
 

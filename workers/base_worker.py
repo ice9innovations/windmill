@@ -42,10 +42,14 @@ class BaseWorker:
 
         # Background publish thread — decouples downstream trigger publishes
         # from the consume loop so they don't block ML throughput
-        self._publish_queue = stdlib_queue.Queue(maxsize=1000)
+        self._publish_queue = stdlib_queue.Queue(
+            maxsize=int(os.getenv('PUBLISH_QUEUE_MAXSIZE', '1000'))
+        )
         self._publish_thread = None
         self._publish_connection = None
         self._publish_channel = None
+        self._sync_publish_connection = None
+        self._sync_publish_channel = None
         self._running = False
 
         # Heartbeat thread — keeps worker_registry up to date while running
@@ -211,6 +215,79 @@ class BaseWorker:
 
         self.logger.info("Publish thread connected to RabbitMQ")
 
+    def _connect_sync_publish_channel(self):
+        """Create a dedicated publish-confirm channel owned by the consume thread."""
+        if self._sync_publish_connection:
+            try:
+                self._sync_publish_connection.close()
+            except Exception:
+                pass
+
+        self._sync_publish_connection = pika.BlockingConnection(self._build_queue_params())
+        self._sync_publish_channel = self._sync_publish_connection.channel()
+        self._sync_publish_channel.confirm_delivery()
+
+        def declare_with_dlq(channel, queue_name):
+            dlq_name = f"{queue_name}.dlq"
+            channel.queue_declare(queue=dlq_name, durable=True)
+            args = {
+                'x-dead-letter-exchange': '',
+                'x-dead-letter-routing-key': dlq_name
+            }
+            ttl_env = os.getenv('QUEUE_MESSAGE_TTL_MS')
+            if ttl_env and ttl_env.isdigit() and int(ttl_env) > 0:
+                args['x-message-ttl'] = int(ttl_env)
+            channel.queue_declare(queue=queue_name, durable=True, arguments=args)
+
+        if self.enable_triggers:
+            declare_with_dlq(self._sync_publish_channel, self._get_queue_by_service_type('harmonization'))
+        if self.enable_consensus_triggers:
+            declare_with_dlq(self._sync_publish_channel, self._get_queue_by_service_type('consensus'))
+        if self.enable_noun_consensus:
+            declare_with_dlq(self._sync_publish_channel, self._get_queue_by_service_type('noun_consensus'))
+        if self.enable_verb_consensus:
+            declare_with_dlq(self._sync_publish_channel, self._get_queue_by_service_type('verb_consensus'))
+
+        self._declare_additional_queues(declare_with_dlq)
+
+    def _publish_messages_sync_confirm(self, messages):
+        """Publish required downstream messages synchronously with broker confirms.
+
+        messages: iterable of (routing_key, body_json_string)
+        """
+        if not messages:
+            return
+
+        if self._sync_publish_connection is None or self._sync_publish_connection.is_closed:
+            self._connect_sync_publish_channel()
+        elif self._sync_publish_channel is None or self._sync_publish_channel.is_closed:
+            self._connect_sync_publish_channel()
+
+        for routing_key, body in messages:
+            try:
+                published = self._sync_publish_channel.basic_publish(
+                    exchange='',
+                    routing_key=routing_key,
+                    body=body,
+                    properties=pika.BasicProperties(delivery_mode=2),
+                    mandatory=True,
+                )
+                if published is False:
+                    raise RuntimeError(f"Broker did not confirm publish to {routing_key}")
+            except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
+                    pika.exceptions.StreamLostError) as e:
+                self.logger.warning(f"Sync publish connection lost: {e}. Reconnecting...")
+                self._connect_sync_publish_channel()
+                published = self._sync_publish_channel.basic_publish(
+                    exchange='',
+                    routing_key=routing_key,
+                    body=body,
+                    properties=pika.BasicProperties(delivery_mode=2),
+                    mandatory=True,
+                )
+                if published is False:
+                    raise RuntimeError(f"Broker did not confirm publish to {routing_key} after reconnect")
+
     def _publish_loop(self):
         """Background thread target: drains the publish queue and sends messages
         on its own dedicated pika connection."""
@@ -296,13 +373,17 @@ class BaseWorker:
         self.logger.info("Publish thread stopped")
 
     def _enqueue_publish(self, routing_key, body):
-        """Enqueue a message for background publishing. Non-blocking — returns immediately."""
+        """Enqueue a message for background publishing.
+
+        Queue size is configurable via PUBLISH_QUEUE_MAXSIZE for controlled
+        stress testing.
+        """
         try:
             self._publish_queue.put_nowait((routing_key, body))
         except stdlib_queue.Full:
             self.logger.error(
                 f"Publish queue full ({self._publish_queue.maxsize}), "
-                f"dropping message to {routing_key}"
+                f"cannot enqueue message to {routing_key}"
             )
 
     def _safe_ack(self, ch, delivery_tag):
@@ -365,75 +446,67 @@ class BaseWorker:
     
     def trigger_consensus(self, image_id, message):
         """Trigger consensus processing (async via background publish thread)"""
-        if self.enable_consensus_triggers:
-            try:
-                consensus_message = {
-                    'image_id': image_id,
-                    'image_filename': message.get('image_filename', f'image_{image_id}'),
-                    'service': self.service_name,
-                    'worker_id': self.worker_id,
-                    'processed_at': datetime.now().isoformat(),
-                    'tier': message.get('tier', 'free'),
-                }
+        if not self.enable_consensus_triggers:
+            return
 
-                self._enqueue_publish(
-                    self._get_queue_by_service_type('consensus'),
-                    json.dumps(consensus_message)
-                )
+        consensus_message = {
+            'image_id': image_id,
+            'image_filename': message.get('image_filename', f'image_{image_id}'),
+            'service': self.service_name,
+            'worker_id': self.worker_id,
+            'processed_at': datetime.now().isoformat(),
+            'tier': message.get('tier', 'free'),
+        }
 
-                self.logger.debug(f"Enqueued consensus trigger for {self.service_name} image {image_id}")
+        self._enqueue_publish(
+            self._get_queue_by_service_type('consensus'),
+            json.dumps(consensus_message)
+        )
 
-            except Exception as e:
-                self.logger.error(f"Failed to enqueue consensus message: {e}")
+        self.logger.debug(f"Enqueued consensus trigger for {self.service_name} image {image_id}")
     
     def trigger_noun_consensus(self, image_id, message):
         """Trigger noun consensus for VLM services (async via background publish thread)"""
         if not self.enable_noun_consensus:
             return
-        try:
-            noun_consensus_message = {
-                'image_id': image_id,
-                'image_filename': message.get('image_filename', f'image_{image_id}'),
-                'image_data': message.get('image_data'),
-                'service': self.service_name,
-                'worker_id': self.worker_id,
-                'processed_at': datetime.now().isoformat(),
-                'tier': message.get('tier', 'free'),
-            }
 
-            self._enqueue_publish(
-                self._get_queue_by_service_type('noun_consensus'),
-                json.dumps(noun_consensus_message)
-            )
+        noun_consensus_message = {
+            'image_id': image_id,
+            'image_filename': message.get('image_filename', f'image_{image_id}'),
+            'image_data': message.get('image_data'),
+            'service': self.service_name,
+            'worker_id': self.worker_id,
+            'processed_at': datetime.now().isoformat(),
+            'tier': message.get('tier', 'free'),
+        }
 
-            self.logger.debug(f"Enqueued noun_consensus trigger for {self.service_name} image {image_id}")
+        self._enqueue_publish(
+            self._get_queue_by_service_type('noun_consensus'),
+            json.dumps(noun_consensus_message)
+        )
 
-        except Exception as e:
-            self.logger.error(f"Failed to enqueue noun_consensus message: {e}")
+        self.logger.debug(f"Enqueued noun_consensus trigger for {self.service_name} image {image_id}")
 
     def trigger_verb_consensus(self, image_id, message):
         """Trigger verb consensus for VLM services (async via background publish thread)"""
         if not self.enable_verb_consensus:
             return
-        try:
-            verb_consensus_message = {
-                'image_id': image_id,
-                'image_filename': message.get('image_filename', f'image_{image_id}'),
-                'service': self.service_name,
-                'worker_id': self.worker_id,
-                'processed_at': datetime.now().isoformat(),
-                'tier': message.get('tier', 'free'),
-            }
 
-            self._enqueue_publish(
-                self._get_queue_by_service_type('verb_consensus'),
-                json.dumps(verb_consensus_message)
-            )
+        verb_consensus_message = {
+            'image_id': image_id,
+            'image_filename': message.get('image_filename', f'image_{image_id}'),
+            'service': self.service_name,
+            'worker_id': self.worker_id,
+            'processed_at': datetime.now().isoformat(),
+            'tier': message.get('tier', 'free'),
+        }
 
-            self.logger.debug(f"Enqueued verb_consensus trigger for {self.service_name} image {image_id}")
+        self._enqueue_publish(
+            self._get_queue_by_service_type('verb_consensus'),
+            json.dumps(verb_consensus_message)
+        )
 
-        except Exception as e:
-            self.logger.error(f"Failed to enqueue verb_consensus message: {e}")
+        self.logger.debug(f"Enqueued verb_consensus trigger for {self.service_name} image {image_id}")
 
     def _record_service_dispatch(self, image_id, service, cluster_id=None):
         """Insert a pending service_dispatch record. Best-effort; errors swallowed.
@@ -835,20 +908,43 @@ class BaseWorker:
                 processing_time = result.get('processing_time') or (
                     result.get('metadata') or {}
                 ).get('processing_time')
+            source_trace_id = trace_id if trace_id else None
             cursor = self.db_conn.cursor()
             cursor.execute("""
-                WITH inserted AS (
-                    INSERT INTO results (image_id, service, data, status, worker_id, processing_time)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                WITH upserted AS (
+                    INSERT INTO results (
+                        image_id, service, source_trace_id, data, status, worker_id, processing_time
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (image_id, service, source_trace_id)
+                    WHERE source_trace_id IS NOT NULL
+                    DO NOTHING
                     RETURNING image_id
+                ),
+                touched AS (
+                    SELECT image_id FROM upserted
+                    UNION ALL
+                    SELECT %s
+                    WHERE %s IS NOT NULL
+                      AND NOT EXISTS (SELECT 1 FROM upserted)
                 )
                 UPDATE service_dispatch SET status = 'complete'
-                WHERE image_id = (SELECT image_id FROM inserted)
+                WHERE image_id = (SELECT image_id FROM touched LIMIT 1)
                   AND service = %s
                   AND cluster_id IS NULL
                   AND status = 'pending'
-            """, (image_id, self._get_clean_service_name(), json.dumps(result), 'success', self.worker_id, processing_time,
-                  self._get_clean_service_name()))
+            """, (
+                image_id,
+                self._get_clean_service_name(),
+                source_trace_id,
+                json.dumps(result),
+                'success',
+                self.worker_id,
+                processing_time,
+                image_id,
+                source_trace_id,
+                self._get_clean_service_name(),
+            ))
             self.db_conn.commit()  # CRITICAL: Commit the transaction!
             cursor.close()
 
@@ -856,10 +952,12 @@ class BaseWorker:
             # from the same result without a separate queue/worker
             self.after_result_stored(image_id, result, message)
 
-            # Trigger post-processing for bbox services (async via background publish thread).
+            tier = message.get('tier', 'free')
+            downstream_messages = []
+
+            # Trigger post-processing for bbox services.
             # Harmony is only useful when multiple spatial services can contribute results.
             # For free tier (single spatial service), skip harmony entirely.
-            tier = message.get('tier', 'free')
             if self.service_name in self.bbox_services and self.enable_triggers \
                     and self.config.is_available_for_tier('system.harmony', tier):
                 bbox_message = {
@@ -873,19 +971,57 @@ class BaseWorker:
                     'tier': tier,
                 }
 
-                self._enqueue_publish(
+                downstream_messages.append((
                     self._get_queue_by_service_type('harmonization'),
                     json.dumps(bbox_message)
-                )
+                ))
 
-                self.logger.debug(f"Enqueued bbox completion to harmonization")
+                self.logger.debug("Prepared bbox completion for harmonization")
 
-            # Trigger noun and verb consensus for VLM services
-            self.trigger_noun_consensus(image_id, message)
-            self.trigger_verb_consensus(image_id, message)
+            if self.enable_noun_consensus:
+                noun_consensus_message = {
+                    'image_id': image_id,
+                    'image_filename': message.get('image_filename', f'image_{image_id}'),
+                    'image_data': message.get('image_data'),
+                    'service': self.service_name,
+                    'worker_id': self.worker_id,
+                    'processed_at': datetime.now().isoformat(),
+                    'tier': tier,
+                }
+                downstream_messages.append((
+                    self._get_queue_by_service_type('noun_consensus'),
+                    json.dumps(noun_consensus_message)
+                ))
 
-            # Trigger consensus processing
-            self.trigger_consensus(image_id, message)
+            if self.enable_verb_consensus:
+                verb_consensus_message = {
+                    'image_id': image_id,
+                    'image_filename': message.get('image_filename', f'image_{image_id}'),
+                    'service': self.service_name,
+                    'worker_id': self.worker_id,
+                    'processed_at': datetime.now().isoformat(),
+                    'tier': tier,
+                }
+                downstream_messages.append((
+                    self._get_queue_by_service_type('verb_consensus'),
+                    json.dumps(verb_consensus_message)
+                ))
+
+            if self.enable_consensus_triggers:
+                consensus_message = {
+                    'image_id': image_id,
+                    'image_filename': message.get('image_filename', f'image_{image_id}'),
+                    'service': self.service_name,
+                    'worker_id': self.worker_id,
+                    'processed_at': datetime.now().isoformat(),
+                    'tier': tier,
+                }
+                downstream_messages.append((
+                    self._get_queue_by_service_type('consensus'),
+                    json.dumps(consensus_message)
+                ))
+
+            self._publish_messages_sync_confirm(downstream_messages)
 
             # Acknowledge message
             self._safe_ack(ch, method.delivery_tag)
@@ -995,4 +1131,9 @@ class BaseWorker:
         self._cleanup()
         if self.db_conn:
             self.db_conn.close()
+        if self._sync_publish_connection:
+            try:
+                self._sync_publish_connection.close()
+            except Exception:
+                pass
         self.logger.info(f"{self.service_name} worker stopped")

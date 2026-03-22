@@ -85,7 +85,9 @@ class NounConsensusWorker(BaseWorker):
                 self.logger.debug(
                     f"noun_consensus: no VLM noun data yet for image {image_id}, skipping"
                 )
+                self._update_service_dispatch(image_id, service='noun_consensus')
                 self._safe_ack(ch, method.delivery_tag)
+                self.job_completed_successfully()
                 return
 
             # Collapse synonyms and count votes (ConceptNet via in-memory edges)
@@ -106,8 +108,6 @@ class NounConsensusWorker(BaseWorker):
             )
 
             self._update_service_dispatch(image_id, service='noun_consensus')
-            self._safe_ack(ch, method.delivery_tag)
-            self.job_completed_successfully()
 
             self.logger.info(
                 f"noun_consensus: image {image_id} - "
@@ -197,6 +197,9 @@ class NounConsensusWorker(BaseWorker):
             # depends on SAM3 completing first.
             if self.config.is_available_for_tier('system.caption_summary', tier) and image_data:
                 self._maybe_update_caption_summary(image_id, image_data, tier)
+
+            self._safe_ack(ch, method.delivery_tag)
+            self.job_completed_successfully()
 
         except Exception as e:
             self.logger.error(f"noun_consensus: error processing message: {e}")
@@ -311,6 +314,7 @@ class NounConsensusWorker(BaseWorker):
             self.logger.error(
                 f"noun_consensus: failed to check/trigger caption_summary for image {image_id}: {e}"
             )
+            raise
 
     def _trigger_florence2_grounding(self, image_id: int, image_data: str, nouns: list, subject_noun: str = None, tier: str = 'free'):
         """Publish a Florence-2 grounding request for the final noun consensus.
@@ -345,7 +349,15 @@ class NounConsensusWorker(BaseWorker):
                 f"with {len(nouns)} nouns: {nouns} (dispatch_id={dispatch_id})"
             )
         except Exception as e:
+            if 'dispatch_id' in locals() and dispatch_id is not None:
+                self._update_service_dispatch(
+                    image_id,
+                    status='failed',
+                    reason=f"publish enqueue failed: {e}",
+                    dispatch_id=dispatch_id,
+                )
             self.logger.error(f"noun_consensus: failed to trigger Florence-2 grounding for image {image_id}: {e}")
+            raise
 
 
     def _fetch_vlm_nouns(self, image_id: int) -> tuple:
