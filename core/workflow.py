@@ -93,6 +93,17 @@ WORKFLOW_STAGES = {
             }
         ],
     },
+    'rembg': {
+        'kind': 'system',
+        'expected_when': ['tier_allows:system.rembg'],
+        'triggered_by': [
+            {
+                'source': 'upstream.api',
+                'worker': 'external producer',
+                'note': 'published directly by the producer when system.rembg is enabled for the tier',
+            }
+        ],
+    },
     'florence2_grounding': {
         'kind': 'system',
         'expected_when': ['has_florence2'],

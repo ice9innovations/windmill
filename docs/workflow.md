@@ -52,6 +52,7 @@ flowchart TD
     Noun --> CaptionSummary[caption_summary]
     Grounding --> Sam3[sam3]
     Consensus --> ContentAnalysis[content_analysis]
+    Submit --> Rembg[rembg]
 ```
 
 ## Expected Downstream Conditions
@@ -67,6 +68,7 @@ These conditions document what `compute_expected_downstream()` currently models.
 | `sam3` | at least one submitted primary is a VLM and the tier allows `system.sam3` |
 | `caption_summary` | at least two submitted primaries are VLMs and the tier allows `system.caption_summary` |
 | `content_analysis` | `nudenet` was submitted and the tier allows `system.content_analysis` |
+| `rembg` | the tier allows `system.rembg` |
 | `florence2_grounding` | `florence2` was submitted |
 
 ## Important Nuances
@@ -75,6 +77,7 @@ These conditions document what `compute_expected_downstream()` currently models.
 - `harmony` retriggers `consensus` after merged boxes are updated.
 - `noun_consensus` triggers `florence2_grounding` progressively and may do so more than once as VLM results arrive.
 - `caption_summary` is progressive and can retrigger as additional captions arrive.
+- `rembg` is producer-triggered rather than worker-triggered in the current deployment model, but it is still part of the expected downstream product set.
 - `colors_post` is declared in the postprocessing area of the config, but it is not currently dispatched in the active harmony code path.
 
 ## Why This Is Markdown, Not YAML
