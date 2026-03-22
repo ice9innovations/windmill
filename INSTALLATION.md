@@ -1,19 +1,67 @@
-## Windmill Installation (Deployment‑Agnostic)
+# Windmill Installation
 
-This guide sets up Windmill without assumptions about specific hosts or Raspberry Pi hardware.
+This guide is for bringing up Windmill itself.
 
-### 1) Prerequisites
+If you need the broader multi-repo deployment picture, start with [DEPLOYMENT.md](/home/sd/windmill/DEPLOYMENT.md). Windmill is an orchestrator; it is not useful by itself unless compatible ML services are reachable from `service_config.yaml`.
+
+## Prerequisites
+
+Required:
+
 - Python 3.10+
-- RabbitMQ (with management plugin enabled)
 - PostgreSQL 13+
+- RabbitMQ 3.x
+- `pgvector` extension in PostgreSQL
+- one or more Animal Farm-compatible ML service endpoints
 
-Optional:
-- GPU services depending on which ML backends you run
+Recommended:
 
-### 2) Environment Variables (.env)
-Create `.env` in repo root:
+- RabbitMQ management plugin
+- systemd for API and worker supervision
+- Ansible for multi-node operations
+
+Optional but relevant:
+
+- ConceptNet load for noun-consensus synonym collapse
+- GPU-backed model hosts for heavier services
+
+## What Windmill Depends On
+
+Windmill expects:
+
+- PostgreSQL for `images`, `results`, aggregate tables, lifecycle state, and worker registry
+- RabbitMQ for primary and downstream queueing
+- HTTP ML services for actual inference
+
+Minimal end-to-end setup:
+
+- one VLM-style primary service
+- one spatial primary service
+- PostgreSQL
+- RabbitMQ
+- a worker node running the corresponding workers plus downstream system workers
+
+## 1. Clone And Create A Virtualenv
+
+```bash
+git clone <your-windmill-remote>
+cd windmill
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
+
+## 2. Configure `.env`
+
+Copy `.env.example` to `.env` and fill in values for your environment.
+
+Typical keys:
+
+```bash
 QUEUE_HOST=your-rabbitmq-host
+QUEUE_PORT=5671
+QUEUE_SSL=true
 QUEUE_USER=your-user
 QUEUE_PASSWORD=your-password
 
@@ -21,8 +69,8 @@ DB_HOST=your-postgres-host
 DB_NAME=your-db-name
 DB_USER=your-db-user
 DB_PASSWORD=your-db-password
+DB_SSLMODE=prefer
 
-# Optional tuning
 WORKER_PREFETCH_COUNT=1
 REQUEST_TIMEOUT=30
 MAX_RETRIES=3
@@ -31,91 +79,164 @@ QUEUE_MESSAGE_TTL_MS=120000
 LOG_LEVEL=INFO
 ```
 
-### 3) Install Python Dependencies
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+Important notes:
 
-### 4) Prepare PostgreSQL
-- Create database and user matching `.env`
-- Apply schema:
+- the API and workers share the same queue and DB connectivity settings
+- `service_config.yaml` is separate from `.env`; it controls service endpoints and tier membership
+- producers must publish `trace_id`; Windmill uses it for primary-result idempotency
+
+## 3. Prepare PostgreSQL
+
+Create the database and role referenced in `.env`, then apply the schema:
+
 ```bash
 psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -f db/db.sql
 ```
 
-### 5) RabbitMQ
-Ensure the management plugin is enabled and credentials match `.env`.
-DLQ/TTL are auto-declared by workers and producer.
+Schema notes:
 
-### 6) Configure Services
-Edit `service_config.yaml` to point to your service hosts/ports. The file is categorized by `primary`, `postprocessing`, and `system` components.
+- `db/db.sql` creates `pgvector` if available
+- `results.source_trace_id` is part of the primary retry-safety design
+- `service_dispatch` is the authoritative per-service lifecycle table
+- `worker_registry` stores live worker heartbeats
 
-### 7) Start Workers
+## 4. Load ConceptNet If You Need Noun Consensus
+
+If your deployment uses noun consensus, load ConceptNet edges:
+
 ```bash
-./windmill.sh start             # start all detected workers
-./windmill.sh status            # verify they are running
+./utils/load_conceptnet.sh /path/to/conceptnet-assertions-5.7.0.csv.gz
 ```
 
-### 8) Submit Jobs
+This populates `conceptnet_edges`, which noun consensus uses to build its in-memory synonym graph.
+
+## 5. Configure `service_config.yaml`
+
+Edit [service_config.yaml](/home/sd/windmill/service_config.yaml) so every enabled service points at a real host/port/endpoint.
+
+This file controls:
+
+- service catalog
+- queue names
+- service types
+- tier membership
+- which services are consensus-eligible
+
+Do not use it to describe internal downstream dependency logic. That is documented separately in [docs/workflow.md](/home/sd/windmill/docs/workflow.md).
+
+## 6. Verify Core Connectivity
+
+Before starting workers, verify:
+
+- PostgreSQL is reachable from the Windmill host
+- RabbitMQ is reachable from the Windmill host
+- each configured service endpoint is reachable from the worker host
+
+At minimum:
+
+- `psql` can connect
+- the API can connect to RabbitMQ
+- workers can hit their configured ML service hosts
+
+## 7. Start Windmill
+
+### Local worker control
+
 ```bash
-./producer.sh --limit 1000      # submits to the safe default primary set
-./producer.sh --group demo --limit 100
+./windmill.sh start
+./windmill.sh status
 ```
 
-### 9) Monitor
-- RabbitMQ UI (Queues, DLQs)
-- Logs in `logs/`
-- Database queries in README
+### Local API
 
-### 10) Common Variations
-- Single‑machine: run RabbitMQ, PostgreSQL, ML services, and workers on one host
-- Split infra: run RabbitMQ and PostgreSQL on managed/cloud services, workers on compute nodes
-- GPU nodes: run heavy ML services on separate machines; workers connect via host/port in `service_config.yaml`
+```bash
+python api.py
+```
 
-### 11) Upgrades and Safe Reprocessing
+If you run the API under systemd, verify with:
 
-## Docker Quickstart (Local Dev)
+```bash
+systemctl status windmill-api
+```
 
-Spin up RabbitMQ + Postgres + Windmill:
+## 8. Submit A Test Image
+
+```bash
+curl -X POST \
+  -F "file=@photo.jpg" \
+  -F "tier=basic" \
+  http://127.0.0.1:9997/analyze
+```
+
+Then verify:
+
+- an `images` row exists
+- primary `results` rows are being written
+- `results.source_trace_id` is populated on those primary rows
+- `service_dispatch` moves to terminal states
+- downstream stages expected for the tier complete
+
+## 9. Verify Operations
+
+Use these checks:
+
+- `./windmill.sh status`
+- RabbitMQ management UI
+- `logs/`
+- `SELECT * FROM worker_registry WHERE status = 'online'`
+- `SELECT * FROM service_dispatch WHERE image_id = <id>`
+
+## 10. Multi-Node Notes
+
+For distributed workers:
+
+- keep `.env` aligned across nodes that share the same DB and broker
+- assign service hosts in `service_config.yaml` so each worker can reach its service
+- use [ansible/inventory.example.yml](/home/sd/windmill/ansible/inventory.example.yml) and [ansible/README.md](/home/sd/windmill/ansible/README.md) for node management
+
+Windmill is designed so most workers can have multiple copies running at once.
+
+## 11. Common Installation Pitfalls
+
+- Windmill starts, but nothing processes
+  - workers are not actually online
+  - RabbitMQ queues have no consumers
+  - service hosts in `service_config.yaml` are unreachable
+- API accepts images, but results never appear
+  - workers are offline
+  - RabbitMQ publish succeeded but no consumers are running
+- noun consensus behaves oddly
+  - ConceptNet was never loaded
+- tier behavior looks wrong
+  - `service_config.yaml` tier membership differs from assumptions in old notes or scripts
+
+## Docker Quickstart
+
+For local development only:
+
 ```bash
 docker compose up --build
-```
-
-Then apply the DB schema inside the windmill container:
-```bash
 docker compose exec windmill bash -lc 'psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -f db/db.sql'
 ```
 
-Submit jobs:
-```bash
-docker compose exec windmill ./producer.sh --limit 100
-```
+Then submit a test image and verify the same lifecycle checks as above.
 
-View RabbitMQ UI at http://localhost:15672 (user/pass from QUEUE_USER/QUEUE_PASSWORD env or defaults).
+## Dataset Seeding By URL
 
-### Using External Datasets (URLs)
-
-Windmill prefers `image_url` over local file paths. You can seed images that live on any reachable HTTP(S) host and avoid mounting files:
-
-- Add images via CSV importer (below) or direct DB insert with `image_url` populated
-- Producer will fetch by URL, extract dimensions, and base64-encode into jobs
+Windmill can process images referenced by URL instead of local file paths.
 
 CSV import helper:
+
 ```bash
 DB_HOST=... DB_NAME=... DB_USER=... DB_PASSWORD=... \
 python utils/import_images_csv.py --csv /path/to/images.csv
 ```
 
-CSV format (header row required):
-```
+CSV format:
+
+```text
 image_id,image_filename,image_url,image_group
 1,000000000001.jpg,https://host/coco/train2017/000000000001.jpg,coco2017
 ```
 
-- Use DLQs to isolate repeated failures
-- Use the provided utils to list/requeue from DLQs
-- For harmonization logic changes, re-run harmony then consensus as documented in README
-
-
+This is useful for external datasets and remote worker fleets where local file mounting is undesirable.

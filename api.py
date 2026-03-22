@@ -25,6 +25,7 @@ from service_config import get_service_config
 from core.image import validate_and_normalize_image
 from core.dispatch import resolve_services, compute_expected_downstream
 from core.results import fetch_results
+from core.workflow import get_workflow_definition
 
 load_dotenv()
 
@@ -184,6 +185,11 @@ def declare_queue(channel, queue_name):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+@app.route('/workflow', methods=['GET'])
+def workflow():
+    """Expose the machine-readable Windmill workflow contract."""
+    return jsonify(get_workflow_definition())
 
 @app.route('/analyze', methods=['POST'])
 def analyze():

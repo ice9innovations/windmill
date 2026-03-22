@@ -4,6 +4,14 @@
 
 Distributed ML image processing pipeline for Animal Farm. Transforms monolithic API calls into a continuous queue-based pipeline capable of processing image streams at scale across 10+ ML services.
 
+Related docs:
+
+- [INSTALLATION.md](/home/sd/windmill/INSTALLATION.md)
+- [DEPLOYMENT.md](/home/sd/windmill/DEPLOYMENT.md)
+- [CONTRIBUTING.md](/home/sd/windmill/CONTRIBUTING.md)
+- [RUNBOOK.md](/home/sd/windmill/RUNBOOK.md)
+- [docs/workflow.md](/home/sd/windmill/docs/workflow.md)
+
 ---
 
 ## How It Works
@@ -36,17 +44,21 @@ Submit image
 | Service | Port | Type | Tiers |
 |---------|------|------|-------|
 | blip | 7777 | semantic, vlm | basic, premium |
+| florence2 | 7803 | semantic, vlm | basic, premium, batch |
 | colors | 7770 | colors | free, basic, premium, batch |
 | metadata | 7781 | metadata | free, basic, premium, batch |
-| ocr | 7775 | specialized | free, basic, premium, batch |
+| nsfw2 | 7774 | nsfw | free, basic, premium, batch |
+| ocr | 7775 | specialized | basic, premium, batch |
+| qr | 7801 | specialized | basic, premium, batch |
 | nudenet | 7789 | specialized | free, basic, premium, batch |
 | moondream | 7795 | semantic, vlm | basic, premium |
 | ollama | 7782 | semantic, vlm | basic, premium |
 | haiku | 7797 | semantic, vlm | premium, batch |
 | gemini | 7767 | semantic, vlm | premium, batch |
 | gpt_nano | 7800 | semantic, vlm | premium, batch |
+| xai | 7805 | semantic, vlm | premium, batch |
 | qwen | 7796 | semantic, vlm | basic, premium |
-| yolo_v8 | 7773 | spatial | basic, premium, batch |
+| yolo_v8 | 7773 | spatial | free, basic, premium, batch |
 
 ### Postprocessing Services (run on cropped bbox regions)
 
@@ -63,10 +75,12 @@ Submit image
 |---------|------|
 | harmony | IoU clustering across spatial results → merged_boxes |
 | consensus | V3 voting across all ML results → consensus |
+| florence2_grounding | progressive noun grounding requests driven by noun_consensus |
 | noun_consensus | Noun extraction + synonym collapse → noun_consensus |
 | verb_consensus | Verb/SVO extraction → verb_consensus |
 | sam3 | SAM3 segmentation for detected nouns → sam3_results |
 | caption_summary | LLM synthesis of all VLM captions → caption_summary |
+| content_analysis | safety/scene synthesis over consensus, captions, and nudenet |
 | rembg | Background removal → used by downstream consumers |
 
 ---
@@ -77,10 +91,10 @@ Services are gated by tier. The `tier` field is set at image submission time.
 
 | Tier | Included services |
 |------|------------------|
-| free | colors, metadata, ocr, nudenet |
-| basic | free + blip, moondream, ollama, qwen, yolo_v8 |
-| premium | basic + haiku, gemini, gpt_nano |
-| batch | colors, metadata, ocr, nudenet, haiku, gemini, gpt_nano, yolo_v8 |
+| free | colors, metadata, nsfw2, nudenet, yolo_v8 |
+| basic | free + blip, florence2, moondream, ollama, ocr, qr, qwen |
+| premium | basic + haiku, gemini, gpt_nano, xai |
+| batch | colors, metadata, nsfw2, ocr, qr, nudenet, florence2, haiku, gemini, gpt_nano, xai, yolo_v8 |
 
 Tiers are defined in `service_config.yaml`. Adding a new tier there automatically makes it valid — no code change required.
 
@@ -209,6 +223,12 @@ curl http://localhost:9997/status/517
 ### GET /results/{image_id}
 
 Full results without status metadata. Use when processing is confirmed complete.
+
+### GET /workflow
+
+Returns the machine-readable Windmill workflow contract: symbolic predicates, downstream stages, and trigger sources.
+
+This endpoint is intended for API consumers and other repos that need to reason about dependency relationships without reimplementing `compute_expected_downstream()`.
 
 ---
 
