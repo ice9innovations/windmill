@@ -248,9 +248,16 @@ class HarmonyWorker(BaseWorker):
                             self.logger.debug(f"Skipped postprocessing for {width}x{height} box (below 8x8 minimum)")
                             continue
 
+                        crop_started_at = time.time()
                         cropped_image_data = self._crop_bbox_from_image(img, merged_bbox)
                         if not cropped_image_data:
                             continue
+                        crop_duration = time.time() - crop_started_at
+                        if trace_id:
+                            self.logger.info(
+                                f"[{trace_id}] harmony cropped cluster {cluster_id} for image {image_id} "
+                                f"in {crop_duration:.3f}s"
+                            )
 
                         base_message = {
                             'merged_box_id': merged_box_id,
@@ -267,20 +274,30 @@ class HarmonyWorker(BaseWorker):
                         tier = getattr(self, 'current_tier', 'free')
                         if box_emoji == '🧑':
                             if self.config.is_available_for_tier('postprocessing.face', tier):
+                                face_publish_started_at = time.time()
                                 self.publish_bbox_message(self.postprocessing_queues['face'], base_message)
+                                face_publish_duration = time.time() - face_publish_started_at
+                                face_dispatch_record_started_at = time.time()
                                 self._record_service_dispatch(image_id, 'face', cluster_id)
+                                face_dispatch_record_duration = time.time() - face_dispatch_record_started_at
                                 face_dispatches += 1
                                 if trace_id:
                                     self.logger.info(
-                                        f"[{trace_id}] published face for image {image_id} cluster {cluster_id}"
+                                        f"[{trace_id}] published face for image {image_id} cluster {cluster_id} "
+                                        f"(publish={face_publish_duration:.3f}s dispatch_record={face_dispatch_record_duration:.3f}s)"
                                     )
                             if self.config.is_available_for_tier('postprocessing.pose', tier):
+                                pose_publish_started_at = time.time()
                                 self.publish_bbox_message(self.postprocessing_queues['pose'], base_message)
+                                pose_publish_duration = time.time() - pose_publish_started_at
+                                pose_dispatch_record_started_at = time.time()
                                 self._record_service_dispatch(image_id, 'pose', cluster_id)
+                                pose_dispatch_record_duration = time.time() - pose_dispatch_record_started_at
                                 pose_dispatches += 1
                                 if trace_id:
                                     self.logger.info(
-                                        f"[{trace_id}] published pose for image {image_id} cluster {cluster_id}"
+                                        f"[{trace_id}] published pose for image {image_id} cluster {cluster_id} "
+                                        f"(publish={pose_publish_duration:.3f}s dispatch_record={pose_dispatch_record_duration:.3f}s)"
                                     )
             if trace_id:
                 self.logger.info(
@@ -1299,19 +1316,24 @@ class HarmonyWorker(BaseWorker):
                 # Progressive harmonization: always reharmonize with latest bbox results
 
                 # Step 1: Clear postprocessing references to avoid FK constraint violation
+                clear_postprocessing_started_at = time.time()
                 cursor.execute("""
                     DELETE FROM postprocessing 
                     WHERE merged_box_id IN (
                         SELECT merged_id FROM merged_boxes WHERE image_id = %s
                     )
                 """, (image_id,))
+                clear_postprocessing_duration = time.time() - clear_postprocessing_started_at
                 
                 # Step 2: Delete old merged boxes (now safe)
+                delete_boxes_started_at = time.time()
                 cursor.execute("DELETE FROM merged_boxes WHERE image_id = %s", (image_id,))
                 deleted_count = cursor.rowcount
+                delete_boxes_duration = time.time() - delete_boxes_started_at
                 
                 # Step 3: Insert new merged boxes - ONE ROW PER MERGED BOX
                 merged_box_count = 0
+                insert_boxes_started_at = time.time()
                 for group_key, group_data in merged_data['grouped_objects'].items():
                     instances = group_data.get('instances', [])
                     for instance in instances:
@@ -1343,6 +1365,7 @@ class HarmonyWorker(BaseWorker):
                         ))
                         instance['merged_box_id'] = cursor.fetchone()[0]
                         merged_box_count += 1
+                insert_boxes_duration = time.time() - insert_boxes_started_at
                 
                 cursor.close()
                 
@@ -1353,6 +1376,13 @@ class HarmonyWorker(BaseWorker):
                     self.logger.info(f"Reharmonized boxes for {image_filename} ({detection_count} detections → {merged_box_count} merged boxes from {services})")
                 else:
                     self.logger.info(f"Harmonized boxes for {image_filename} ({detection_count} detections → {merged_box_count} merged boxes from {services})")
+                if self.current_trace_id:
+                    self.logger.info(
+                        f"[{self.current_trace_id}] harmony db stages for image {image_id}: "
+                        f"clear_postprocessing={clear_postprocessing_duration:.3f}s "
+                        f"delete_boxes={delete_boxes_duration:.3f}s "
+                        f"insert_boxes={insert_boxes_duration:.3f}s"
+                    )
                 
                 # Commit merged_boxes BEFORE dispatching to face/pose queues.
                 # Face/pose workers may consume the RabbitMQ message and attempt
