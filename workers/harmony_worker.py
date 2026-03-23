@@ -318,6 +318,184 @@ class HarmonyWorker(BaseWorker):
         except Exception as e:
             self.logger.error(f"Failed to publish to {queue_name}: {e}")
             raise
+
+    def _normalize_prediction_bbox(self, prediction, service):
+        """Normalize result bbox format to the internal dict shape."""
+        bbox = prediction.get('bbox')
+        if isinstance(bbox, list):
+            if len(bbox) != 4:
+                self.logger.warning(
+                    f"Skipping {service} prediction - invalid bbox array length: {len(bbox)}"
+                )
+                return None
+            return {
+                'x': bbox[0],
+                'y': bbox[1],
+                'width': bbox[2],
+                'height': bbox[3],
+            }
+
+        if isinstance(bbox, dict):
+            if not all(k in bbox for k in ['x', 'y', 'width', 'height']):
+                self.logger.warning(
+                    f"Skipping {service} prediction - missing required bbox keys: {bbox.keys()}"
+                )
+                return None
+            return {
+                'x': bbox['x'],
+                'y': bbox['y'],
+                'width': bbox['width'],
+                'height': bbox['height'],
+            }
+
+        self.logger.warning(
+            f"Skipping {service} prediction - unknown bbox format: {type(bbox)}"
+        )
+        return None
+
+    def _extract_detections(self, bbox_results):
+        """Convert bbox results rows into normalized detections."""
+        all_detections = []
+        source_result_ids = []
+        source_services = list(set(r[0] for r in bbox_results))
+
+        for service, data, result_id in bbox_results:
+            source_result_ids.append(result_id)
+
+            if not isinstance(data, dict) or 'predictions' not in data:
+                self.logger.debug(f"Skipping {service} - invalid data format")
+                continue
+
+            predictions = data['predictions']
+            if not predictions:
+                self.logger.debug(f"Skipping {service} - empty predictions array")
+                continue
+
+            for prediction in predictions:
+                normalized_bbox = self._normalize_prediction_bbox(prediction, service)
+                if not normalized_bbox:
+                    continue
+
+                all_detections.append({
+                    'service': service,
+                    'label': prediction.get('label', ''),
+                    'emoji': prediction.get('emoji', ''),
+                    'bbox': normalized_bbox,
+                    'confidence': prediction.get('confidence', 0.0),
+                    'type': prediction.get('type', 'object_detection'),
+                })
+
+        return all_detections, source_services, source_result_ids
+
+    def _build_single_service_instance(self, detection, object_id):
+        """Build one merged-box instance directly from a single detection."""
+        primary_emoji = normalize_person_emoji(detection['emoji'])
+        return {
+            'cluster_id': f"{primary_emoji}_{object_id}",
+            'emoji': primary_emoji,
+            'labels': [detection['label']] if detection['label'] else [],
+            'merged_bbox': detection['bbox'],
+            'detection_count': 1,
+            'avg_confidence': round(detection['confidence'], 3),
+            'max_confidence': round(detection['confidence'], 3),
+            'contributing_services': [detection['service']],
+            'detections': [{
+                'service': detection['service'],
+                'confidence': detection['confidence'],
+            }],
+            'assignment_method': 'single_service_passthrough',
+            'bbox_merge_method': 'passthrough',
+        }
+
+    def _build_single_service_merged_data(self, bbox_results, all_detections, source_services, source_result_ids):
+        """Bypass clustering when only one spatial result exists."""
+        grouped_objects = {}
+        for object_id, detection in enumerate(all_detections):
+            primary_emoji = normalize_person_emoji(detection['emoji'])
+            if primary_emoji not in grouped_objects:
+                grouped_objects[primary_emoji] = {
+                    'label': detection['label'],
+                    'emoji': primary_emoji,
+                    'type': detection['type'],
+                    'detections': [],
+                    'instances': [],
+                }
+
+            grouped_objects[primary_emoji]['detections'].append(detection)
+            grouped_objects[primary_emoji]['instances'].append(
+                self._build_single_service_instance(detection, object_id)
+            )
+
+        self.logger.info(
+            f"Single-service harmony fast path: {len(all_detections)} detections from {bbox_results[0][0]}"
+        )
+        return {
+            'all_detections': all_detections,
+            'grouped_objects': grouped_objects,
+            'source_services': source_services,
+            'total_detections': len(all_detections),
+            'harmonization_algorithm': 'single_service_passthrough',
+            'source_result_ids': source_result_ids,
+        }
+
+    def _merged_box_signature(self, merged_data):
+        """Create a stable signature for semantic equality of merged boxes."""
+        bbox = merged_data.get('merged_bbox') or {}
+        return {
+            'emoji': normalize_person_emoji(merged_data.get('emoji', '')),
+            'labels': sorted(merged_data.get('labels', [])),
+            'merged_bbox': {
+                'x': bbox.get('x'),
+                'y': bbox.get('y'),
+                'width': bbox.get('width'),
+                'height': bbox.get('height'),
+            },
+            'contributing_services': sorted(merged_data.get('contributing_services', [])),
+            'detection_count': merged_data.get('detection_count', 0),
+        }
+
+    def _merged_data_signatures(self, merged_data):
+        """Return sorted signatures for proposed grouped_objects data."""
+        signatures = []
+        for group_data in merged_data.get('grouped_objects', {}).values():
+            for instance in group_data.get('instances', []):
+                signatures.append(self._merged_box_signature(instance))
+        return sorted(
+            signatures,
+            key=lambda item: (
+                item['emoji'],
+                json.dumps(item['merged_bbox'], sort_keys=True),
+                json.dumps(item['labels']),
+                json.dumps(item['contributing_services']),
+                item['detection_count'],
+            )
+        )
+
+    def _fetch_existing_merged_signatures(self, image_id):
+        """Read current merged-box signatures for no-op short circuiting."""
+        cursor = self.db_conn.cursor()
+        cursor.execute("""
+            SELECT merged_data
+            FROM merged_boxes
+            WHERE image_id = %s
+            ORDER BY created DESC, merged_id DESC
+        """, (image_id,))
+        signatures = [
+            self._merged_box_signature(row[0])
+            for row in cursor.fetchall()
+            if isinstance(row[0], dict)
+        ]
+        cursor.close()
+        return sorted(
+            signatures,
+            key=lambda item: (
+                item['emoji'],
+                json.dumps(item['merged_bbox'], sort_keys=True),
+                json.dumps(item['labels']),
+                json.dumps(item['contributing_services']),
+                item['detection_count'],
+            )
+        )
     
     def process_message(self, ch, method, properties, body):
         """Process a single queue message"""
@@ -420,71 +598,18 @@ class HarmonyWorker(BaseWorker):
         if not bbox_results:
             self.logger.debug("No bbox_results provided")
             return None
-        
-        # Convert database results to service format
-        all_detections = []
-        source_result_ids = []
-        
-        for service, data, result_id in bbox_results:
-            source_result_ids.append(result_id)
-            
-            if not isinstance(data, dict) or 'predictions' not in data:
-                self.logger.debug(f"Skipping {service} - invalid data format")
-                continue
-            
-            predictions = data['predictions']
-            if not predictions:
-                self.logger.debug(f"Skipping {service} - empty predictions array")
-                continue
-            for prediction in predictions:
-                if not prediction.get('bbox'):
-                    self.logger.debug(f"Skipping {service} prediction - no bbox")
-                    continue
 
-                # Normalize bbox format (handle both dict and array formats)
-                try:
-                    bbox = prediction['bbox']
-                    if isinstance(bbox, list):
-                        # Array format [x, y, w, h] - convert to dict
-                        if len(bbox) != 4:
-                            self.logger.warning(f"Skipping {service} prediction - invalid bbox array length: {len(bbox)}")
-                            continue
-                        normalized_bbox = {
-                            'x': bbox[0],
-                            'y': bbox[1],
-                            'width': bbox[2],
-                            'height': bbox[3]
-                        }
-                        self.logger.debug(f"Normalized {service} bbox from array to dict format")
-                    elif isinstance(bbox, dict):
-                        # Already in dict format - validate required keys
-                        if not all(k in bbox for k in ['x', 'y', 'width', 'height']):
-                            self.logger.warning(f"Skipping {service} prediction - missing required bbox keys: {bbox.keys()}")
-                            continue
-                        normalized_bbox = bbox
-                    else:
-                        self.logger.warning(f"Skipping {service} prediction - unknown bbox format: {type(bbox)}")
-                        continue
-                except Exception as e:
-                    self.logger.warning(f"Skipping {service} prediction - error normalizing bbox: {e}")
-                    continue
-
-                # Extract detection with harmonized format
-                detection = {
-                    'service': service,
-                    'label': prediction.get('label', ''),
-                    'emoji': prediction.get('emoji', ''),
-                    'bbox': normalized_bbox,
-                    'confidence': prediction.get('confidence', 0.0),
-                    'type': prediction.get('type', 'object_detection')
-                }
-                all_detections.append(detection)
-                self.logger.debug(f"Added detection: {service} {detection['emoji']} {detection['label']}")
+        all_detections, source_services, source_result_ids = self._extract_detections(bbox_results)
         
         if not all_detections:
             self.logger.info(f"No valid detections found after processing {len(bbox_results)} bbox results")
             return None
-        
+
+        if len(bbox_results) == 1:
+            return self._build_single_service_merged_data(
+                bbox_results, all_detections, source_services, source_result_ids
+            )
+
         self.logger.debug(f"Processing {len(all_detections)} detections from {len(bbox_results)} services")
         
         # Apply BoundingBoxService harmonization logic
@@ -502,7 +627,7 @@ class HarmonyWorker(BaseWorker):
         harmonized_data = {
             'all_detections': all_detections,
             'grouped_objects': grouped_objects,
-            'source_services': list(set(r[0] for r in bbox_results)),
+            'source_services': source_services,
             'total_detections': len(all_detections),
             'harmonization_algorithm': 'greedy_many_to_one_v2',
             'source_result_ids': source_result_ids
@@ -547,9 +672,9 @@ class HarmonyWorker(BaseWorker):
         clusters = []
         used = set()
         
-        self.logger.info(f"DEBUG: Starting clustering with {len(detections)} detections")
+        self.logger.debug(f"DEBUG: Starting clustering with {len(detections)} detections")
         for i, det in enumerate(detections):
-            self.logger.info(f"DEBUG: Detection {i}: {det['service']} -> {det['emoji']} at {det['bbox']}")
+            self.logger.debug(f"DEBUG: Detection {i}: {det['service']} -> {det['emoji']} at {det['bbox']}")
         
         for i, detection in enumerate(detections):
             if i in used:
@@ -572,7 +697,7 @@ class HarmonyWorker(BaseWorker):
                     rule = merge_info['rule']
                     ratio = merge_info['containment_ratio']
 
-                    self.logger.info(f"DEBUG: Containment merge triggered - {contained_det['emoji']} (containment={ratio:.2f}) → {container_det['emoji']} with confidence boost per rule: {rule['description']}")
+                    self.logger.debug(f"DEBUG: Containment merge triggered - {contained_det['emoji']} (containment={ratio:.2f}) -> {container_det['emoji']} with confidence boost per rule: {rule['description']}")
 
                     # For containment merges, we want to preserve the container and absorb the contained
                     # Create a new merged detection with container properties but combined metadata
@@ -596,7 +721,7 @@ class HarmonyWorker(BaseWorker):
                     # Replace current cluster with merged detection
                     cluster = [merged_detection]
                     used.add(j)
-                    self.logger.info(f"DEBUG: Added to containment-merge cluster")
+                    self.logger.debug("DEBUG: Added to containment-merge cluster")
                     continue
 
                 # Only cluster detections with the same emoji (same object type)
@@ -621,11 +746,11 @@ class HarmonyWorker(BaseWorker):
                     if self.are_detections_near_identical(detection['bbox'], other_detection['bbox']):
                         # Multi-criteria clustering (IoU + center distance + size similarity)
                         should_cluster = True
-                        self.logger.info(f"DEBUG: Clustering via multi-criteria (IoU={overlap:.3f}, area_ratio={area_ratio:.3f})")
+                        self.logger.debug(f"DEBUG: Clustering via multi-criteria (IoU={overlap:.3f}, area_ratio={area_ratio:.3f})")
                     elif containment_ratio > 0.7:  # One box is 70% contained in the other
                         # Fallback: containment-based clustering (different scales of same object)
                         should_cluster = True
-                        self.logger.info(f"DEBUG: Clustering via containment ({containment_ratio:.3f})")
+                        self.logger.debug(f"DEBUG: Clustering via containment ({containment_ratio:.3f})")
                     else:
                         # For small objects, use distance-based clustering as last resort
                         max_area = max(area1, area2)
@@ -640,22 +765,22 @@ class HarmonyWorker(BaseWorker):
 
                             if distance < SMALL_OBJECT_DISTANCE:
                                 should_cluster = True
-                                self.logger.info(f"DEBUG: Clustering small objects via distance ({distance:.1f}px)")
+                                self.logger.debug(f"DEBUG: Clustering small objects via distance ({distance:.1f}px)")
 
-                    self.logger.info(f"DEBUG: Same emoji {emoji1}, overlap = {overlap:.3f}, area_ratio = {area_ratio:.3f}, should_cluster = {should_cluster}")
+                    self.logger.debug(f"DEBUG: Same emoji {emoji1}, overlap = {overlap:.3f}, area_ratio = {area_ratio:.3f}, should_cluster = {should_cluster}")
                     
                     if should_cluster:
                         cluster.append(other_detection)
                         used.add(j)
-                        self.logger.info(f"DEBUG: Added to same-emoji cluster")
+                        self.logger.debug("DEBUG: Added to same-emoji cluster")
                     else:
-                        self.logger.info(f"DEBUG: Not clustering - insufficient criteria")
+                        self.logger.debug("DEBUG: Not clustering - insufficient criteria")
                 else:
-                    self.logger.info(f"DEBUG: Different emojis {emoji1} vs {emoji2} - not clustering")
+                    self.logger.debug(f"DEBUG: Different emojis {emoji1} vs {emoji2} - not clustering")
             
             if cluster:
                 clusters.append(cluster)
-                self.logger.info(f"DEBUG: Created cluster with {len(cluster)} detections: {[d['emoji'] for d in cluster]}")
+                self.logger.debug(f"DEBUG: Created cluster with {len(cluster)} detections: {[d['emoji'] for d in cluster]}")
         
         # Convert clusters to potential objects
         potential_objects = []
@@ -668,7 +793,7 @@ class HarmonyWorker(BaseWorker):
                 'cluster_detections': cluster
             }
             potential_objects.append(potential_object)
-            self.logger.info(f"DEBUG: Potential object {i}: emojis={potential_object['candidate_emojis']}, services={[d['service'] for d in cluster]}")
+            self.logger.debug(f"DEBUG: Potential object {i}: emojis={potential_object['candidate_emojis']}, services={[d['service'] for d in cluster]}")
         
         self.logger.debug(f"Discovered {len(potential_objects)} potential objects from {len(detections)} detections")
         return potential_objects
@@ -1098,6 +1223,14 @@ class HarmonyWorker(BaseWorker):
                     self.logger.info(f"No bounding boxes to harmonize for image {image_id} - all detection services returned empty predictions")
                     return {'success': True, 'merged_boxes_created': False}
                 
+                proposed_signatures = self._merged_data_signatures(merged_data)
+                existing_signatures = self._fetch_existing_merged_signatures(image_id)
+                if existing_signatures and existing_signatures == proposed_signatures:
+                    self.logger.info(
+                        f"Skipping no-op harmony for {image_filename}: merged boxes unchanged"
+                    )
+                    return {'success': True, 'merged_boxes_created': True}
+
                 # Safe atomic DELETE + INSERT with foreign key handling
                 cursor = self.db_conn.cursor()
 
