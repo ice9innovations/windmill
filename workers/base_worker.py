@@ -948,6 +948,11 @@ class BaseWorker:
             self.db_conn.commit()  # CRITICAL: Commit the transaction!
             cursor.close()
 
+            if trace_id:
+                self.logger.info(
+                    f"[{trace_id}] stored {self.service_name} result for image {image_id}"
+                )
+
             # In-place extrapolation hook: subclasses derive additional data
             # from the same result without a separate queue/worker
             self.after_result_stored(image_id, result, message)
@@ -977,6 +982,10 @@ class BaseWorker:
                 ))
 
                 self.logger.debug("Prepared bbox completion for harmonization")
+                if trace_id:
+                    self.logger.info(
+                        f"[{trace_id}] publishing harmony trigger from {self.service_name} for image {image_id}"
+                    )
 
             if self.enable_noun_consensus:
                 noun_consensus_message = {
@@ -1021,7 +1030,13 @@ class BaseWorker:
                     json.dumps(consensus_message)
                 ))
 
+            publish_started_at = time.time()
             self._publish_messages_sync_confirm(downstream_messages)
+            if trace_id and downstream_messages:
+                self.logger.info(
+                    f"[{trace_id}] published {len(downstream_messages)} downstream message(s) "
+                    f"from {self.service_name} for image {image_id} in {time.time() - publish_started_at:.3f}s"
+                )
 
             # Acknowledge message
             self._safe_ack(ch, method.delivery_tag)

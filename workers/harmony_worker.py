@@ -196,66 +196,97 @@ class HarmonyWorker(BaseWorker):
     
     # Removed publish_to_downstream - using new dispatch_bbox_postprocessing instead
     
+    def _crop_bbox_from_image(self, img, bbox):
+        """Crop one bbox from an already-decoded PIL image."""
+        try:
+            x = bbox['x']
+            y = bbox['y']
+            width = bbox['width']
+            height = bbox['height']
+
+            crop_box = (x, y, x + width, y + height)
+            cropped_img = img.crop(crop_box)
+
+            if cropped_img.mode not in ('RGB', 'L'):
+                cropped_img = cropped_img.convert('RGB')
+
+            img_buffer = io.BytesIO()
+            cropped_img.save(img_buffer, format='JPEG', quality=90)
+            img_buffer.seek(0)
+            return base64.b64encode(img_buffer.getvalue())
+        except Exception as e:
+            self.logger.error(f"Failed to crop bbox from decoded image: {e}")
+            return None
+
     def dispatch_bbox_postprocessing(self, image_id, image_filename, merged_data, image_data):
         """Dispatch bbox postprocessing jobs for each merged box"""
         try:
-            
-            # Process each merged box
-            for group_key, group_data in merged_data['grouped_objects'].items():
-                instances = group_data.get('instances', [])
-                for instance in instances:
-                    merged_bbox = instance.get('merged_bbox', {})
-                    cluster_id = instance.get('cluster_id', '')
-                    
-                    # Get merged_box_id from database for this instance (use main connection to see uncommitted data)
-                    cursor = self.db_conn.cursor()
-                    cursor.execute("""
-                        SELECT merged_id FROM merged_boxes 
-                        WHERE image_id = %s AND merged_data->>'cluster_id' = %s
-                        ORDER BY created DESC LIMIT 1
-                    """, (image_id, cluster_id))
-                    box_result = cursor.fetchone()
-                    cursor.close()
-                    
-                    if not box_result:
-                        continue
-                        
-                    merged_box_id = box_result[0]
-                    
-                    # Crop the bounding box
-                    cropped_image_data = self.crop_bbox_from_data(image_data, merged_bbox)
-                    if not cropped_image_data:
-                        continue
-                    
-                    # Create postprocessing message
-                    base_message = {
-                        'merged_box_id': merged_box_id,
-                        'image_id': image_id,
-                        'cluster_id': cluster_id,
-                        'bbox': merged_bbox,
-                        'cropped_image_data': cropped_image_data.decode('latin-1')  # Encode bytes for JSON
-                    }
-                    # Propagate trace_id and tier from harmony input
-                    if hasattr(self, 'current_trace_id') and self.current_trace_id:
-                        base_message['trace_id'] = self.current_trace_id
-                    base_message['tier'] = getattr(self, 'current_tier', 'free')
-                    
-                    width = merged_bbox.get('width', 0)
-                    height = merged_bbox.get('height', 0)
-                    if width < MIN_POSTPROCESSING_SIZE[0] or height < MIN_POSTPROCESSING_SIZE[1]:
-                        self.logger.debug(f"Skipped postprocessing for {width}x{height} box (below 8x8 minimum)")
-                        continue
+            trace_id = getattr(self, 'current_trace_id', None)
+            image_bytes = base64.b64decode(image_data)
+            img = Image.open(io.BytesIO(image_bytes))
+            face_dispatches = 0
+            pose_dispatches = 0
 
-                    box_emoji = normalize_person_emoji(instance.get('emoji', ''))
-                    tier = getattr(self, 'current_tier', 'free')
-                    if box_emoji == '🧑':
-                        if self.config.is_available_for_tier('postprocessing.face', tier):
-                            self.publish_bbox_message(self.postprocessing_queues['face'], base_message)
-                            self._record_service_dispatch(image_id, 'face', cluster_id)
-                        if self.config.is_available_for_tier('postprocessing.pose', tier):
-                            self.publish_bbox_message(self.postprocessing_queues['pose'], base_message)
-                            self._record_service_dispatch(image_id, 'pose', cluster_id)
-                    
+            # Process each merged box
+            with img:
+                for group_key, group_data in merged_data['grouped_objects'].items():
+                    instances = group_data.get('instances', [])
+                    for instance in instances:
+                        merged_bbox = instance.get('merged_bbox', {})
+                        cluster_id = instance.get('cluster_id', '')
+                        merged_box_id = instance.get('merged_box_id')
+
+                        if not merged_box_id:
+                            self.logger.warning(
+                                f"Missing merged_box_id for {cluster_id} on image {image_id}, skipping postprocessing dispatch"
+                            )
+                            continue
+
+                        width = merged_bbox.get('width', 0)
+                        height = merged_bbox.get('height', 0)
+                        if width < MIN_POSTPROCESSING_SIZE[0] or height < MIN_POSTPROCESSING_SIZE[1]:
+                            self.logger.debug(f"Skipped postprocessing for {width}x{height} box (below 8x8 minimum)")
+                            continue
+
+                        cropped_image_data = self._crop_bbox_from_image(img, merged_bbox)
+                        if not cropped_image_data:
+                            continue
+
+                        base_message = {
+                            'merged_box_id': merged_box_id,
+                            'image_id': image_id,
+                            'cluster_id': cluster_id,
+                            'bbox': merged_bbox,
+                            'cropped_image_data': cropped_image_data.decode('latin-1')
+                        }
+                        if hasattr(self, 'current_trace_id') and self.current_trace_id:
+                            base_message['trace_id'] = self.current_trace_id
+                        base_message['tier'] = getattr(self, 'current_tier', 'free')
+
+                        box_emoji = normalize_person_emoji(instance.get('emoji', ''))
+                        tier = getattr(self, 'current_tier', 'free')
+                        if box_emoji == '🧑':
+                            if self.config.is_available_for_tier('postprocessing.face', tier):
+                                self.publish_bbox_message(self.postprocessing_queues['face'], base_message)
+                                self._record_service_dispatch(image_id, 'face', cluster_id)
+                                face_dispatches += 1
+                                if trace_id:
+                                    self.logger.info(
+                                        f"[{trace_id}] published face for image {image_id} cluster {cluster_id}"
+                                    )
+                            if self.config.is_available_for_tier('postprocessing.pose', tier):
+                                self.publish_bbox_message(self.postprocessing_queues['pose'], base_message)
+                                self._record_service_dispatch(image_id, 'pose', cluster_id)
+                                pose_dispatches += 1
+                                if trace_id:
+                                    self.logger.info(
+                                        f"[{trace_id}] published pose for image {image_id} cluster {cluster_id}"
+                                    )
+            if trace_id:
+                self.logger.info(
+                    f"[{trace_id}] harmony dispatched face={face_dispatches} pose={pose_dispatches} "
+                    f"for image {image_id}"
+                )
         except Exception as e:
             self.logger.error(f"Error in dispatch_bbox_postprocessing: {e}")
             raise
@@ -500,6 +531,7 @@ class HarmonyWorker(BaseWorker):
     def process_message(self, ch, method, properties, body):
         """Process a single queue message"""
         try:
+            receipt_started_at = time.time()
             # Parse message
             message = json.loads(body)
             # Capture trace_id and tier for propagation to postprocessing
@@ -511,6 +543,13 @@ class HarmonyWorker(BaseWorker):
             image_id = message['image_id']
             image_filename = message.get('image_filename', f'image_{image_id}')
             image_data = message.get('image_data')  # Base64 encoded image data
+            upstream_processed_at = message.get('processed_at')
+
+            if self.current_trace_id:
+                self.logger.info(
+                    f"[{self.current_trace_id}] harmony received image {image_id} "
+                    f"(upstream_processed_at={upstream_processed_at})"
+                )
 
             # Record that harmony was triggered — part of the harmonization transaction
             self._record_service_dispatch(image_id, 'harmony')
@@ -534,6 +573,12 @@ class HarmonyWorker(BaseWorker):
                     self.logger.info(f"Successfully processed harmony for {image_filename}, postprocessing dispatched")
                 else:
                     self.logger.info(f"Successfully processed harmony for {image_filename}, no merged boxes to enrich")
+
+                if self.current_trace_id:
+                    self.logger.info(
+                        f"[{self.current_trace_id}] harmony finished image {image_id} "
+                        f"in {time.time() - receipt_started_at:.3f}s"
+                    )
                 
                 # Trigger consensus after harmony completes
                 self.trigger_consensus(image_id, message)
@@ -1207,7 +1252,14 @@ class HarmonyWorker(BaseWorker):
                     return {'success': False, 'merged_boxes_created': False}
                 
                 # Get bbox results
+                bbox_fetch_started_at = time.time()
                 bbox_results = self.get_bbox_results_for_image(image_id)
+                bbox_fetch_duration = time.time() - bbox_fetch_started_at
+                if self.current_trace_id:
+                    self.logger.info(
+                        f"[{self.current_trace_id}] harmony fetched bbox results for image {image_id} "
+                        f"in {bbox_fetch_duration:.3f}s"
+                    )
                 if not bbox_results:
                     self.logger.info(f"No bbox results found for image {image_id}, skipping")
                     return {'success': True, 'merged_boxes_created': False}  # Not an error - just no data to process
@@ -1229,6 +1281,10 @@ class HarmonyWorker(BaseWorker):
                     self.logger.info(
                         f"Skipping no-op harmony for {image_filename}: merged boxes unchanged"
                     )
+                    if self.current_trace_id:
+                        self.logger.info(
+                            f"[{self.current_trace_id}] harmony no-op for image {image_id}"
+                        )
                     return {'success': True, 'merged_boxes_created': True}
 
                 # Safe atomic DELETE + INSERT with foreign key handling
@@ -1277,6 +1333,7 @@ class HarmonyWorker(BaseWorker):
                         cursor.execute("""
                             INSERT INTO merged_boxes (image_id, source_result_ids, merged_data, worker_id, status)
                             VALUES (%s, %s, %s, %s, %s)
+                            RETURNING merged_id
                         """, (
                             image_id,
                             merged_box_data['source_result_ids'],
@@ -1284,6 +1341,7 @@ class HarmonyWorker(BaseWorker):
                             self.worker_id,
                             'success'
                         ))
+                        instance['merged_box_id'] = cursor.fetchone()[0]
                         merged_box_count += 1
                 
                 cursor.close()
@@ -1302,14 +1360,26 @@ class HarmonyWorker(BaseWorker):
                 # before our transaction commits — causing a spurious FK violation
                 # that silently drops the result.  Commit first to guarantee the
                 # FK target is visible when the workers arrive.
+                commit_started_at = time.time()
                 self.db_conn.commit()
+                if self.current_trace_id:
+                    self.logger.info(
+                        f"[{self.current_trace_id}] harmony committed merged boxes for image {image_id} "
+                        f"in {time.time() - commit_started_at:.3f}s"
+                    )
 
                 # Dispatch bbox postprocessing jobs for each merged box
                 if merged_box_count > 0 and image_data:
+                    dispatch_started_at = time.time()
                     try:
                         self.dispatch_bbox_postprocessing(image_id, image_filename, merged_data, image_data)
                         # Commit service_dispatch records written during dispatch
                         self.db_conn.commit()
+                        if self.current_trace_id:
+                            self.logger.info(
+                                f"[{self.current_trace_id}] harmony dispatched postprocessing for image {image_id} "
+                                f"in {time.time() - dispatch_started_at:.3f}s"
+                            )
                     except Exception as e:
                         self.logger.error(f"Failed to dispatch postprocessing for {image_filename}: {e}")
                         # merged_boxes are already committed; dispatch failed but harmonization succeeded.
