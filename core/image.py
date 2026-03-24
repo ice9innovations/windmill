@@ -24,7 +24,14 @@ def validate_and_normalize_image(image_bytes, max_dimension=None):
     invalidates the Image object, so we re-open from the original bytes
     for actual processing.
 
-    Returns (normalized_bytes, width, height).
+    Returns:
+        (
+            normalized_bytes,
+            original_width,
+            original_height,
+            normalized_width,
+            normalized_height,
+        )
     Raises ValueError with a safe message if the bytes are not a valid image.
     """
     if max_dimension is None:
@@ -42,6 +49,7 @@ def validate_and_normalize_image(image_bytes, max_dimension=None):
         raise ValueError("Failed to decode image")
 
     original_format = img.format or 'JPEG'
+    original_width, original_height = img.size
 
     # Normalize EXIF orientation so all downstream workers (VLMs, SAM3, etc.)
     # receive pixels in display orientation. Without this, a portrait phone
@@ -56,7 +64,7 @@ def validate_and_normalize_image(image_bytes, max_dimension=None):
     needs_transcode = original_format not in _WEB_SAFE
 
     if max(width, height) <= max_dimension and not needs_transcode and not orientation_changed:
-        return image_bytes, width, height
+        return image_bytes, original_width, original_height, width, height
 
     if max(width, height) > max_dimension:
         ratio    = max_dimension / max(width, height)
@@ -70,5 +78,4 @@ def validate_and_normalize_image(image_bytes, max_dimension=None):
 
     buf = io.BytesIO()
     img.save(buf, format=save_format)
-    return buf.getvalue(), width, height
-
+    return buf.getvalue(), original_width, original_height, width, height

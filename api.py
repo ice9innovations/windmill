@@ -226,7 +226,13 @@ def analyze():
 
     # Validate and normalize — entirely in memory, never touches disk
     try:
-        image_bytes, width, height = validate_and_normalize_image(image_bytes)
+        (
+            image_bytes,
+            original_width,
+            original_height,
+            normalized_width,
+            normalized_height,
+        ) = validate_and_normalize_image(image_bytes)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
@@ -237,10 +243,28 @@ def analyze():
         db  = get_db()
         cur = db.cursor()
         cur.execute(
-            """INSERT INTO images (image_filename, image_group, services_submitted, tier)
-               VALUES (%s, %s, %s, %s)
+            """INSERT INTO images (
+                   image_filename,
+                   image_group,
+                   services_submitted,
+                   tier,
+                   original_image_width,
+                   original_image_height,
+                   normalized_image_width,
+                   normalized_image_height
+               )
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                RETURNING image_id""",
-            (image_filename, image_group, service_names, tier),
+            (
+                image_filename,
+                image_group,
+                service_names,
+                tier,
+                original_width,
+                original_height,
+                normalized_width,
+                normalized_height,
+            ),
         )
         image_id = cur.fetchone()[0]
         # Record pending dispatch for all primary services — best-effort tracking.
@@ -271,8 +295,10 @@ def analyze():
                     "image_id":       image_id,
                     "image_filename": image_filename,
                     "image_data":     b64_data,
-                    "image_width":    width,
-                    "image_height":   height,
+                    "image_width":    normalized_width,
+                    "image_height":   normalized_height,
+                    "original_image_width": original_width,
+                    "original_image_height": original_height,
                     "submitted_at":   datetime.now().isoformat(),
                     "trace_id":       trace_id,
                     "service_name":   service_name,
@@ -301,8 +327,12 @@ def analyze():
         "image_id":           image_id,
         "trace_id":           trace_id,
         "services_submitted": service_names,
-        "image_width":        width,
-        "image_height":       height,
+        "image_width":        normalized_width,
+        "image_height":       normalized_height,
+        "original_image_width": original_width,
+        "original_image_height": original_height,
+        "normalized_image_width": normalized_width,
+        "normalized_image_height": normalized_height,
     }), 202
 
 
@@ -315,7 +345,9 @@ def status(image_id):
 
         # Image metadata
         cur.execute(
-            """SELECT image_filename, image_group, services_submitted, image_created, tier
+            """SELECT image_filename, image_group, services_submitted, image_created, tier,
+                      original_image_width, original_image_height,
+                      normalized_image_width, normalized_image_height
                FROM images WHERE image_id = %s""",
             (image_id,),
         )
@@ -392,6 +424,10 @@ def status(image_id):
             "image_filename":         image_row['image_filename'],
             "image_group":            image_row['image_group'],
             "image_created":          image_row['image_created'].isoformat() if image_row['image_created'] else None,
+            "original_image_width":   image_row['original_image_width'],
+            "original_image_height":  image_row['original_image_height'],
+            "normalized_image_width": image_row['normalized_image_width'],
+            "normalized_image_height": image_row['normalized_image_height'],
             "services_submitted":     services_submitted,
             "vlm_services":           vlm_services,
             "services_completed":     completed,
@@ -424,7 +460,9 @@ def results(image_id):
 
         # Verify image exists
         cur.execute(
-            """SELECT image_filename, image_group, services_submitted, image_created
+            """SELECT image_filename, image_group, services_submitted, image_created,
+                      original_image_width, original_image_height,
+                      normalized_image_width, normalized_image_height
                FROM images WHERE image_id = %s""",
             (image_id,),
         )
@@ -439,6 +477,10 @@ def results(image_id):
             "image_filename":     image_row['image_filename'],
             "image_group":        image_row['image_group'],
             "image_created":      image_row['image_created'].isoformat() if image_row['image_created'] else None,
+            "original_image_width": image_row['original_image_width'],
+            "original_image_height": image_row['original_image_height'],
+            "normalized_image_width": image_row['normalized_image_width'],
+            "normalized_image_height": image_row['normalized_image_height'],
             "services_submitted": image_row['services_submitted'] or [],
             **results_data,
         })

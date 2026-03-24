@@ -41,6 +41,12 @@ CREATE TABLE images (
     image_group           VARCHAR(255),
     services_submitted    TEXT[],
     image_created         TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+    -- Upload-space dimensions before Windmill normalization/transcoding.
+    original_image_width  INTEGER,
+    original_image_height INTEGER,
+    -- Processing-space dimensions after Windmill normalization/transcoding.
+    normalized_image_width  INTEGER,
+    normalized_image_height INTEGER,
     -- CLIP image embedding (ViT-L/14, 768-dimensional, normalized)
     -- Written once on first caption score; used for image similarity search
     image_clip_embedding  vector(768),
@@ -323,4 +329,3 @@ CREATE TABLE IF NOT EXISTS conceptnet_edges (
 CREATE INDEX IF NOT EXISTS idx_cn_rel       ON conceptnet_edges(relation);
 CREATE INDEX IF NOT EXISTS idx_cn_start_rel ON conceptnet_edges(start_uri, relation);
 CREATE INDEX IF NOT EXISTS idx_cn_end_rel   ON conceptnet_edges(end_uri, relation);
-
