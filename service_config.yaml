@@ -1,9 +1,12 @@
 # Windmill Service Configuration
-# Defines ML services, infrastructure components, and their queue mappings
+# Defines the tiered pipeline/result contract for user-visible services.
+# This is NOT a registry of every worker process or internal plumbing queue.
+# If a worker does not participate in tiered result expectations, it does not
+# belong here.
 #
 
 # Rules:
-# Spatial services trigger box harmonization
+# Spatial services may trigger direct bbox postprocessing
 # Semantic services trigger caption scores
 # All services trigger consesus building unless tagged with consensus: false
 
@@ -204,7 +207,9 @@ services:
       service_type: colors
       consensus: false
       tier:
-        - system
+        - basic
+        - premium
+        - batch
 
     face:
       queue_name: face
@@ -231,26 +236,18 @@ services:
 
   system:
 
-    # Infrastructure Services - Queue processing and harmonization
-    # Handled differently to avoid recursion
-    # Consensus does not trigger consensus
-    # Harmony does not trigger harmony
+    # Derived/result-producing services. The category name is historical.
+    # These entries participate in real user-facing tier behavior; there is no
+    # separate "system" tier.
+    # Consensus does not trigger consensus.
 
     consensus:
       queue_name: consensus
       service_type: consensus
       tier:
-        - system
-
-    harmony:
-      queue_name: harmony
-      service_type: harmonization
-      tier:
         - basic
         - premium
         - batch
-        - system
-      # prefetch: 1  # default; keep single in-flight message per worker
 
     content_analysis:
       queue_name: content_analysis
@@ -265,13 +262,17 @@ services:
       queue_name: noun_consensus
       service_type: noun_consensus
       tier:
-        - system
+        - basic
+        - premium
+        - batch
 
     verb_consensus:
       queue_name: verb_consensus
       service_type: verb_consensus
       tier:
-        - system
+        - basic
+        - premium
+        - batch
 
     florence2_grounding:
       queue_name: florence2_grounding
@@ -280,7 +281,9 @@ services:
       endpoint: /analyze
       service_type: grounding
       tier:
-        - system
+        - basic
+        - premium
+        - batch
 
     caption_summary:
       queue_name: caption_summary
