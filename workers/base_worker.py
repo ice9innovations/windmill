@@ -12,12 +12,15 @@ import socket
 import base64
 import io
 import threading
-import queue as stdlib_queue
 import ssl
 import pika
 import psycopg2
 import requests
 import yaml
+import re
+from PIL import Image
+from collections import deque
+from functools import partial
 from datetime import datetime
 from dotenv import load_dotenv
 from service_config import get_service_config
@@ -40,14 +43,14 @@ class BaseWorker:
         self.db_backoff_delay = 1  # Start with 1 second
         self.max_db_backoff_delay = 60  # Max 60 seconds
 
-        # Background publish thread — decouples downstream trigger publishes
-        # from the consume loop so they don't block ML throughput
-        self._publish_queue = stdlib_queue.Queue(
-            maxsize=int(os.getenv('PUBLISH_QUEUE_MAXSIZE', '1000'))
-        )
+        # Async publisher state — outbound publishes run on a dedicated RabbitMQ
+        # I/O loop instead of blocking the consume thread.
         self._publish_thread = None
         self._publish_connection = None
         self._publish_channel = None
+        self._publish_ready = threading.Event()
+        self._publish_lock = threading.Lock()
+        self._publish_pending = deque()
         self._sync_publish_connection = None
         self._sync_publish_channel = None
         self._running = False
@@ -112,7 +115,7 @@ class BaseWorker:
         self.is_vlm = self.config.is_vlm_service(self.service_name)
         self.enable_consensus_triggers = self.config.should_trigger_consensus(self.service_name)
 
-        # Enable triggers for spatial services (for bbox harmonization)
+        # Enable direct bbox postprocessing triggers for spatial services
         self.enable_triggers = self.is_spatial
         # Enable noun and verb consensus for VLM services
         self.enable_noun_consensus = self.is_vlm
@@ -145,6 +148,150 @@ class BaseWorker:
         if '.' in self.service_name:
             return self.service_name.split('.', 1)[1]  # Return part after first dot
         return self.service_name
+
+    def _normalize_emoji(self, emoji):
+        if not emoji:
+            return emoji
+        return re.sub(r'[\uFE00-\uFE0F\u180B-\u180D\u200D]', '', emoji)
+
+    def _normalize_person_emoji(self, emoji):
+        normalized = self._normalize_emoji(emoji)
+        if normalized in ['🧑', '👩', '🧒']:
+            return '🧑'
+        return normalized
+
+    def _normalize_prediction_bbox(self, prediction):
+        bbox = prediction.get('bbox')
+        if isinstance(bbox, list) and len(bbox) >= 4:
+            return {
+                'x': bbox[0],
+                'y': bbox[1],
+                'width': bbox[2],
+                'height': bbox[3],
+            }
+        if isinstance(bbox, dict) and all(k in bbox for k in ('x', 'y', 'width', 'height')):
+            return {
+                'x': bbox['x'],
+                'y': bbox['y'],
+                'width': bbox['width'],
+                'height': bbox['height'],
+            }
+        return None
+
+    def _now_iso(self):
+        return datetime.now().isoformat()
+
+    def _crop_bbox_from_image_data(self, image_data, bbox):
+        """Crop one bbox from base64 image data and return base64 JPEG bytes."""
+        try:
+            image_bytes = base64.b64decode(image_data)
+            img = Image.open(io.BytesIO(image_bytes))
+            with img:
+                crop_box = (
+                    bbox['x'],
+                    bbox['y'],
+                    bbox['x'] + bbox['width'],
+                    bbox['y'] + bbox['height'],
+                )
+                cropped_img = img.crop(crop_box)
+                if cropped_img.mode not in ('RGB', 'L'):
+                    cropped_img = cropped_img.convert('RGB')
+                img_buffer = io.BytesIO()
+                cropped_img.save(img_buffer, format='JPEG', quality=90)
+                img_buffer.seek(0)
+                return base64.b64encode(img_buffer.getvalue()).decode('latin-1')
+        except Exception as e:
+            self.logger.error(f"Failed to crop bbox from image data: {e}")
+            return None
+
+    def _build_postprocessing_messages(self, image_id, message, result, tier, trace_id):
+        """Build direct face/pose postprocessing messages for single-spatial YOLO paths."""
+        if self.service_name not in self.bbox_services:
+            return []
+        if len(self.bbox_services) != 1:
+            return []
+        if self._get_clean_service_name() != 'yolo_v8':
+            return []
+        if not isinstance(result, dict):
+            return []
+
+        predictions = result.get('predictions') or []
+        if not predictions:
+            return []
+
+        messages = []
+        for index, prediction in enumerate(predictions):
+            bbox = self._normalize_prediction_bbox(prediction)
+            if not bbox:
+                continue
+
+            if bbox['width'] < 8 or bbox['height'] < 8:
+                continue
+
+            label = (prediction.get('label') or '').strip().lower()
+            emoji = self._normalize_person_emoji(prediction.get('emoji', ''))
+            if label != 'person' and emoji != '🧑':
+                continue
+
+            cluster_id = f"yolo_person_{index}"
+            cropped_image_data = self._crop_bbox_from_image_data(message.get('image_data'), bbox)
+            if not cropped_image_data:
+                continue
+
+            if self.config.is_available_for_tier('postprocessing.face', tier):
+                self._record_postprocessing_event(
+                    image_id=image_id,
+                    merged_box_id=None,
+                    service='face',
+                    cluster_id=cluster_id,
+                    event_type='enqueued',
+                    source_service=self._get_clean_service_name(),
+                    source_stage='result_stored',
+                    data={'bbox': bbox},
+                )
+                messages.append((
+                    self._get_queue_name('postprocessing.face'),
+                    json.dumps({
+                        'merged_box_id': None,
+                        'image_id': image_id,
+                        'cluster_id': cluster_id,
+                        'bbox': bbox,
+                        'cropped_image_data': cropped_image_data,
+                        'trace_id': trace_id,
+                        'tier': tier,
+                        'source_service': self._get_clean_service_name(),
+                        'source_stage': 'result_stored',
+                        'dispatch_enqueued_at': self._now_iso(),
+                    }),
+                ))
+            if self.config.is_available_for_tier('postprocessing.pose', tier):
+                self._record_postprocessing_event(
+                    image_id=image_id,
+                    merged_box_id=None,
+                    service='pose',
+                    cluster_id=cluster_id,
+                    event_type='enqueued',
+                    source_service=self._get_clean_service_name(),
+                    source_stage='result_stored',
+                    data={'bbox': bbox},
+                )
+                messages.append((
+                    self._get_queue_name('postprocessing.pose'),
+                    json.dumps({
+                        'merged_box_id': None,
+                        'image_id': image_id,
+                        'cluster_id': cluster_id,
+                        'bbox': bbox,
+                        'cropped_image_data': cropped_image_data,
+                        'trace_id': trace_id,
+                        'tier': tier,
+                        'source_service': self._get_clean_service_name(),
+                        'source_stage': 'result_stored',
+                        'dispatch_enqueued_at': self._now_iso(),
+                    }),
+                ))
+
+        return messages
 
     def _declare_additional_queues(self, declare_with_dlq):
         """Override in subclasses to declare additional downstream queues on the publish channel."""
@@ -182,16 +329,13 @@ class BaseWorker:
         kwargs.update(overrides)
         return pika.ConnectionParameters(**kwargs)
 
-    def _connect_publish_channel(self):
-        """Create a separate RabbitMQ connection and channel for background publishing.
-        This connection is owned by the publish thread and never touched by the consume thread."""
-        self._publish_connection = pika.BlockingConnection(self._build_queue_params())
-        self._publish_channel = self._publish_connection.channel()
+    def _get_publish_declarations(self):
+        """Return downstream queues this worker may publish to, including DLQs."""
+        declarations = []
 
-        # Declare all downstream queues this worker might publish to
-        def declare_with_dlq(channel, queue_name):
+        def add_queue(queue_name):
             dlq_name = f"{queue_name}.dlq"
-            channel.queue_declare(queue=dlq_name, durable=True)
+            declarations.append((dlq_name, None))
             args = {
                 'x-dead-letter-exchange': '',
                 'x-dead-letter-routing-key': dlq_name
@@ -199,21 +343,21 @@ class BaseWorker:
             ttl_env = os.getenv('QUEUE_MESSAGE_TTL_MS')
             if ttl_env and ttl_env.isdigit() and int(ttl_env) > 0:
                 args['x-message-ttl'] = int(ttl_env)
-            channel.queue_declare(queue=queue_name, durable=True, arguments=args)
+            declarations.append((queue_name, args))
 
-        # Declare downstream queues based on what this worker triggers
         if self.enable_triggers:
-            declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('harmonization'))
+            if self.service_name in self.bbox_services and len(self.bbox_services) == 1:
+                add_queue(self._get_queue_name('postprocessing.face'))
+                add_queue(self._get_queue_name('postprocessing.pose'))
         if self.enable_consensus_triggers:
-            declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('consensus'))
+            add_queue(self._get_queue_by_service_type('consensus'))
         if self.enable_noun_consensus:
-            declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('noun_consensus'))
+            add_queue(self._get_queue_by_service_type('noun_consensus'))
         if self.enable_verb_consensus:
-            declare_with_dlq(self._publish_channel, self._get_queue_by_service_type('verb_consensus'))
+            add_queue(self._get_queue_by_service_type('verb_consensus'))
 
-        self._declare_additional_queues(declare_with_dlq)
-
-        self.logger.info("Publish thread connected to RabbitMQ")
+        self._declare_additional_queues(lambda _channel, queue_name: add_queue(queue_name))
+        return declarations
 
     def _connect_sync_publish_channel(self):
         """Create a dedicated publish-confirm channel owned by the consume thread."""
@@ -240,7 +384,9 @@ class BaseWorker:
             channel.queue_declare(queue=queue_name, durable=True, arguments=args)
 
         if self.enable_triggers:
-            declare_with_dlq(self._sync_publish_channel, self._get_queue_by_service_type('harmonization'))
+            if self.service_name in self.bbox_services and len(self.bbox_services) == 1:
+                declare_with_dlq(self._sync_publish_channel, self._get_queue_name('postprocessing.face'))
+                declare_with_dlq(self._sync_publish_channel, self._get_queue_name('postprocessing.pose'))
         if self.enable_consensus_triggers:
             declare_with_dlq(self._sync_publish_channel, self._get_queue_by_service_type('consensus'))
         if self.enable_noun_consensus:
@@ -288,103 +434,166 @@ class BaseWorker:
                 if published is False:
                     raise RuntimeError(f"Broker did not confirm publish to {routing_key} after reconnect")
 
-    def _publish_loop(self):
-        """Background thread target: drains the publish queue and sends messages
-        on its own dedicated pika connection."""
-        try:
-            self._connect_publish_channel()
-        except Exception as e:
-            self.logger.error(f"Publish thread failed to connect: {e}")
-            return
-
+    def _start_async_publisher(self):
+        """Publisher thread target using RabbitMQ's async I/O loop."""
         while self._running:
             try:
-                routing_key, body = self._publish_queue.get(timeout=0.5)
-            except stdlib_queue.Empty:
-                # Process pika heartbeats during idle periods to prevent
-                # the broker from closing the connection
-                try:
-                    self._publish_connection.process_data_events()
-                except Exception as e:
-                    self.logger.warning(f"Publish connection heartbeat failed: {e}. Reconnecting...")
-                    try:
-                        self._connect_publish_channel()
-                    except Exception as reconnect_e:
-                        self.logger.error(f"Publish thread reconnect failed: {reconnect_e}")
-                continue
-
-            # Drain all waiting messages into a batch so they are published
-            # in a tight burst rather than one per loop iteration. This matters
-            # when a single worker result triggers multiple downstream messages
-            # (e.g. florence2_grounding dispatching N colors_post jobs).
-            batch = [(routing_key, body)]
-            while True:
-                try:
-                    batch.append(self._publish_queue.get_nowait())
-                except stdlib_queue.Empty:
-                    break
-
-            for routing_key, body in batch:
-                try:
-                    self._publish_channel.basic_publish(
-                        exchange='',
-                        routing_key=routing_key,
-                        body=body,
-                        properties=pika.BasicProperties(delivery_mode=2)
-                    )
-                except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
-                        pika.exceptions.StreamLostError) as e:
-                    self.logger.warning(f"Publish connection lost: {e}. Reconnecting...")
-                    try:
-                        self._connect_publish_channel()
-                        # Retry the failed publish after reconnecting
-                        self._publish_channel.basic_publish(
-                            exchange='',
-                            routing_key=routing_key,
-                            body=body,
-                            properties=pika.BasicProperties(delivery_mode=2)
-                        )
-                    except Exception as retry_e:
-                        self.logger.error(f"Publish retry failed after reconnect: {retry_e}")
-                except Exception as e:
-                    self.logger.error(f"Publish error: {e}")
-
-        # Drain remaining messages on shutdown
-        drained = 0
-        while not self._publish_queue.empty():
-            try:
-                routing_key, body = self._publish_queue.get_nowait()
-                self._publish_channel.basic_publish(
-                    exchange='',
-                    routing_key=routing_key,
-                    body=body,
-                    properties=pika.BasicProperties(delivery_mode=2)
+                self._publish_ready.clear()
+                self._publish_connection = pika.SelectConnection(
+                    self._build_queue_params(),
+                    on_open_callback=self._on_publish_connection_open,
+                    on_open_error_callback=self._on_publish_connection_open_error,
+                    on_close_callback=self._on_publish_connection_closed,
                 )
-                drained += 1
-            except Exception:
-                break
-        if drained:
-            self.logger.info(f"Publish thread drained {drained} remaining messages on shutdown")
+                self._publish_connection.ioloop.start()
+            except Exception as e:
+                if self._running:
+                    self.logger.error(f"Async publish loop failed: {e}")
+            finally:
+                self._publish_ready.clear()
+                self._publish_channel = None
+                self._publish_connection = None
 
-        try:
-            self._publish_connection.close()
-        except Exception:
-            pass
-        self.logger.info("Publish thread stopped")
+            if self._running:
+                time.sleep(self.retry_delay)
+
+        self.logger.info("Async publish thread stopped")
+
+    def _on_publish_connection_open(self, connection):
+        connection.channel(on_open_callback=self._on_publish_channel_open)
+
+    def _on_publish_connection_open_error(self, connection, error):
+        self.logger.warning(f"Async publish connection open failed: {error}")
+        connection.ioloop.stop()
+
+    def _on_publish_connection_closed(self, connection, reason):
+        self._publish_ready.clear()
+        self._publish_channel = None
+        if self._running:
+            self.logger.warning(f"Async publish connection closed: {reason}")
+        connection.ioloop.stop()
+
+    def _on_publish_channel_open(self, channel):
+        self._publish_channel = channel
+        declarations = self._get_publish_declarations()
+        self._declare_publish_queue_at_index(declarations, 0)
+
+    def _declare_publish_queue_at_index(self, declarations, index):
+        if self._publish_channel is None:
+            return
+        if index >= len(declarations):
+            self._publish_ready.set()
+            self.logger.info("Async publisher connected to RabbitMQ")
+            self._flush_pending_async_publishes()
+            return
+
+        queue_name, arguments = declarations[index]
+        self._publish_channel.queue_declare(
+            queue=queue_name,
+            durable=True,
+            arguments=arguments,
+            callback=lambda _frame: self._declare_publish_queue_at_index(declarations, index + 1),
+        )
+
+    def _flush_pending_async_publishes(self):
+        while True:
+            with self._publish_lock:
+                if not self._publish_pending:
+                    return
+                routing_key, body, local_enqueued_at = self._publish_pending.popleft()
+            self._async_publish_message(routing_key, body, local_enqueued_at)
 
     def _enqueue_publish(self, routing_key, body):
-        """Enqueue a message for background publishing.
+        """Publish through the async RabbitMQ connection without blocking the worker."""
+        body = self._augment_publish_body(
+            body,
+            _publisher_enqueued_at=self._now_iso(),
+        )
+        local_enqueued_at = time.monotonic()
 
-        Queue size is configurable via PUBLISH_QUEUE_MAXSIZE for controlled
-        stress testing.
+        if (
+            self._publish_connection is not None
+            and self._publish_channel is not None
+            and self._publish_ready.is_set()
+        ):
+            try:
+                self._publish_connection.ioloop.add_callback_threadsafe(
+                    partial(self._async_publish_message, routing_key, body, local_enqueued_at)
+                )
+                return
+            except Exception as e:
+                self.logger.warning(f"Async publish handoff failed, buffering locally: {e}")
+
+        with self._publish_lock:
+            self._publish_pending.append((routing_key, body, local_enqueued_at))
+
+    def _async_publish_message(self, routing_key, body, local_enqueued_at):
+        if self._publish_channel is None or self._publish_channel.is_closed:
+            with self._publish_lock:
+                self._publish_pending.appendleft((routing_key, body, local_enqueued_at))
+            return
+
+        local_queue_wait = time.monotonic() - local_enqueued_at
+        body = self._augment_publish_body(
+            body,
+            _publisher_started_at=self._now_iso(),
+        )
+        publish_started_at = time.time()
+        self._publish_channel.basic_publish(
+            exchange='',
+            routing_key=routing_key,
+            body=body,
+            properties=pika.BasicProperties(delivery_mode=2),
+        )
+        publish_duration = time.time() - publish_started_at
+        self._log_publish_timing(
+            routing_key,
+            body,
+            local_queue_wait,
+            publish_duration,
+        )
+
+    def _augment_publish_body(self, body, **fields):
+        """Add publish-trace metadata to JSON object bodies.
+
+        Non-JSON payloads are returned unchanged.
         """
+        if not body or not fields:
+            return body
         try:
-            self._publish_queue.put_nowait((routing_key, body))
-        except stdlib_queue.Full:
-            self.logger.error(
-                f"Publish queue full ({self._publish_queue.maxsize}), "
-                f"cannot enqueue message to {routing_key}"
-            )
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                return body
+            for key, value in fields.items():
+                payload[key] = value
+            return json.dumps(payload)
+        except Exception:
+            return body
+
+    def _log_publish_timing(self, routing_key, body, local_queue_wait, publish_duration, retried=False):
+        """Emit publish timing when the local handoff or publish call is slow."""
+        if local_queue_wait < 0.05 and publish_duration < 0.05:
+            return
+        image_id = None
+        trace_id = None
+        try:
+            payload = json.loads(body)
+            if isinstance(payload, dict):
+                image_id = payload.get('image_id')
+                trace_id = payload.get('trace_id')
+        except Exception:
+            pass
+        bits = [
+            f"routing_key={routing_key}",
+            f"local_queue_wait={local_queue_wait:.3f}s",
+            f"publish_call={publish_duration:.3f}s",
+        ]
+        if image_id is not None:
+            bits.insert(1, f"image={image_id}")
+        if retried:
+            bits.append("retried=true")
+        prefix = f"[{trace_id}] " if trace_id else ""
+        self.logger.info(prefix + "publish_timing " + " ".join(bits))
 
     def _safe_ack(self, ch, delivery_tag):
         """Ack a message, logging instead of raising if the channel is dead.
@@ -436,19 +645,80 @@ class BaseWorker:
         
         # POST as multipart file upload
         files = {'file': ('image.jpg', io.BytesIO(image_bytes), 'image/jpeg')}
-        response = requests.post(
-            service_url,
-            files=files,
-            timeout=self.request_timeout
-        )
-        response.raise_for_status()
-        return response.json()
+        try:
+            response = requests.post(
+                service_url,
+                files=files,
+                timeout=self.request_timeout
+            )
+            return self._coerce_terminal_http_response(response)
+        except requests.RequestException as e:
+            if getattr(e, 'response', None) is not None:
+                return self._coerce_terminal_http_response(e.response)
+            self.logger.error(f"{self.service_name} request failed before terminal response: {e}")
+            return None
+
+    def _coerce_terminal_http_response(self, response, service=None):
+        """Convert an HTTP response into a terminal result payload.
+
+        If the service answered at all, that is a terminal outcome for the current
+        trigger. Non-2xx and non-JSON responses are normalized into failed result
+        payloads so workers do not spin forever retrying stable service errors.
+        """
+        service = service or self._get_clean_service_name()
+        body_text = ""
+        try:
+            body_text = response.text or ""
+        except Exception:
+            body_text = ""
+
+        payload = None
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+
+        if not isinstance(payload, dict):
+            payload = {
+                'service': service,
+                'status': 'failed',
+                'predictions': [],
+                'error_message': body_text.strip()[:500] or (
+                    f"HTTP {response.status_code} with non-JSON response"
+                ),
+                'metadata': {},
+            }
+        else:
+            payload.setdefault('service', service)
+            if not isinstance(payload.get('metadata'), dict):
+                payload['metadata'] = {}
+            if response.ok:
+                payload.setdefault('status', 'success')
+            else:
+                if payload.get('status') == 'success' or not payload.get('status'):
+                    payload['status'] = 'failed'
+                if not any(payload.get(key) for key in ('error_message', 'error', 'message')):
+                    payload['error_message'] = (
+                        body_text.strip()[:500] or f"HTTP {response.status_code}"
+                    )
+
+        payload['metadata'].setdefault('http_status', response.status_code)
+        if not response.ok:
+            payload['metadata'].setdefault('terminal_http_error', True)
+        return payload
     
     def trigger_consensus(self, image_id, message):
         """Trigger consensus processing (async via background publish thread)"""
         if not self.enable_consensus_triggers:
             return
 
+        self._record_service_event(
+            image_id=image_id,
+            service='consensus',
+            event_type='enqueued',
+            source_service=self._get_clean_service_name(),
+            source_stage='consensus_trigger',
+        )
         consensus_message = {
             'image_id': image_id,
             'image_filename': message.get('image_filename', f'image_{image_id}'),
@@ -470,6 +740,13 @@ class BaseWorker:
         if not self.enable_noun_consensus:
             return
 
+        self._record_service_event(
+            image_id=image_id,
+            service='noun_consensus',
+            event_type='enqueued',
+            source_service=self._get_clean_service_name(),
+            source_stage='noun_consensus_trigger',
+        )
         noun_consensus_message = {
             'image_id': image_id,
             'image_filename': message.get('image_filename', f'image_{image_id}'),
@@ -492,6 +769,13 @@ class BaseWorker:
         if not self.enable_verb_consensus:
             return
 
+        self._record_service_event(
+            image_id=image_id,
+            service='verb_consensus',
+            event_type='enqueued',
+            source_service=self._get_clean_service_name(),
+            source_stage='verb_consensus_trigger',
+        )
         verb_consensus_message = {
             'image_id': image_id,
             'image_filename': message.get('image_filename', f'image_{image_id}'),
@@ -521,15 +805,34 @@ class BaseWorker:
         the parent transaction alive.
         """
         try:
+            total_started_at = time.time()
             cursor = self.db_conn.cursor()
+            savepoint_duration = 0.0
             if not self.db_conn.autocommit:
+                savepoint_started_at = time.time()
                 cursor.execute("SAVEPOINT before_service_dispatch")
+                savepoint_duration = time.time() - savepoint_started_at
+            execute_started_at = time.time()
             cursor.execute(
                 "INSERT INTO service_dispatch (image_id, service, cluster_id) VALUES (%s, %s, %s) RETURNING dispatch_id",
                 (image_id, service, cluster_id),
             )
+            execute_duration = time.time() - execute_started_at
+            fetch_started_at = time.time()
             row = cursor.fetchone()
+            fetch_duration = time.time() - fetch_started_at
+            close_started_at = time.time()
             cursor.close()
+            close_duration = time.time() - close_started_at
+            if getattr(self, "service_name", None) == "system.harmony":
+                self.logger.info(
+                    f"service_dispatch record timing service={service} image={image_id} "
+                    f"savepoint={savepoint_duration:.3f}s "
+                    f"execute={execute_duration:.3f}s "
+                    f"fetch={fetch_duration:.3f}s "
+                    f"close={close_duration:.3f}s "
+                    f"total={time.time() - total_started_at:.3f}s"
+                )
             return row[0] if row else None
         except Exception as e:
             self.logger.warning(
@@ -560,7 +863,9 @@ class BaseWorker:
         """
         service = service or self._get_clean_service_name()
         try:
+            total_started_at = time.time()
             cursor = self.db_conn.cursor()
+            execute_started_at = time.time()
             if dispatch_id is not None:
                 if reason is not None:
                     cursor.execute(
@@ -604,9 +909,25 @@ class BaseWorker:
                              AND cluster_id = %s AND status = 'pending'""",
                         (status, image_id, service, cluster_id),
                     )
+            execute_duration = time.time() - execute_started_at
+            close_started_at = time.time()
             cursor.close()
+            close_duration = time.time() - close_started_at
+            commit_duration = 0.0
             if not self.db_conn.autocommit:
+                commit_started_at = time.time()
                 self.db_conn.commit()
+                commit_duration = time.time() - commit_started_at
+            if getattr(self, "service_name", None) == "system.harmony":
+                self.logger.info(
+                    f"service_dispatch update timing service={service} image={image_id} "
+                    f"dispatch_id={dispatch_id if dispatch_id is not None else 'none'} "
+                    f"cluster_id={cluster_id if cluster_id is not None else 'null'} "
+                    f"execute={execute_duration:.3f}s "
+                    f"close={close_duration:.3f}s "
+                    f"commit={commit_duration:.3f}s "
+                    f"total={time.time() - total_started_at:.3f}s"
+                )
         except Exception as e:
             self.logger.warning(
                 f"Failed to update service_dispatch for {service}/{image_id}: {e}"
@@ -616,6 +937,156 @@ class BaseWorker:
                     self.db_conn.rollback()
                 except Exception:
                     pass
+
+    def _record_postprocessing_event(
+        self,
+        image_id,
+        service,
+        cluster_id,
+        event_type,
+        merged_box_id=None,
+        source_service=None,
+        source_stage=None,
+        data=None,
+        commit=False,
+    ):
+        """Append one postprocessing event row. Best-effort and mutation-free."""
+        if not cluster_id:
+            return
+
+        try:
+            cursor = self.db_conn.cursor()
+            if not getattr(self.db_conn, "autocommit", False):
+                cursor.execute("SAVEPOINT before_postprocessing_event")
+            cursor.execute(
+                """
+                INSERT INTO postprocessing_events (
+                    image_id, merged_box_id, service, cluster_id,
+                    event_type, source_service, source_stage, data
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    image_id,
+                    merged_box_id,
+                    service,
+                    cluster_id,
+                    event_type,
+                    source_service,
+                    source_stage,
+                    json.dumps(data) if data is not None else None,
+                ),
+            )
+            if getattr(self.db_conn, "autocommit", False) or commit:
+                self.db_conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.logger.warning(
+                f"Failed to record postprocessing_event for {service}/{image_id}/{cluster_id}: {e}"
+            )
+            try:
+                if getattr(self.db_conn, "autocommit", False):
+                    self.db_conn.rollback()
+                else:
+                    rollback_cursor = self.db_conn.cursor()
+                    rollback_cursor.execute("ROLLBACK TO SAVEPOINT before_postprocessing_event")
+                    rollback_cursor.close()
+            except Exception:
+                pass
+
+    def _record_service_event(
+        self,
+        image_id,
+        service,
+        event_type,
+        source_service=None,
+        source_stage=None,
+        data=None,
+        commit=False,
+    ):
+        """Append one image-level service event row. Best-effort and mutation-free."""
+        try:
+            cursor = self.db_conn.cursor()
+            if not getattr(self.db_conn, "autocommit", False):
+                cursor.execute("SAVEPOINT before_service_event")
+            cursor.execute(
+                """
+                INSERT INTO service_events (
+                    image_id, service, event_type, source_service, source_stage, data
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    image_id,
+                    service,
+                    event_type,
+                    source_service,
+                    source_stage,
+                    json.dumps(data) if data is not None else None,
+                ),
+            )
+            if getattr(self.db_conn, "autocommit", False) or commit:
+                self.db_conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.logger.warning(
+                f"Failed to record service_event for {service}/{image_id}: {e}"
+            )
+            try:
+                if getattr(self.db_conn, "autocommit", False):
+                    self.db_conn.rollback()
+                else:
+                    rollback_cursor = self.db_conn.cursor()
+                    rollback_cursor.execute("ROLLBACK TO SAVEPOINT before_service_event")
+                    rollback_cursor.close()
+            except Exception:
+                pass
+
+    def _store_terminal_service_result(
+        self,
+        image_id,
+        payload,
+        status='success',
+        processing_time=None,
+        service=None,
+        source_trace_id=None,
+    ):
+        """Persist a terminal JSON result row for this service.
+
+        Used by internal/system workers that previously treated terminal
+        no-data or non-ideal outcomes as absence instead of as a real result.
+        """
+        service = service or self._get_clean_service_name()
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO results (
+                    image_id, service, source_trace_id, data, status, worker_id, processing_time
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    image_id,
+                    service,
+                    source_trace_id,
+                    json.dumps(payload),
+                    status,
+                    self.worker_id,
+                    processing_time,
+                ),
+            )
+            self.db_conn.commit()
+            cursor.close()
+            return True
+        except Exception as e:
+            self.logger.error(
+                f"Failed to store terminal result for {service}/{image_id}: {e}"
+            )
+            try:
+                self.db_conn.rollback()
+            except Exception:
+                pass
+            return False
 
     def _handle_sigterm(self, signum, frame):
         """Convert SIGTERM to KeyboardInterrupt so workers can clean up on windmill.sh stop."""
@@ -901,13 +1372,27 @@ class BaseWorker:
 
             # Call ML service
             result = self.post_image_data(message['image_data'])
+            if not isinstance(result, dict):
+                self.logger.error(
+                    f"{self.service_name} returned no terminal JSON result for image {image_id}"
+                )
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
+                self.job_failed("No terminal JSON result")
+                return
+
+            result_status = result.get('status', 'success') or 'success'
+            failed_reason = (
+                result.get('error_message')
+                or result.get('error')
+                or result.get('message')
+                or ((result.get('metadata') or {}).get('reason'))
+            )
 
             # Store result in database
             processing_time = None
-            if isinstance(result, dict):
-                processing_time = result.get('processing_time') or (
-                    result.get('metadata') or {}
-                ).get('processing_time')
+            processing_time = result.get('processing_time') or (
+                result.get('metadata') or {}
+            ).get('processing_time')
             source_trace_id = trace_id if trace_id else None
             cursor = self.db_conn.cursor()
             cursor.execute("""
@@ -928,21 +1413,25 @@ class BaseWorker:
                     WHERE %s IS NOT NULL
                       AND NOT EXISTS (SELECT 1 FROM upserted)
                 )
-                UPDATE service_dispatch SET status = 'complete'
-                WHERE image_id = (SELECT image_id FROM touched LIMIT 1)
-                  AND service = %s
-                  AND cluster_id IS NULL
-                  AND status = 'pending'
+                UPDATE service_dispatch
+                   SET status = %s,
+                       failed_reason = %s
+                 WHERE image_id = (SELECT image_id FROM touched LIMIT 1)
+                   AND service = %s
+                   AND cluster_id IS NULL
+                   AND status = 'pending'
             """, (
                 image_id,
                 self._get_clean_service_name(),
                 source_trace_id,
                 json.dumps(result),
-                'success',
+                result_status,
                 self.worker_id,
                 processing_time,
                 image_id,
                 source_trace_id,
+                'complete' if result_status == 'success' else 'failed',
+                None if result_status == 'success' else failed_reason,
                 self._get_clean_service_name(),
             ))
             self.db_conn.commit()  # CRITICAL: Commit the transaction!
@@ -950,8 +1439,18 @@ class BaseWorker:
 
             if trace_id:
                 self.logger.info(
-                    f"[{trace_id}] stored {self.service_name} result for image {image_id}"
+                    f"[{trace_id}] stored {self.service_name} result for image {image_id} "
+                    f"(status={result_status})"
                 )
+
+            if result_status != 'success':
+                self._safe_ack(ch, method.delivery_tag)
+                self.job_completed_successfully()
+                self.logger.warning(
+                    f"{self.service_name} returned terminal non-success for image {image_id}: "
+                    f"{failed_reason or 'no reason provided'}"
+                )
+                return
 
             # In-place extrapolation hook: subclasses derive additional data
             # from the same result without a separate queue/worker
@@ -959,32 +1458,19 @@ class BaseWorker:
 
             tier = message.get('tier', 'free')
             downstream_messages = []
+            postprocessing_messages = self._build_postprocessing_messages(
+                image_id=image_id,
+                message=message,
+                result=result,
+                tier=tier,
+                trace_id=trace_id,
+            )
 
-            # Trigger post-processing for bbox services.
-            # Harmony is only useful when multiple spatial services can contribute results.
-            # For free tier (single spatial service), skip harmony entirely.
-            if self.service_name in self.bbox_services and self.enable_triggers \
-                    and self.config.is_available_for_tier('system.harmony', tier):
-                bbox_message = {
-                    'image_id': image_id,
-                    'image_filename': message.get('image_filename', f'image_{image_id}'),
-                    'image_data': message['image_data'],
-                    'trace_id': trace_id,
-                    'service': self.service_name,
-                    'worker_id': self.worker_id,
-                    'processed_at': datetime.now().isoformat(),
-                    'tier': tier,
-                }
-
-                downstream_messages.append((
-                    self._get_queue_by_service_type('harmonization'),
-                    json.dumps(bbox_message)
-                ))
-
-                self.logger.debug("Prepared bbox completion for harmonization")
+            if postprocessing_messages:
+                downstream_messages.extend(postprocessing_messages)
                 if trace_id:
                     self.logger.info(
-                        f"[{trace_id}] publishing harmony trigger from {self.service_name} for image {image_id}"
+                        f"[{trace_id}] queueing direct postprocessing from {self.service_name} for image {image_id}"
                     )
 
             if self.enable_noun_consensus:
@@ -1031,10 +1517,11 @@ class BaseWorker:
                 ))
 
             publish_started_at = time.time()
-            self._publish_messages_sync_confirm(downstream_messages)
+            for routing_key, body in downstream_messages:
+                self._enqueue_publish(routing_key, body)
             if trace_id and downstream_messages:
                 self.logger.info(
-                    f"[{trace_id}] published {len(downstream_messages)} downstream message(s) "
+                    f"[{trace_id}] queued {len(downstream_messages)} downstream message(s) "
                     f"from {self.service_name} for image {image_id} in {time.time() - publish_started_at:.3f}s"
                 )
 
@@ -1092,7 +1579,7 @@ class BaseWorker:
         # Start background publish thread
         self._running = True
         self._publish_thread = threading.Thread(
-            target=self._publish_loop,
+            target=self._start_async_publisher,
             daemon=True,
             name=f"{self.service_name}_publish"
         )
@@ -1121,11 +1608,18 @@ class BaseWorker:
                     self.connection.close()
                 except Exception:
                     pass
+                if self._publish_connection:
+                    try:
+                        self._publish_connection.ioloop.add_callback_threadsafe(
+                            self._publish_connection.ioloop.stop
+                        )
+                    except Exception:
+                        pass
                 if self._publish_thread and self._publish_thread.is_alive():
-                    self.logger.info("Waiting for publish thread to drain...")
+                    self.logger.info("Waiting for async publisher thread to stop...")
                     self._publish_thread.join(timeout=10)
                     if self._publish_thread.is_alive():
-                        self.logger.warning("Publish thread did not stop within timeout")
+                        self.logger.warning("Async publisher thread did not stop within timeout")
                 self._stop_registry()
                 break
             except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,

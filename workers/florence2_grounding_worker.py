@@ -20,6 +20,7 @@ import os
 import sys
 import time
 import requests
+from datetime import datetime
 from PIL import Image
 
 sys.path.append(os.path.dirname(__file__))
@@ -37,8 +38,30 @@ class Florence2GroundingWorker(BaseWorker):
         self._colors_post_queue = self._get_queue_name('postprocessing.colors_post')
 
     def _declare_additional_queues(self, declare_with_dlq):
-        """Declare colors_post queue on the publish channel — we are the trigger."""
+        """Declare colors_post queue on the publish channel."""
         declare_with_dlq(self._publish_channel, self._colors_post_queue)
+
+    def _crop_bbox_from_image_data(self, image_data_b64: str, bbox: dict):
+        try:
+            image_bytes = base64.b64decode(image_data_b64)
+            img = Image.open(io.BytesIO(image_bytes))
+            with img:
+                crop_box = (
+                    bbox['x'],
+                    bbox['y'],
+                    bbox['x'] + bbox['width'],
+                    bbox['y'] + bbox['height'],
+                )
+                cropped_img = img.crop(crop_box)
+                if cropped_img.mode not in ('RGB', 'L'):
+                    cropped_img = cropped_img.convert('RGB')
+                img_buffer = io.BytesIO()
+                cropped_img.save(img_buffer, format='JPEG', quality=90)
+                img_buffer.seek(0)
+                return base64.b64encode(img_buffer.getvalue()).decode('latin-1')
+        except Exception as e:
+            self.logger.error(f"florence2_grounding: crop failed: {e}")
+            return None
 
     def process_message(self, ch, method, properties, body):
         start_time = time.time()
@@ -53,7 +76,6 @@ class Florence2GroundingWorker(BaseWorker):
             image_id = message['image_id']
             image_data = message.get('image_data')
             tier = message.get('tier', 'free')
-            dispatch_id = message.get('dispatch_id')
 
             if not image_data:
                 self.logger.error(
@@ -75,18 +97,51 @@ class Florence2GroundingWorker(BaseWorker):
                 self.logger.info(
                     f"florence2_grounding: no consensus nouns for image {image_id}, skipping"
                 )
-                self._update_service_dispatch(image_id, dispatch_id=dispatch_id)
+                self._record_service_event(
+                    image_id=image_id,
+                    service='florence2_grounding',
+                    event_type='completed',
+                    source_service='noun_consensus',
+                    source_stage='grounding_run',
+                    data={'reason': 'No consensus nouns available at processing time'},
+                    commit=True,
+                )
                 self._safe_ack(ch, method.delivery_tag)
                 return
 
             # Dedup: skip if already grounded with this exact noun set
-            previous_nouns = self._fetch_previous_nouns(image_id)
+            previous_result = self._fetch_previous_grounding_result(image_id)
+            previous_nouns = previous_result['nouns']
             if set(nouns) == previous_nouns:
                 self.logger.info(
                     f"florence2_grounding: image {image_id} already grounded "
-                    f"with same {len(nouns)} nouns, skipping"
+                    f"with same {len(nouns)} nouns, skipping model run"
                 )
-                self._update_service_dispatch(image_id, dispatch_id=dispatch_id)
+                previous_predictions = previous_result['predictions']
+                if previous_predictions:
+                    self._dispatch_colors_post(
+                        image_id,
+                        image_data,
+                        previous_predictions,
+                        tier,
+                        message.get('trace_id'),
+                    )
+                    self.logger.info(
+                        f"florence2_grounding: image {image_id} reused "
+                        f"{len(previous_predictions)} stored grounding prediction(s) for dispatch"
+                    )
+                self._record_service_event(
+                    image_id=image_id,
+                    service='florence2_grounding',
+                    event_type='completed',
+                    source_service='noun_consensus',
+                    source_stage='grounding_reuse',
+                    data={
+                        'reused_previous_result': True,
+                        'prediction_count': len(previous_predictions),
+                    },
+                    commit=True,
+                )
                 self._safe_ack(ch, method.delivery_tag)
                 return
 
@@ -102,7 +157,30 @@ class Florence2GroundingWorker(BaseWorker):
                 self.job_failed("Florence-2 grounding call failed")
                 return
 
+            result_status = result.get('status', 'success') if isinstance(result, dict) else 'success'
+
             processing_time = round(time.time() - start_time, 3)
+
+            if result_status != 'success':
+                self._store_result(image_id, result, processing_time)
+                self._record_service_event(
+                    image_id=image_id,
+                    service='florence2_grounding',
+                    event_type='failed',
+                    source_service='noun_consensus',
+                    source_stage='grounding_run',
+                    data={
+                        'error_message': result.get('error') or result.get('message'),
+                    },
+                    commit=True,
+                )
+                self._safe_ack(ch, method.delivery_tag)
+                self.job_completed_successfully()
+                self.logger.warning(
+                    f"florence2_grounding: image {image_id} returned terminal non-success: "
+                    f"{result.get('error') or result.get('message') or 'no reason provided'}"
+                )
+                return
 
             # Embed the noun set in metadata so dedup can read it back next trigger.
             # Also record the colors_post dispatch count so the API can gate
@@ -135,11 +213,11 @@ class Florence2GroundingWorker(BaseWorker):
             result['metadata']['colors_post_dispatched'] = colors_post_count
 
             self._store_result(image_id, result, processing_time)
-            self._dispatch_colors_post(image_id, image_data, predictions, tier)
+            self._dispatch_colors_post(image_id, image_data, predictions, tier, message.get('trace_id'))
 
             # Mark nouns that were successfully grounded back in noun_consensus.
-            # Must happen before _update_service_dispatch so the grounding_validated
-            # backfill is committed before the NOTIFY fires and the SSE reads results.
+            # Must happen before ACK so the grounding_validated backfill is
+            # committed before the NOTIFY fires and the SSE reads results.
             grounded_labels = [
                 p['label'].lower().strip()
                 for p in result.get('predictions', [])
@@ -148,7 +226,18 @@ class Florence2GroundingWorker(BaseWorker):
             if grounded_labels:
                 self._validate_noun_consensus(image_id, nouns, grounded_labels)
 
-            self._update_service_dispatch(image_id, dispatch_id=dispatch_id)
+            self._record_service_event(
+                image_id=image_id,
+                service='florence2_grounding',
+                event_type='completed',
+                source_service='noun_consensus',
+                source_stage='grounding_run',
+                data={
+                    'prediction_count': len(result.get('predictions', [])),
+                    'nouns_queried': nouns,
+                },
+                commit=True,
+            )
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
 
@@ -214,16 +303,16 @@ class Florence2GroundingWorker(BaseWorker):
             )
             return []
 
-    def _fetch_previous_nouns(self, image_id: int) -> set:
-        """Return the noun set from the most recent grounding result for this image.
+    def _fetch_previous_grounding_result(self, image_id: int) -> dict:
+        """Return noun set and predictions from the most recent grounding result.
 
-        Returns an empty set if no prior result exists.
+        Returns {'nouns': set(), 'predictions': []} if no prior result exists.
         """
         try:
             cursor = self.db_conn.cursor()
             cursor.execute(
                 """
-                SELECT data->'metadata'->>'nouns_queried'
+                SELECT data->'metadata'->>'nouns_queried', data->'predictions'
                 FROM results
                 WHERE image_id = %s AND service = 'florence2_grounding'
                 ORDER BY result_created DESC
@@ -234,13 +323,17 @@ class Florence2GroundingWorker(BaseWorker):
             row = cursor.fetchone()
             cursor.close()
             if not row or not row[0]:
-                return set()
-            return set(json.loads(row[0]))
+                return {'nouns': set(), 'predictions': []}
+            predictions = row[1] if len(row) > 1 and row[1] else []
+            return {
+                'nouns': set(json.loads(row[0])),
+                'predictions': predictions,
+            }
         except Exception as e:
             self.logger.warning(
-                f"florence2_grounding: could not fetch previous nouns for image {image_id}: {e}"
+                f"florence2_grounding: could not fetch previous grounding result for image {image_id}: {e}"
             )
-            return set()
+            return {'nouns': set(), 'predictions': []}
 
     def _call_florence2_grounding(self, image_data_b64: str, prompt: str):
         """POST image + prompt to Florence-2 CAPTION_TO_PHRASE_GROUNDING."""
@@ -254,17 +347,11 @@ class Florence2GroundingWorker(BaseWorker):
                 files=files,
                 timeout=self.request_timeout,
             )
-            resp.raise_for_status()
-            payload = resp.json()
-            if payload.get('status') != 'success':
-                self.logger.error(
-                    f"florence2_grounding: service returned non-success: "
-                    f"{payload.get('error')}"
-                )
-                return None
-            return payload
-        except Exception as e:
-            self.logger.error(f"florence2_grounding: REST call failed: {e}")
+            return self._coerce_terminal_http_response(resp)
+        except requests.RequestException as e:
+            if getattr(e, 'response', None) is not None:
+                return self._coerce_terminal_http_response(e.response)
+            self.logger.error(f"florence2_grounding: REST call failed before terminal response: {e}")
             return None
 
     def _store_result(self, image_id: int, data: dict, processing_time: float):
@@ -281,7 +368,7 @@ class Florence2GroundingWorker(BaseWorker):
                     image_id,
                     self._get_clean_service_name(),
                     json.dumps(data),
-                    'success',
+                    data.get('status', 'success') or 'success',
                     self.worker_id,
                     processing_time,
                 ),
@@ -347,31 +434,14 @@ class Florence2GroundingWorker(BaseWorker):
             )
 
 
-    def _dispatch_colors_post(self, image_id: int, image_data_b64: str, predictions: list, tier: str = 'free'):
-        """Crop each grounded bbox and dispatch to colors_post queue.
-
-        Each prediction becomes one colors_post job. merged_box_id is NULL since
-        florence2_grounding boxes do not go through harmony — the postprocessing
-        table allows this.
-        """
+    def _dispatch_colors_post(self, image_id: int, image_data_b64: str, predictions: list, tier: str = 'free', trace_id: str = None):
+        """Send direct colors_post jobs."""
         if not predictions:
             return
 
-        try:
-            image_bytes = base64.b64decode(image_data_b64)
-            img = Image.open(io.BytesIO(image_bytes))
-            if img.mode not in ('RGB', 'L'):
-                img = img.convert('RGB')
-            img_width, img_height = img.size
-        except Exception as e:
-            self.logger.warning(
-                f"florence2_grounding: could not open image for colors dispatch "
-                f"(image {image_id}): {e}"
-            )
-            return
-
         dispatched = 0
-        for pred in predictions:
+        skipped_existing = 0
+        for index, pred in enumerate(predictions):
             bbox_arr = pred.get('bbox')
             label = pred.get('label', 'unknown')
             if not bbox_arr or len(bbox_arr) < 4:
@@ -382,30 +452,38 @@ class Florence2GroundingWorker(BaseWorker):
             if w < MIN_COLORS_SIZE[0] or h < MIN_COLORS_SIZE[1]:
                 continue
 
-            try:
-                x1 = max(0, int(x))
-                y1 = max(0, int(y))
-                x2 = min(img_width, int(x + w))
-                y2 = min(img_height, int(y + h))
-                cropped = img.crop((x1, y1, x2, y2))
-                buf = io.BytesIO()
-                cropped.save(buf, format='JPEG', quality=90)
-                buf.seek(0)
-                cropped_b64 = base64.b64encode(buf.getvalue()).decode('latin-1')
-            except Exception as e:
-                self.logger.warning(
-                    f"florence2_grounding: crop failed for '{label}' "
-                    f"(image {image_id}): {e}"
-                )
+            cluster_id = f"grounding_{label}_{index}"
+            if self._has_active_or_completed_colors_dispatch(image_id, cluster_id):
+                skipped_existing += 1
                 continue
 
+            bbox = {'x': x, 'y': y, 'width': w, 'height': h}
+            cropped_image_data = self._crop_bbox_from_image_data(image_data_b64, bbox)
+            if not cropped_image_data:
+                continue
+
+            self._record_postprocessing_event(
+                image_id=image_id,
+                merged_box_id=None,
+                service='colors_post',
+                cluster_id=cluster_id,
+                event_type='enqueued',
+                source_service='florence2_grounding',
+                source_stage='grounding_complete',
+                data={'bbox': bbox, 'label': label},
+            )
             message = {
                 'merged_box_id': None,
                 'image_id': image_id,
-                'cluster_id': f'grounding_{label}',
-                'bbox': {'x': x, 'y': y, 'width': w, 'height': h},
-                'cropped_image_data': cropped_b64,
+                'cluster_id': cluster_id,
+                'bbox': bbox,
+                'cropped_image_data': cropped_image_data,
+                'trace_id': trace_id,
                 'tier': tier,
+                'source_service': 'florence2_grounding',
+                'source_stage': 'grounding_complete',
+                'dispatch_enqueued_at': datetime.now().isoformat(),
+                'metadata': {'label': label},
             }
             self._enqueue_publish(self._colors_post_queue, json.dumps(message))
             dispatched += 1
@@ -415,6 +493,39 @@ class Florence2GroundingWorker(BaseWorker):
                 f"florence2_grounding: dispatched {dispatched} colors_post jobs "
                 f"for image {image_id}"
             )
+        elif skipped_existing:
+            self.logger.info(
+                f"florence2_grounding: skipped {skipped_existing} duplicate colors_post job(s) "
+                f"for image {image_id}"
+            )
+
+    def _has_active_or_completed_colors_dispatch(self, image_id: int, cluster_id: str) -> bool:
+        """Return True when colors_post for this image/cluster is already live or settled."""
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                SELECT event_type
+                FROM postprocessing_events
+                WHERE image_id = %s
+                  AND service = 'colors_post'
+                  AND cluster_id = %s
+                ORDER BY event_id DESC
+                LIMIT 1
+                """,
+                (image_id, cluster_id),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            if not row:
+                return False
+            return row[0] in ('enqueued', 'completed')
+        except Exception as e:
+            self.logger.warning(
+                f"florence2_grounding: duplicate colors_post check failed for "
+                f"image {image_id} cluster {cluster_id}: {e}"
+            )
+            return False
 
 
 if __name__ == '__main__':

@@ -24,7 +24,7 @@ class BboxFaceWorker(PostProcessingWorker):
         re-trigger content_analysis so the face+NudeNet face correlation runs
         with actual face service detections available."""
         try:
-            message = json.loads(body.decode('utf-8'))
+            message = self._parse_message_body(body)
             self.current_bbox = message.get('bbox', {})
             image_id = message.get('image_id')
             tier = message.get('tier', 'free')
@@ -37,7 +37,7 @@ class BboxFaceWorker(PostProcessingWorker):
             # consensus) before face worker completes, so face_service_detections
             # would be empty on that first pass.  This second trigger ensures
             # correlate_faces() has real data to work with.
-            if image_id:
+            if image_id and result:
                 self._trigger_content_analysis(image_id, tier)
 
             return result
@@ -86,15 +86,10 @@ class BboxFaceWorker(PostProcessingWorker):
                 timeout=self.request_timeout
             )
             
-            if response.status_code == 200:
-                face_data = response.json()
-                if face_data.get('status') == 'success' and face_data.get('predictions') and len(face_data.get('predictions', [])) > 0:
-                    # Transform coordinates from crop-relative to full-image-relative
-                    transformed_data = self.transform_face_coordinates_to_full_image(face_data)
-                    return transformed_data
-            
-            self.logger.warning(f"Face service returned status {response.status_code}: {response.text[:200]}")
-            return None
+            face_data = self._coerce_terminal_http_response(response)
+            if face_data.get('status') == 'success' and face_data.get('predictions'):
+                return self.transform_face_coordinates_to_full_image(face_data)
+            return face_data
             
         except Exception as e:
             self.logger.error(f"Error processing face detection: {e}")

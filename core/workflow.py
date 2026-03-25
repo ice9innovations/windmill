@@ -7,6 +7,10 @@ map. It is intentionally defined in Python rather than operator configuration.
 
 WORKFLOW_VERSION = 1
 
+# `tier_allows:<service>` predicates use the full service identifier from
+# service_config.yaml, e.g. `system.caption_summary`. That is a service name,
+# not a separate customer tier namespace.
+
 PREDICATE_DESCRIPTIONS = {
     'has_consensus_service': 'At least one submitted primary service has consensus=true.',
     'has_spatial_primary': 'At least one submitted primary service is spatial.',
@@ -17,28 +21,13 @@ PREDICATE_DESCRIPTIONS = {
 }
 
 WORKFLOW_STAGES = {
-    'harmony': {
-        'kind': 'system',
-        'expected_when': ['has_spatial_primary', 'tier_allows:system.harmony'],
-        'triggered_by': [
-            {
-                'source': 'primary.spatial',
-                'worker': 'workers/base_worker.py',
-            }
-        ],
-    },
     'consensus': {
         'kind': 'system',
-        'expected_when': ['has_consensus_service', 'tier_allows:system.harmony'],
+        'expected_when': ['has_consensus_service'],
         'triggered_by': [
             {
                 'source': 'primary.consensus_eligible',
                 'worker': 'workers/base_worker.py',
-            },
-            {
-                'source': 'system.harmony',
-                'worker': 'workers/harmony_worker.py',
-                'note': 'harmony retriggers consensus after merged_boxes update',
             },
         ],
     },

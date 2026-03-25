@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'workers'))
 sys.path.insert(0, os.path.dirname(__file__))
 from service_config import get_service_config
 from core.image import validate_and_normalize_image
-from core.dispatch import resolve_services, compute_expected_downstream
+from core.dispatch import resolve_services
 from core.results import fetch_results
 from core.workflow import get_workflow_definition
 
@@ -238,46 +238,51 @@ def analyze():
 
     service_names = resolve_services(tier, config)
 
-    # Register image metadata — bytes are never stored anywhere
+    # Register image metadata and authoritative primary dispatch rows together.
     try:
-        db  = get_db()
-        cur = db.cursor()
-        cur.execute(
-            """INSERT INTO images (
-                   image_filename,
-                   image_group,
-                   services_submitted,
-                   tier,
-                   original_image_width,
-                   original_image_height,
-                   normalized_image_width,
-                   normalized_image_height
-               )
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-               RETURNING image_id""",
-            (
-                image_filename,
-                image_group,
-                service_names,
-                tier,
-                original_width,
-                original_height,
-                normalized_width,
-                normalized_height,
-            ),
-        )
-        image_id = cur.fetchone()[0]
-        # Record pending dispatch for all primary services — best-effort tracking.
-        # Failures here must never abort image submission.
+        db = get_db()
+        previous_autocommit = db.autocommit
+        db.autocommit = False
         try:
+            cur = db.cursor()
+            cur.execute(
+                """INSERT INTO images (
+                       image_filename,
+                       image_group,
+                       services_submitted,
+                       tier,
+                       original_image_width,
+                       original_image_height,
+                       normalized_image_width,
+                       normalized_image_height
+                   )
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                   RETURNING image_id""",
+                (
+                    image_filename,
+                    image_group,
+                    service_names,
+                    tier,
+                    original_width,
+                    original_height,
+                    normalized_width,
+                    normalized_height,
+                ),
+            )
+            image_id = cur.fetchone()[0]
             cur.execute(
                 "INSERT INTO service_dispatch (image_id, service) SELECT %s, unnest(%s::text[])",
                 (image_id, service_names),
             )
-        except Exception as e:
-            app.logger.warning("Failed to record service_dispatch entries: %s", e)
+            db.commit()
+            cur.close()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.autocommit = previous_autocommit
     except Exception as e:
-        app.logger.error("Database insert failed: %s", e)
+        app.logger.error("Submission registration failed: %s", e)
         return jsonify({"error": "Failed to register image in database"}), 500
 
     # Publish to queues
@@ -383,41 +388,105 @@ def status(image_id):
         vlm_services = [s for s in services_submitted if s in vlm_short_names]
 
         primary_complete     = done == total and total > 0
-        expected_downstream  = compute_expected_downstream(services_submitted, config, tier)
         # Aggregate results (consensus, noun_consensus, etc.) live in
         # service_results after the fetch_results reshape — check both locations.
         _sr = results_data.get('service_results', {})
-
-        # Mirror ice9-api's settled/dispatch_pending_services pattern.
-        # A service is settled when it has a terminal cluster_id=NULL dispatch row,
-        # unless it also has a pending cluster_id=NULL row (multi-dispatch services).
         _terminal = {'complete', 'failed', 'dead-lettered'}
-        _sd = results_data.get('service_dispatch', [])
-        _services_with_pending = {
-            r['service'] for r in _sd
-            if r.get('cluster_id') is None and r.get('status') == 'pending'
-        }
-        settled = ({
-            r['service'] for r in _sd
-            if r.get('cluster_id') is None and r.get('status') in _terminal
-        } | set(completed.keys())) - _services_with_pending
-
         _failed_states = {'failed', 'dead-lettered'}
-        _sd_failed = {
-            r['service'] for r in _sd
-            if r.get('cluster_id') is None and r.get('status') in _failed_states
-        } - _services_with_pending
-
-        downstream_failed  = [
-            svc for svc, expected in expected_downstream.items()
-            if expected and _sr.get(svc) is None and svc in _sd_failed
+        _sd = results_data.get('service_dispatch', [])
+        _current_sd = results_data.get('current_service_dispatch', [])
+        _current_pp = results_data.get('current_postprocessing_events', [])
+        _current_se = results_data.get('current_service_events', [])
+        dispatches_pending = [
+            row for row in _sd
+            if row.get('status') == 'pending'
         ]
-        downstream_pending = [
-            svc for svc, expected in expected_downstream.items()
-            if expected and _sr.get(svc) is None and svc not in settled
+        dispatches_terminal = [
+            row for row in _sd
+            if row.get('status') in _terminal
+        ]
+        dispatches_failed = [
+            row for row in _sd
+            if row.get('status') in _failed_states
         ]
 
-        is_complete = primary_complete and len(downstream_pending) == 0
+        result_failed = {
+            service: data.get('data', {}).get('error_message')
+            or data.get('data', {}).get('error')
+            or data.get('data', {}).get('message')
+            for service, data in _sr.items()
+            if (data.get('status') or 'success') != 'success'
+        }
+        submitted_result_services = {
+            service for service in _sr.keys()
+            if service in services_submitted
+        }
+        services_pending = sorted({
+            service for service in services_submitted
+            if service not in submitted_result_services
+        } | {
+            row.get('service') for row in _current_sd
+            if row.get('service') in services_submitted and row.get('status') == 'pending'
+        })
+        services_failed = {
+            **{
+                service: reason
+                for service, reason in result_failed.items()
+                if service in services_submitted
+            },
+            **{
+                row.get('service'): row.get('failed_reason')
+                for row in _current_sd
+                if row.get('service') in services_submitted and row.get('status') in _failed_states
+            },
+        }
+        downstream_pending = sorted({
+            row.get('service') for row in _current_sd
+            if row.get('service') not in services_submitted and row.get('status') == 'pending'
+        } | {
+            row.get('service') for row in _current_se
+            if row.get('event_type') == 'enqueued'
+        } | {
+            row.get('service') for row in _current_pp
+            if row.get('event_type') == 'enqueued'
+        })
+        downstream_failed = sorted({
+            service for service in _sr.keys()
+            if service not in services_submitted and (_sr.get(service, {}).get('status') or 'success') != 'success'
+        } | {
+            row.get('service') for row in _current_sd
+            if row.get('service') not in services_submitted and row.get('status') in _failed_states
+        } | {
+            row.get('service') for row in _current_se
+            if row.get('event_type') == 'failed'
+        } | {
+            row.get('service') for row in _current_pp
+            if row.get('event_type') == 'failed'
+        })
+
+        service_events_pending = [
+            row for row in _current_se
+            if row.get('event_type') == 'enqueued'
+        ]
+        service_events_failed = [
+            row for row in _current_se
+            if row.get('event_type') == 'failed'
+        ]
+        postprocessing_pending = [
+            row for row in _current_pp
+            if row.get('event_type') == 'enqueued'
+        ]
+        postprocessing_failed = [
+            row for row in _current_pp
+            if row.get('event_type') == 'failed'
+        ]
+
+        is_complete = (
+            len(_sd) > 0
+            and len(dispatches_pending) == 0
+            and len(service_events_pending) == 0
+            and len(postprocessing_pending) == 0
+        )
 
         return jsonify({
             "image_id":               image_id,
@@ -432,11 +501,22 @@ def status(image_id):
             "vlm_services":           vlm_services,
             "services_completed":     completed,
             "services_pending":       services_pending,
+            "services_failed":        services_failed,
             "progress":               f"{done}/{total}",
             "is_complete":            is_complete,
             "primary_complete":       primary_complete,
             "downstream_pending":     downstream_pending,
             "downstream_failed":      downstream_failed,
+            "dispatches_total":       len(_sd),
+            "dispatches_terminal":    len(dispatches_terminal),
+            "dispatches_pending":     dispatches_pending,
+            "dispatches_failed":      dispatches_failed,
+            "postprocessing_events_total": len(results_data.get('postprocessing_events', [])),
+            "postprocessing_events_pending": postprocessing_pending,
+            "postprocessing_events_failed": postprocessing_failed,
+            "service_events_total": len(results_data.get('service_events', [])),
+            "service_events_pending": service_events_pending,
+            "service_events_failed": service_events_failed,
             "consensus_complete":     _sr.get('consensus') is not None,
             "content_analysis_complete": _sr.get('content_analysis') is not None,
             "noun_consensus_complete":    _sr.get('noun_consensus') is not None,

@@ -61,8 +61,6 @@ class VerbConsensusWorker(BaseWorker):
             image_id = message['image_id']
             triggering_service = message.get('service', 'unknown')
 
-            self._record_service_dispatch(image_id, 'verb_consensus')
-
             self.logger.debug(
                 f"verb_consensus: processing image {image_id} "
                 f"(triggered by {triggering_service})"
@@ -71,10 +69,35 @@ class VerbConsensusWorker(BaseWorker):
             service_verb_map, service_svo_map = self._fetch_vlm_verbs(image_id)
 
             if not service_verb_map:
+                processing_time = round(time.time() - start_time, 3)
+                self._store_terminal_service_result(
+                    image_id,
+                    {
+                        'service': 'verb_consensus',
+                        'status': 'success',
+                        'verbs': [],
+                        'svo_triples': {},
+                        'metadata': {
+                            'no_usable_data': True,
+                            'reason': 'No VLM verb data yet',
+                            'triggered_by': triggering_service,
+                            'processed_at': datetime.now().isoformat(),
+                        },
+                    },
+                    processing_time=processing_time,
+                )
                 self.logger.debug(
                     f"verb_consensus: no VLM verb data yet for image {image_id}, skipping"
                 )
-                self._update_service_dispatch(image_id, service='verb_consensus')
+                self._record_service_event(
+                    image_id=image_id,
+                    service='verb_consensus',
+                    event_type='completed',
+                    source_service=triggering_service,
+                    source_stage='verb_consensus_run',
+                    data={'reason': 'No VLM verb data yet'},
+                    commit=True,
+                )
                 self._safe_ack(ch, method.delivery_tag)
                 self.job_completed_successfully()
                 return
@@ -87,7 +110,30 @@ class VerbConsensusWorker(BaseWorker):
                 processing_time=round(time.time() - start_time, 3),
             )
 
-            self._update_service_dispatch(image_id, service='verb_consensus')
+            self._store_terminal_service_result(
+                image_id,
+                {
+                    'service': 'verb_consensus',
+                    'status': 'success',
+                    'verbs': collapsed,
+                    'svo_triples': service_svo_map,
+                    'services_present': services_present,
+                    'metadata': {
+                        'processed_at': datetime.now().isoformat(),
+                    },
+                },
+                processing_time=round(time.time() - start_time, 3),
+            )
+            self._record_service_event(
+                image_id=image_id,
+                service='verb_consensus',
+                event_type='completed',
+                source_service=triggering_service,
+                source_stage='verb_consensus_run',
+                data={'services_present': services_present},
+                commit=True,
+            )
+
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
 

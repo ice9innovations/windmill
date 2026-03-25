@@ -155,6 +155,22 @@ def _write_dead_lettered(db_conn, image_id, service, reason):
         logger.warning(f"Failed to write dead-lettered for {service}/{image_id}: {e}")
 
 
+def _write_dead_lettered_by_dispatch_id(db_conn, dispatch_id, reason):
+    """Best-effort targeted UPDATE for multi-dispatch downstream rows."""
+    try:
+        cur = db_conn.cursor()
+        cur.execute(
+            """UPDATE service_dispatch
+               SET status = 'dead-lettered', failed_reason = %s
+               WHERE dispatch_id = %s AND status = 'pending'""",
+            (reason, dispatch_id),
+        )
+        cur.close()
+        logger.info(f"Marked dead-lettered dispatch_id={dispatch_id} reason={reason!r}")
+    except Exception as e:
+        logger.warning(f"Failed to write dead-lettered for dispatch_id={dispatch_id}: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Queue helpers
 # ---------------------------------------------------------------------------

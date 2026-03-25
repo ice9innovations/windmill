@@ -114,11 +114,20 @@ class ConsensusWorkerMergeFocused(BaseWorker):
             'triggered_at': datetime.now().isoformat(),
             'tier': tier,
         }
+        self._record_service_event(
+            image_id=image_id,
+            service='content_analysis',
+            event_type='enqueued',
+            source_service='consensus',
+            source_stage='content_analysis_trigger',
+            data={'tier': tier},
+        )
         self._enqueue_publish(
             self._get_queue_name('system.content_analysis'),
             json.dumps(content_analysis_message)
         )
         self.logger.debug(f"Enqueued content_analysis trigger for image {image_id}")
+        return True
 
     def _consensus_is_current(self, image_id):
         """Return True if the stored consensus already incorporates all current results.
@@ -985,7 +994,13 @@ class ConsensusWorkerMergeFocused(BaseWorker):
             t1 = time.time()
             if not service_results:
                 self.logger.debug(f"No results for image {image_id}, skipping")
-                return False
+                return {
+                    'status': 'success',
+                    'consensus_data': None,
+                    'reason': 'No service results available',
+                    'processing_time': round(t1 - t0, 3),
+                    'services_count': 0,
+                }
 
             # Calculate consensus
             consensus_data = self.calculate_consensus(service_results, image_id)
@@ -993,7 +1008,13 @@ class ConsensusWorkerMergeFocused(BaseWorker):
 
             if not consensus_data:
                 self.logger.warning(f"Could not calculate consensus for image {image_id}")
-                return False
+                return {
+                    'status': 'success',
+                    'consensus_data': None,
+                    'reason': 'No usable consensus data',
+                    'processing_time': round(t2 - t1, 3),
+                    'services_count': len(service_results),
+                }
 
             t3 = time.time()
 
@@ -1022,7 +1043,13 @@ class ConsensusWorkerMergeFocused(BaseWorker):
                 f"[fetch={t1-t0:.3f}s calc={t2-t1:.3f}s health={t3-t2:.3f}s write={t4-t3:.3f}s total={t4-t0:.3f}s]"
             )
 
-            return True
+            return {
+                'status': 'success',
+                'consensus_data': consensus_data,
+                'reason': None,
+                'processing_time': round(t4 - t0, 3),
+                'services_count': len(service_results),
+            }
 
         except Exception as e:
             self.logger.error(f"Error updating consensus for image {image_id}: {e}")
@@ -1031,7 +1058,13 @@ class ConsensusWorkerMergeFocused(BaseWorker):
                     self.db_conn.rollback()
             except:
                 pass
-            return False
+            return {
+                'status': 'failed',
+                'consensus_data': None,
+                'reason': str(e),
+                'processing_time': None,
+                'services_count': 0,
+            }
 
     def process_message(self, ch, method, properties, body):
         """Process a message from the consensus queue"""
@@ -1045,23 +1078,60 @@ class ConsensusWorkerMergeFocused(BaseWorker):
             # Skip if consensus is already current (burst of triggers for same image)
             if self._consensus_is_current(image_id):
                 self.logger.debug(f"Skipping redundant consensus for {image_filename} (already current)")
+                self._record_service_event(
+                    image_id=image_id,
+                    service='consensus',
+                    event_type='completed',
+                    source_service=message_data.get('service'),
+                    source_stage='consensus_run',
+                    data={'reason': 'Already current'},
+                    commit=True,
+                )
                 self._safe_ack(ch, method.delivery_tag)
                 return
 
             self.logger.info(f"Processing merge-focused consensus for: {image_filename}")
 
-            # Record that consensus was triggered (after skip check — only track real work)
-            self._record_service_dispatch(image_id, 'consensus')
-
             # Update consensus for this specific image
-            success = self.update_consensus_for_image(image_id, image_filename)
+            consensus_result = self.update_consensus_for_image(image_id, image_filename)
+            result_status = consensus_result.get('status', 'failed')
+            consensus_data = consensus_result.get('consensus_data')
+            reason = consensus_result.get('reason')
+            processing_time = consensus_result.get('processing_time')
 
-            if success:
+            if result_status == 'success':
+                self._store_terminal_service_result(
+                    image_id,
+                    {
+                        'service': 'consensus',
+                        'status': 'success',
+                        'consensus_data': consensus_data,
+                        'metadata': {
+                            'no_usable_data': consensus_data is None,
+                            'reason': reason,
+                            'services_count': consensus_result.get('services_count', 0),
+                        },
+                    },
+                    processing_time=processing_time,
+                    service='consensus',
+                )
+                self._record_service_event(
+                    image_id=image_id,
+                    service='consensus',
+                    event_type='completed',
+                    source_service=message_data.get('service'),
+                    source_stage='consensus_run',
+                    data={
+                        'no_usable_data': consensus_data is None,
+                        'reason': reason,
+                    },
+                    commit=True,
+                )
                 self.logger.info(f"Completed merge-focused consensus for {image_filename}")
-                self._update_service_dispatch(image_id, service='consensus')
 
                 # Trigger content analysis after consensus completes (basic+ only)
-                self.trigger_content_analysis(image_id, image_filename, tier)
+                if consensus_data is not None:
+                    self.trigger_content_analysis(image_id, image_filename, tier)
             else:
                 self.logger.error(f"Failed to update merge-focused consensus for {image_filename}")
                 self._safe_nack(ch, method.delivery_tag, requeue=True)

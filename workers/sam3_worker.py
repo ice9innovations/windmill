@@ -67,6 +67,19 @@ class Sam3Worker(BaseWorker):
                 return
 
             if not nouns:
+                self._store_terminal_service_result(
+                    image_id,
+                    {
+                        'service': 'sam3',
+                        'status': 'success',
+                        'results': {},
+                        'metadata': {
+                            'no_usable_data': True,
+                            'reason': 'No nouns to query',
+                        },
+                    },
+                    processing_time=round(time.time() - start_time, 3),
+                )
                 self.logger.info(f"sam3: no nouns to query for image {image_id}, skipping")
                 self._safe_ack(ch, method.delivery_tag)
                 return
@@ -77,6 +90,21 @@ class Sam3Worker(BaseWorker):
             new_nouns = [n for n in nouns if n not in set(existing_nouns)]
 
             if not new_nouns:
+                self._store_terminal_service_result(
+                    image_id,
+                    {
+                        'service': 'sam3',
+                        'status': 'success',
+                        'results': existing_data,
+                        'metadata': {
+                            'no_usable_data': True,
+                            'reason': 'No new nouns to process',
+                            'nouns_queried': nouns,
+                            'existing_nouns': existing_nouns,
+                        },
+                    },
+                    processing_time=round(time.time() - start_time, 3),
+                )
                 self.logger.info(
                     f"sam3: image {image_id} already processed with same nouns, skipping"
                 )
@@ -90,11 +118,26 @@ class Sam3Worker(BaseWorker):
             )
 
             # Call SAM3 only for the new nouns
-            new_results = self._call_sam3(image_data, new_nouns)
-            if new_results is None:
+            sam3_response = self._call_sam3(image_data, new_nouns)
+            if sam3_response is None:
                 self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("SAM3 REST call failed")
                 return
+            if sam3_response.get('status', 'success') != 'success':
+                self._store_terminal_service_result(
+                    image_id,
+                    sam3_response,
+                    status=sam3_response.get('status', 'failed') or 'failed',
+                    processing_time=round(time.time() - start_time, 3),
+                )
+                self._safe_ack(ch, method.delivery_tag)
+                self.job_completed_successfully()
+                self.logger.warning(
+                    f"sam3: image {image_id} returned terminal non-success: "
+                    f"{sam3_response.get('error_message') or sam3_response.get('error') or sam3_response.get('message') or 'no reason provided'}"
+                )
+                return
+            new_results = sam3_response.get('results', {})
 
             # Merge with existing noun results. Strip underscore keys from the
             # existing data — _subject and _background will be recomputed below
@@ -124,7 +167,12 @@ class Sam3Worker(BaseWorker):
                 elif subject_noun not in results:
                     # Subject noun wasn't queried in the main call — try a focused call.
                     # (e.g. "person" voted when only "woman" was in noun consensus)
-                    subject_result = self._call_sam3(image_data, [subject_noun])
+                    subject_response = self._call_sam3(image_data, [subject_noun])
+                    subject_result = (
+                        subject_response.get('results', {})
+                        if isinstance(subject_response, dict) and subject_response.get('status', 'success') == 'success'
+                        else {}
+                    )
                     if subject_result and subject_result.get(subject_noun, {}).get('instances'):
                         instances = subject_result[subject_noun]['instances']
                         results['_subject'] = {'instances': instances, 'noun': subject_noun}
@@ -163,6 +211,19 @@ class Sam3Worker(BaseWorker):
 
             # Store full merged results
             self._upsert_sam3_results(image_id, all_nouns, results, processing_time)
+            self._store_terminal_service_result(
+                image_id,
+                {
+                    'service': 'sam3',
+                    'status': 'success',
+                    'results': results,
+                    'nouns_queried': all_nouns,
+                    'metadata': {
+                        'processed_at': time.time(),
+                    },
+                },
+                processing_time=processing_time,
+            )
 
             # Mark all pending SAM3 dispatch records complete for this image
             self._update_service_dispatch(image_id)
@@ -194,7 +255,7 @@ class Sam3Worker(BaseWorker):
             self.job_failed(str(e))
 
     def _call_sam3(self, image_data_b64: str, nouns: list):
-        """POST image + nouns to SAM3 REST service, return results dict."""
+        """POST image + nouns to SAM3 REST service, return a terminal payload."""
         try:
             image_bytes = base64.b64decode(image_data_b64)
             prepared_bytes, scale, orig_w, orig_h = self._prepare_image(image_bytes)
@@ -205,18 +266,17 @@ class Sam3Worker(BaseWorker):
             resp = requests.post(
                 SAM3_ENDPOINT, files=files, data=data, timeout=SAM3_TIMEOUT
             )
-            resp.raise_for_status()
-            payload = resp.json()
-
-            if payload.get('status') != 'success':
-                self.logger.error(f"sam3: REST returned non-success: {payload.get('error')}")
-                return None
-
+            payload = self._coerce_terminal_http_response(resp, service='sam3')
+            if payload.get('status', 'success') != 'success':
+                return payload
             results = payload.get('results', {})
-            return self._scale_results(results, scale, orig_w, orig_h)
+            payload['results'] = self._scale_results(results, scale, orig_w, orig_h)
+            return payload
 
-        except Exception as e:
-            self.logger.error(f"sam3: REST call failed: {e}")
+        except requests.RequestException as e:
+            if getattr(e, 'response', None) is not None:
+                return self._coerce_terminal_http_response(e.response, service='sam3')
+            self.logger.error(f"sam3: REST call failed before terminal response: {e}")
             return None
 
     def _prepare_image(self, image_bytes: bytes):

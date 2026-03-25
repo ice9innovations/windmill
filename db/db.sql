@@ -12,6 +12,8 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 -- Drop existing tables in dependency order (for clean reinstalls ONLY)
 DROP TABLE IF EXISTS content_analysis CASCADE;
+DROP TABLE IF EXISTS service_events CASCADE;
+DROP TABLE IF EXISTS postprocessing_events CASCADE;
 DROP TABLE IF EXISTS postprocessing CASCADE;
 DROP TABLE IF EXISTS sam3_results CASCADE;
 DROP TABLE IF EXISTS rembg_results CASCADE;
@@ -137,6 +139,43 @@ CREATE TABLE postprocessing (
 CREATE INDEX idx_postprocessing_image_service ON postprocessing(image_id, service);
 CREATE INDEX idx_postprocessing_merged_box ON postprocessing(merged_box_id);
 CREATE INDEX idx_postprocessing_created ON postprocessing(result_created);
+
+
+-- Postprocessing events table: append-only child-work intent/settlement breadcrumbs.
+-- This is intentionally observability-first and mutation-free.
+CREATE TABLE postprocessing_events (
+    event_id         BIGSERIAL PRIMARY KEY,
+    image_id         BIGINT NOT NULL REFERENCES images(image_id),
+    merged_box_id    BIGINT REFERENCES merged_boxes(merged_id),
+    service          VARCHAR(255) NOT NULL,
+    cluster_id       TEXT NOT NULL,
+    event_type       VARCHAR(20) NOT NULL,
+    source_service   VARCHAR(255),
+    source_stage     VARCHAR(255),
+    data             JSONB,
+    created_at       TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_postprocessing_events_image_service ON postprocessing_events(image_id, service);
+CREATE INDEX idx_postprocessing_events_image_cluster ON postprocessing_events(image_id, cluster_id);
+CREATE INDEX idx_postprocessing_events_created ON postprocessing_events(created_at);
+
+
+-- Service events table: append-only image-level internal/progressive service breadcrumbs.
+CREATE TABLE service_events (
+    event_id         BIGSERIAL PRIMARY KEY,
+    image_id         BIGINT NOT NULL REFERENCES images(image_id),
+    service          VARCHAR(255) NOT NULL,
+    event_type       VARCHAR(20) NOT NULL,
+    source_service   VARCHAR(255),
+    source_stage     VARCHAR(255),
+    data             JSONB,
+    created_at       TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_service_events_image_service ON service_events(image_id, service);
+CREATE INDEX idx_service_events_created ON service_events(created_at);
+
 
 
 -- Content Analysis table: Semantic-spatial scene understanding (UPSERT per image)
@@ -275,6 +314,12 @@ CREATE TABLE IF NOT EXISTS service_dispatch (
 );
 
 CREATE INDEX IF NOT EXISTS idx_service_dispatch_image ON service_dispatch(image_id);
+CREATE INDEX IF NOT EXISTS idx_service_dispatch_pending_image_service_nullcluster
+    ON service_dispatch(image_id, service)
+    WHERE cluster_id IS NULL AND status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_service_dispatch_pending_image_service_cluster
+    ON service_dispatch(image_id, service, cluster_id)
+    WHERE status = 'pending';
 
 
 -- ---------------------------------------------------------------------------

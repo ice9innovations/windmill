@@ -75,9 +75,24 @@ class RembgWorker(BaseWorker):
 
             # Call rembg service — BEN2 handles subject isolation internally
             result = self._call_rembg(image_bytes, image_id)
-            if not result:
+            if result is None:
                 self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("rembg service call failed")
+                return
+
+            if result.get('status', 'success') != 'success':
+                self._store_terminal_service_result(
+                    image_id,
+                    result,
+                    status=result.get('status', 'failed') or 'failed',
+                    processing_time=round(time.time() - start_time, 3),
+                )
+                self._safe_ack(ch, method.delivery_tag)
+                self.job_completed_successfully()
+                self.logger.warning(
+                    f"rembg: image {image_id} returned terminal non-success: "
+                    f"{result.get('error_message') or result.get('error') or result.get('message') or 'no reason provided'}"
+                )
                 return
 
             png_b64 = result['mask']
@@ -108,18 +123,12 @@ class RembgWorker(BaseWorker):
                 files={'file': ('image.png', io.BytesIO(image_bytes), 'image/png')},
                 timeout=REMBG_TIMEOUT,
             )
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get('status') != 'success':
-                self.logger.error(
-                    f"rembg: service returned error for image {image_id}: "
-                    f"{data.get('error')}"
-                )
-                return None
-            return data
-        except Exception as e:
+            return self._coerce_terminal_http_response(resp)
+        except requests.RequestException as e:
+            if getattr(e, 'response', None) is not None:
+                return self._coerce_terminal_http_response(e.response)
             self.logger.error(
-                f"rembg: service call failed for image {image_id}: {e}"
+                f"rembg: service call failed for image {image_id} before terminal response: {e}"
             )
             return None
 

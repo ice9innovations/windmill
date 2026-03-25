@@ -59,8 +59,13 @@ class GptNanoWorker(BaseWorker):
                 f"gpt_nano: NudeNet result not available for image {image_id} "
                 f"after {NUDENET_TIMEOUT}s — skipping OpenAI API call"
             )
-            self._store_blocked(image_id, "NudeNet unavailable")
-            self._fire_downstream(image_id, message)
+            self._store_gate_result(image_id, "NudeNet unavailable", status='failed', blocked=False)
+            self._update_service_dispatch(
+                image_id,
+                service='gpt_nano',
+                status='failed',
+                reason='NudeNet unavailable',
+            )
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
             return
@@ -71,7 +76,8 @@ class GptNanoWorker(BaseWorker):
                 f"gpt_nano: NSFW detected for image {image_id} "
                 f"({', '.join(sorted(detected))}) — skipping OpenAI API call"
             )
-            self._store_blocked(image_id, BLOCKED_TEXT)
+            self._store_gate_result(image_id, BLOCKED_TEXT, status='success', blocked=True)
+            self._update_service_dispatch(image_id, service='gpt_nano')
             self._fire_downstream(image_id, message)
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
@@ -113,33 +119,25 @@ class GptNanoWorker(BaseWorker):
             self.logger.error(f"gpt_nano: nudenet fetch error for image {image_id}: {e}")
             return None
 
-    def _store_blocked(self, image_id, reason):
-        """Store a synthetic blocked result so the pipeline continues cleanly."""
+    def _store_gate_result(self, image_id, reason, status='success', blocked=True):
+        """Store a synthetic gating result so the pipeline continues cleanly."""
         result = {
-            'status':  'success',
+            'status':  status,
             'service': 'gpt_nano',
             'predictions': [{'text': BLOCKED_TEXT}],
             'nouns': [],
             'metadata': {
-                'blocked': True,
+                'blocked': blocked,
                 'reason':  reason,
                 'processed_at': datetime.now().isoformat(),
             },
         }
-        try:
-            cursor = self.db_conn.cursor()
-            cursor.execute(
-                """INSERT INTO results
-                       (image_id, service, data, status, result_created, worker_id)
-                   VALUES (%s, %s, %s, %s, NOW(), %s)""",
-                (image_id, 'gpt_nano', json.dumps(result), 'success', self.worker_id)
-            )
-            self.db_conn.commit()
-            cursor.close()
-        except Exception as e:
-            self.logger.error(
-                f"gpt_nano: failed to store blocked result for image {image_id}: {e}"
-            )
+        self._store_terminal_service_result(
+            image_id,
+            result,
+            status=status,
+            service='gpt_nano',
+        )
 
     def _fire_downstream(self, image_id, message):
         """Trigger noun_consensus, verb_consensus, and consensus so the pipeline doesn't stall."""

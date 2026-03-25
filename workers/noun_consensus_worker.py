@@ -64,8 +64,6 @@ class NounConsensusWorker(BaseWorker):
             triggering_service = message.get('service', 'unknown')
             tier = message.get('tier', 'free')
 
-            self._record_service_dispatch(image_id, 'noun_consensus')
-
             self.logger.debug(
                 f"noun_consensus: processing image {image_id} "
                 f"(triggered by {triggering_service})"
@@ -82,10 +80,34 @@ class NounConsensusWorker(BaseWorker):
             )
 
             if not service_noun_map:
+                processing_time = round(time.time() - start_time, 3)
+                self._store_terminal_service_result(
+                    image_id,
+                    {
+                        'service': 'noun_consensus',
+                        'status': 'success',
+                        'nouns': [],
+                        'metadata': {
+                            'no_usable_data': True,
+                            'reason': 'No VLM noun data yet',
+                            'triggered_by': triggering_service,
+                            'processed_at': datetime.now().isoformat(),
+                        },
+                    },
+                    processing_time=processing_time,
+                )
                 self.logger.debug(
                     f"noun_consensus: no VLM noun data yet for image {image_id}, skipping"
                 )
-                self._update_service_dispatch(image_id, service='noun_consensus')
+                self._record_service_event(
+                    image_id=image_id,
+                    service='noun_consensus',
+                    event_type='completed',
+                    source_service=triggering_service,
+                    source_stage='noun_consensus_run',
+                    data={'reason': 'No VLM noun data yet'},
+                    commit=True,
+                )
                 self._safe_ack(ch, method.delivery_tag)
                 self.job_completed_successfully()
                 return
@@ -107,7 +129,29 @@ class NounConsensusWorker(BaseWorker):
                 category_tally=category_tally,
             )
 
-            self._update_service_dispatch(image_id, service='noun_consensus')
+            self._store_terminal_service_result(
+                image_id,
+                {
+                    'service': 'noun_consensus',
+                    'status': 'success',
+                    'nouns': collapsed,
+                    'category_tally': category_tally,
+                    'services_present': services_present,
+                    'metadata': {
+                        'processed_at': datetime.now().isoformat(),
+                    },
+                },
+                processing_time=round(time.time() - start_time, 3),
+            )
+            self._record_service_event(
+                image_id=image_id,
+                service='noun_consensus',
+                event_type='completed',
+                source_service=triggering_service,
+                source_stage='noun_consensus_run',
+                data={'services_present': services_present},
+                commit=True,
+            )
 
             self.logger.info(
                 f"noun_consensus: image {image_id} - "
@@ -128,11 +172,8 @@ class NounConsensusWorker(BaseWorker):
                 )
 
             # Trigger grounding as soon as any VLM has reported.
-            # The pending-dispatch guard ensures at most one grounding job is
-            # in-flight per image at a time. If one is already pending, the
-            # trigger is skipped — the in-flight job processes the current noun
-            # set when it runs, and later noun_consensus triggers will dispatch
-            # again once that job completes if the noun set has grown.
+            # Duplicate triggers are collapsed in florence2_grounding itself by
+            # comparing the current noun set with the latest stored result.
             if self._count_vlm_results(image_id) > 0 and image_data:
                 # Threshold based on tier's total expected VLM count, not how
                 # many have reported so far. This keeps the bar stable across
@@ -153,13 +194,7 @@ class NounConsensusWorker(BaseWorker):
                     if n.get('vote_count', 0) >= min_votes
                 ]
                 if consensus_nouns:
-                    if self._has_pending_grounding_dispatch(image_id):
-                        self.logger.debug(
-                            f"noun_consensus: grounding already pending "
-                            f"for image {image_id}, skipping"
-                        )
-                    else:
-                        self._trigger_florence2_grounding(image_id, image_data, consensus_nouns, subject_noun, tier)
+                    self._trigger_florence2_grounding(image_id, image_data, consensus_nouns, subject_noun, tier)
                 else:
                     # No consensus reached — promote the top noun if it's a clear
                     # leader (strictly ahead of second place). Fires only when the
@@ -184,13 +219,7 @@ class NounConsensusWorker(BaseWorker):
                             processing_time=round(time.time() - start_time, 3),
                             category_tally=category_tally,
                         )
-                        if self._has_pending_grounding_dispatch(image_id):
-                            self.logger.debug(
-                                f"noun_consensus: grounding already pending "
-                                f"for image {image_id} (promoted '{top}'), skipping"
-                            )
-                        else:
-                            self._trigger_florence2_grounding(image_id, image_data, [top], subject_noun, tier)
+                        self._trigger_florence2_grounding(image_id, image_data, [top], subject_noun, tier)
 
             # Trigger caption_summary directly — fires as soon as enough captions are
             # available, and re-fires progressively as stragglers arrive. No longer
@@ -227,34 +256,6 @@ class NounConsensusWorker(BaseWorker):
         except Exception as e:
             self.logger.error(f"noun_consensus: result count error for image {image_id}: {e}")
             return 0
-
-    def _has_pending_grounding_dispatch(self, image_id: int) -> bool:
-        """Return True if a grounding dispatch is already pending for this image.
-
-        Used to prevent multiple simultaneous grounding jobs — noun_consensus fires
-        on every VLM completion, but only one grounding job should be in-flight at
-        a time. Safe to use as a non-atomic guard here because noun_consensus_worker
-        is single-consumer and processes one message at a time.
-        """
-        try:
-            cursor = self.db_conn.cursor()
-            cursor.execute(
-                """SELECT 1 FROM service_dispatch
-                   WHERE image_id = %s
-                     AND service = 'florence2_grounding'
-                     AND cluster_id IS NULL
-                     AND status = 'pending'
-                   LIMIT 1""",
-                (image_id,),
-            )
-            row = cursor.fetchone()
-            cursor.close()
-            return row is not None
-        except Exception as e:
-            self.logger.warning(
-                f"noun_consensus: pending grounding check failed for image {image_id}: {e}"
-            )
-            return False
 
     def _maybe_update_caption_summary(self, image_id: int, image_data: str, tier: str):
         """Trigger caption_summary synthesis when new VLM captions are available.
@@ -302,6 +303,18 @@ class NounConsensusWorker(BaseWorker):
                 queue=queue_name, durable=True,
                 arguments={'x-dead-letter-exchange': '', 'x-dead-letter-routing-key': dlq},
             )
+            self._record_service_event(
+                image_id=image_id,
+                service='caption_summary',
+                event_type='enqueued',
+                source_service='noun_consensus',
+                source_stage='caption_summary_trigger',
+                data={
+                    'available_count': available_count,
+                    'last_count': last_count,
+                    'tier': tier,
+                },
+            )
             self._enqueue_publish(
                 queue_name,
                 json.dumps({'image_id': image_id, 'image_data': image_data, 'tier': tier}),
@@ -318,20 +331,24 @@ class NounConsensusWorker(BaseWorker):
 
     def _trigger_florence2_grounding(self, image_id: int, image_data: str, nouns: list, subject_noun: str = None, tier: str = 'free'):
         """Publish a Florence-2 grounding request for the final noun consensus.
-
-        The dispatch_id (service_dispatch PK) is embedded in the queue message so the
-        worker can use targeted completion tracking rather than the bulk-clear path.
-        This is required because noun_consensus fires florence2_grounding progressively
-        (once per VLM completion), creating multiple pending rows per image. Without
-        dispatch_id, the first completion would bulk-clear all pending rows and the SSE
-        stream would fire complete with only the partial first result.
         """
         if not self.config.is_available_for_tier('primary.florence2', tier):
             self.logger.debug(f"noun_consensus: skipping Florence-2 grounding for tier '{tier}' image {image_id}")
             return
         try:
             queue_name = self._get_queue_by_service_type('grounding')
-            dispatch_id = self._record_service_dispatch(image_id, 'florence2_grounding', None)
+            self._record_service_event(
+                image_id=image_id,
+                service='florence2_grounding',
+                event_type='enqueued',
+                source_service='noun_consensus',
+                source_stage='grounding_trigger',
+                data={
+                    'nouns': nouns,
+                    'subject_noun': subject_noun,
+                    'tier': tier,
+                },
+            )
             self._enqueue_publish(
                 queue_name,
                 json.dumps({
@@ -341,21 +358,13 @@ class NounConsensusWorker(BaseWorker):
                     'subject_noun': subject_noun,
                     'triggered_at': datetime.now().isoformat(),
                     'tier': tier,
-                    'dispatch_id': dispatch_id,
                 }),
             )
             self.logger.info(
                 f"noun_consensus: triggered Florence-2 grounding for image {image_id} "
-                f"with {len(nouns)} nouns: {nouns} (dispatch_id={dispatch_id})"
+                f"with {len(nouns)} nouns: {nouns}"
             )
         except Exception as e:
-            if 'dispatch_id' in locals() and dispatch_id is not None:
-                self._update_service_dispatch(
-                    image_id,
-                    status='failed',
-                    reason=f"publish enqueue failed: {e}",
-                    dispatch_id=dispatch_id,
-                )
             self.logger.error(f"noun_consensus: failed to trigger Florence-2 grounding for image {image_id}: {e}")
             raise
 

@@ -180,7 +180,6 @@ class ContentAnalysisWorker(BaseWorker):
 
         Returns dict with:
         - results: all service results
-        - merged_boxes: harmonized bboxes
         - consensus: consensus detections
         - captions: VLM captions
         - nudenet_detections: NudeNet anatomy detections
@@ -260,21 +259,6 @@ class ContentAnalysisWorker(BaseWorker):
                             continue
                         yolo_person_bboxes.append({'id': i, 'bbox': bbox})
 
-            # Get merged boxes (harmonized bboxes)
-            cursor.execute("""
-                SELECT merged_id, merged_data
-                FROM merged_boxes
-                WHERE image_id = %s
-            """, (image_id,))
-
-            merged_boxes = []
-            for row in cursor.fetchall():
-                merged_id, merged_data = row
-                merged_boxes.append({
-                    'merged_id': merged_id,
-                    'data': merged_data
-                })
-
             # Get consensus
             cursor.execute("""
                 SELECT consensus_data
@@ -342,7 +326,6 @@ class ContentAnalysisWorker(BaseWorker):
 
             return {
                 'results': results,
-                'merged_boxes': merged_boxes,
                 'yolo_person_bboxes': yolo_person_bboxes,
                 'consensus': consensus_data,
                 'captions': captions,
@@ -484,7 +467,6 @@ class ContentAnalysisWorker(BaseWorker):
         try:
             captions = image_data['captions']
             nudenet_detections = image_data['nudenet_detections']
-            merged_boxes = image_data['merged_boxes']
             consensus_data = image_data.get('consensus')
             validated_gendered_nouns = image_data.get('validated_gendered_nouns', [])
 
@@ -745,9 +727,29 @@ class ContentAnalysisWorker(BaseWorker):
             # Run content analysis
             analysis = self.analyze_content(image_id, image_data)
             if not analysis:
+                self._store_terminal_service_result(
+                    image_id,
+                    {
+                        'service': 'content_analysis',
+                        'status': 'failed',
+                        'full_analysis': None,
+                        'error_message': 'Content analysis returned no terminal analysis payload',
+                    },
+                    processing_time=round(time.time() - start_time, 3),
+                    service='content_analysis',
+                )
+                self._record_service_event(
+                    image_id=image_id,
+                    service='content_analysis',
+                    event_type='failed',
+                    source_service=message.get('triggered_by'),
+                    source_stage='content_analysis_run',
+                    data={'error_message': 'Content analysis returned no terminal analysis payload'},
+                    commit=True,
+                )
                 self.logger.error(f"Failed to analyze content for {image_id}")
-                self._safe_nack(ch, method.delivery_tag, requeue=True)
-                self.job_failed("Analysis failed")
+                self._safe_ack(ch, method.delivery_tag)
+                self.job_completed_successfully()
                 return
 
             # Store analysis
@@ -756,6 +758,26 @@ class ContentAnalysisWorker(BaseWorker):
                 self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Storage failed")
                 return
+
+            self._store_terminal_service_result(
+                image_id,
+                {
+                    'service': 'content_analysis',
+                    'status': 'success',
+                    'full_analysis': analysis['full_analysis'],
+                    'analysis_version': analysis['analysis_version'],
+                },
+                processing_time=round(time.time() - start_time, 3),
+                service='content_analysis',
+            )
+            self._record_service_event(
+                image_id=image_id,
+                service='content_analysis',
+                event_type='completed',
+                source_service=message.get('triggered_by'),
+                source_stage='content_analysis_run',
+                commit=True,
+            )
 
             # Acknowledge message
             self._safe_ack(ch, method.delivery_tag)

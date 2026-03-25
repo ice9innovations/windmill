@@ -129,14 +129,9 @@ class HarmonyWorker(BaseWorker):
 
         # Also check read connection
         try:
-            if not self.read_db_conn or self.read_db_conn.closed:
-                self.logger.warning("Read database connection is closed")
+            if not self.read_db_conn or self.read_db_conn.closed != 0:
+                self.logger.warning("Read database connection is closed or broken")
                 return self.connect_to_database()
-
-            # Validate read connection with test query
-            cursor = self.read_db_conn.cursor()
-            cursor.execute("SELECT 1")
-            cursor.close()
 
             return True
 
@@ -170,13 +165,10 @@ class HarmonyWorker(BaseWorker):
             declare_with_dlq(self.queue_channel, self.queue_name)
             # Removed old downstream queue
             
-            # Declare bbox postprocessing queues - read from config
             face_queue = self._get_queue_name('postprocessing.face')
             pose_queue = self._get_queue_name('postprocessing.pose')
             declare_with_dlq(self.queue_channel, face_queue)
             declare_with_dlq(self.queue_channel, pose_queue)
-
-            # Store queue names for later use
             self.postprocessing_queues = {
                 'face': face_queue,
                 'pose': pose_queue,
@@ -219,17 +211,17 @@ class HarmonyWorker(BaseWorker):
             return None
 
     def dispatch_bbox_postprocessing(self, image_id, image_filename, merged_data, image_data):
-        """Dispatch bbox postprocessing jobs for each merged box"""
+        """Dispatch bbox postprocessing jobs for each merged box."""
         try:
             trace_id = getattr(self, 'current_trace_id', None)
             image_bytes = base64.b64decode(image_data)
             img = Image.open(io.BytesIO(image_bytes))
             face_dispatches = 0
             pose_dispatches = 0
+            tier = getattr(self, 'current_tier', 'free')
 
-            # Process each merged box
             with img:
-                for group_key, group_data in merged_data['grouped_objects'].items():
+                for group_data in merged_data['grouped_objects'].values():
                     instances = group_data.get('instances', [])
                     for instance in instances:
                         merged_bbox = instance.get('merged_bbox', {})
@@ -248,57 +240,55 @@ class HarmonyWorker(BaseWorker):
                             self.logger.debug(f"Skipped postprocessing for {width}x{height} box (below 8x8 minimum)")
                             continue
 
-                        crop_started_at = time.time()
+                        if normalize_person_emoji(instance.get('emoji', '')) != '🧑':
+                            continue
+
                         cropped_image_data = self._crop_bbox_from_image(img, merged_bbox)
                         if not cropped_image_data:
                             continue
-                        crop_duration = time.time() - crop_started_at
-                        if trace_id:
-                            self.logger.info(
-                                f"[{trace_id}] harmony cropped cluster {cluster_id} for image {image_id} "
-                                f"in {crop_duration:.3f}s"
-                            )
 
                         base_message = {
                             'merged_box_id': merged_box_id,
                             'image_id': image_id,
                             'cluster_id': cluster_id,
                             'bbox': merged_bbox,
-                            'cropped_image_data': cropped_image_data.decode('latin-1')
+                            'cropped_image_data': cropped_image_data.decode('latin-1'),
+                            'trace_id': trace_id,
+                            'tier': tier,
+                            'source_service': 'harmony',
+                            'source_stage': 'merged_boxes_committed',
+                            'dispatch_enqueued_at': datetime.now().isoformat(),
                         }
-                        if hasattr(self, 'current_trace_id') and self.current_trace_id:
-                            base_message['trace_id'] = self.current_trace_id
-                        base_message['tier'] = getattr(self, 'current_tier', 'free')
 
-                        box_emoji = normalize_person_emoji(instance.get('emoji', ''))
-                        tier = getattr(self, 'current_tier', 'free')
-                        if box_emoji == '🧑':
-                            if self.config.is_available_for_tier('postprocessing.face', tier):
-                                face_publish_started_at = time.time()
-                                self.publish_bbox_message(self.postprocessing_queues['face'], base_message)
-                                face_publish_duration = time.time() - face_publish_started_at
-                                face_dispatch_record_started_at = time.time()
-                                self._record_service_dispatch(image_id, 'face', cluster_id)
-                                face_dispatch_record_duration = time.time() - face_dispatch_record_started_at
-                                face_dispatches += 1
-                                if trace_id:
-                                    self.logger.info(
-                                        f"[{trace_id}] published face for image {image_id} cluster {cluster_id} "
-                                        f"(publish={face_publish_duration:.3f}s dispatch_record={face_dispatch_record_duration:.3f}s)"
-                                    )
-                            if self.config.is_available_for_tier('postprocessing.pose', tier):
-                                pose_publish_started_at = time.time()
-                                self.publish_bbox_message(self.postprocessing_queues['pose'], base_message)
-                                pose_publish_duration = time.time() - pose_publish_started_at
-                                pose_dispatch_record_started_at = time.time()
-                                self._record_service_dispatch(image_id, 'pose', cluster_id)
-                                pose_dispatch_record_duration = time.time() - pose_dispatch_record_started_at
-                                pose_dispatches += 1
-                                if trace_id:
-                                    self.logger.info(
-                                        f"[{trace_id}] published pose for image {image_id} cluster {cluster_id} "
-                                        f"(publish={pose_publish_duration:.3f}s dispatch_record={pose_dispatch_record_duration:.3f}s)"
-                                    )
+                        if self.config.is_available_for_tier('postprocessing.face', tier):
+                            self._record_postprocessing_event(
+                                image_id=image_id,
+                                merged_box_id=merged_box_id,
+                                service='face',
+                                cluster_id=cluster_id,
+                                event_type='enqueued',
+                                source_service='harmony',
+                                source_stage='merged_boxes_committed',
+                                data={'bbox': merged_bbox},
+                            )
+                            face_message = dict(base_message)
+                            self.publish_bbox_message(self.postprocessing_queues['face'], face_message)
+                            face_dispatches += 1
+
+                        if self.config.is_available_for_tier('postprocessing.pose', tier):
+                            self._record_postprocessing_event(
+                                image_id=image_id,
+                                merged_box_id=merged_box_id,
+                                service='pose',
+                                cluster_id=cluster_id,
+                                event_type='enqueued',
+                                source_service='harmony',
+                                source_stage='merged_boxes_committed',
+                                data={'bbox': merged_bbox},
+                            )
+                            pose_message = dict(base_message)
+                            self.publish_bbox_message(self.postprocessing_queues['pose'], pose_message)
+                            pose_dispatches += 1
             if trace_id:
                 self.logger.info(
                     f"[{trace_id}] harmony dispatched face={face_dispatches} pose={pose_dispatches} "
@@ -345,22 +335,7 @@ class HarmonyWorker(BaseWorker):
     def publish_bbox_message(self, queue_name, message):
         """Publish message to bbox postprocessing queue"""
         try:
-            # Check if connection is healthy
-            if not self.queue_channel or self.queue_connection.is_closed:
-                self.logger.warning("RabbitMQ queue connection lost, reconnecting...")
-                self.connect_to_queue()
-                # Update BaseWorker variables after reconnection
-                self.connection = self.queue_connection
-                self.channel = self.queue_channel
-            
-            self.queue_channel.basic_publish(
-                exchange='',
-                routing_key=queue_name,
-                body=json.dumps(message),
-                properties=pika.BasicProperties(
-                    delivery_mode=2  # Make message persistent
-                )
-            )
+            self._enqueue_publish(queue_name, json.dumps(message))
             self.logger.debug(f"Published bbox message to {queue_name}")
             
         except Exception as e:
@@ -550,7 +525,9 @@ class HarmonyWorker(BaseWorker):
         try:
             receipt_started_at = time.time()
             # Parse message
+            parse_started_at = time.time()
             message = json.loads(body)
+            parse_duration = time.time() - parse_started_at
             # Capture trace_id and tier for propagation to postprocessing
             self.current_trace_id = message.get('trace_id')
             self.current_tier = message.get('tier', 'free')
@@ -568,14 +545,46 @@ class HarmonyWorker(BaseWorker):
                     f"(upstream_processed_at={upstream_processed_at})"
                 )
 
-            # Record that harmony was triggered — part of the harmonization transaction
-            self._record_service_dispatch(image_id, 'harmony')
+            dispatch_record_duration = 0.0
 
             # Process the harmony merge for this image
+            update_started_at = time.time()
             result = self.update_merged_boxes_for_image(image_id, image_filename, image_data)
+            update_duration = time.time() - update_started_at
 
             if result['success']:
-                self._update_service_dispatch(image_id, service='harmony')
+                result_store_started_at = time.time()
+                self._store_terminal_service_result(
+                    image_id,
+                    {
+                        'service': 'harmony',
+                        'status': 'success',
+                        'merged_boxes_created': result.get('merged_boxes_created', False),
+                        'merged_box_count': result.get('merged_box_count', 0),
+                        'metadata': {
+                            'no_usable_data': not result.get('merged_boxes_created', False),
+                            'reason': result.get('reason'),
+                        },
+                    },
+                    processing_time=round(time.time() - receipt_started_at, 3),
+                    service='harmony',
+                )
+                result_store_duration = time.time() - result_store_started_at
+                service_event_started_at = time.time()
+                self._record_service_event(
+                    image_id=image_id,
+                    service='harmony',
+                    event_type='completed',
+                    source_service=message.get('service'),
+                    source_stage='harmonization_run',
+                    data={
+                        'merged_boxes_created': result.get('merged_boxes_created', False),
+                        'reason': result.get('reason'),
+                    },
+                    commit=True,
+                )
+                service_event_duration = time.time() - service_event_started_at
+                dispatch_complete_duration = 0.0
                 
                 # Only send spatial enrichment message if merged boxes were actually created
                 if result['merged_boxes_created']:
@@ -598,10 +607,28 @@ class HarmonyWorker(BaseWorker):
                     )
                 
                 # Trigger consensus after harmony completes
+                consensus_trigger_started_at = time.time()
                 self.trigger_consensus(image_id, message)
+                consensus_trigger_duration = time.time() - consensus_trigger_started_at
                 
                 # Acknowledge the message
+                ack_started_at = time.time()
                 self._safe_ack(ch, method.delivery_tag)
+                ack_duration = time.time() - ack_started_at
+
+                if self.current_trace_id:
+                    self.logger.info(
+                        f"[{self.current_trace_id}] harmony outer phases for image {image_id}: "
+                        f"parse={parse_duration:.3f}s "
+                        f"dispatch_record={dispatch_record_duration:.3f}s "
+                        f"update={update_duration:.3f}s "
+                        f"store_result={result_store_duration:.3f}s "
+                        f"service_event={service_event_duration:.3f}s "
+                        f"dispatch_complete={dispatch_complete_duration:.3f}s "
+                        f"trigger_consensus={consensus_trigger_duration:.3f}s "
+                        f"ack={ack_duration:.3f}s "
+                        f"outer_total={time.time() - receipt_started_at:.3f}s"
+                    )
                 
             else:
                 # Reject and requeue for retry
@@ -1259,14 +1286,22 @@ class HarmonyWorker(BaseWorker):
         
         for attempt in range(max_retries):
             try:
+                total_started_at = time.time()
                 # Ensure healthy database connection
+                db_health_started_at = time.time()
                 if not self.ensure_database_connection():
                     self.logger.error("Could not establish database connection")
                     if attempt < max_retries - 1:
                         self.logger.info(f"Retrying database operation (attempt {attempt + 1}/{max_retries})")
                         time.sleep(2)  # Wait before retry
                         continue
-                    return {'success': False, 'merged_boxes_created': False}
+                    return {
+                        'success': False,
+                        'merged_boxes_created': False,
+                        'merged_box_count': 0,
+                        'reason': 'Database unavailable',
+                    }
+                db_health_duration = time.time() - db_health_started_at
                 
                 # Get bbox results
                 bbox_fetch_started_at = time.time()
@@ -1279,39 +1314,82 @@ class HarmonyWorker(BaseWorker):
                     )
                 if not bbox_results:
                     self.logger.info(f"No bbox results found for image {image_id}, skipping")
-                    return {'success': True, 'merged_boxes_created': False}  # Not an error - just no data to process
+                    return {
+                        'success': True,
+                        'merged_boxes_created': False,
+                        'merged_box_count': 0,
+                        'reason': 'No bbox results found',
+                    }  # Not an error - just no data to process
                 else:
                     self.logger.info(f"Found {len(bbox_results)} bbox results for image {image_id}")
                 
                 # Harmonize bounding boxes
-                start_time = time.time()
+                harmonize_started_at = time.time()
                 merged_data = self.harmonize_bounding_boxes(bbox_results)
-                processing_time = time.time() - start_time
+                harmonize_duration = time.time() - harmonize_started_at
                 
                 if not merged_data:
                     self.logger.info(f"No bounding boxes to harmonize for image {image_id} - all detection services returned empty predictions")
-                    return {'success': True, 'merged_boxes_created': False}
+                    return {
+                        'success': True,
+                        'merged_boxes_created': False,
+                        'merged_box_count': 0,
+                        'reason': 'No bounding boxes to harmonize',
+                    }
                 
+                proposed_signature_started_at = time.time()
                 proposed_signatures = self._merged_data_signatures(merged_data)
+                proposed_signature_duration = time.time() - proposed_signature_started_at
+
+                existing_signature_fetch_started_at = time.time()
                 existing_signatures = self._fetch_existing_merged_signatures(image_id)
-                if existing_signatures and existing_signatures == proposed_signatures:
+                existing_signature_fetch_duration = time.time() - existing_signature_fetch_started_at
+
+                signature_compare_started_at = time.time()
+                signatures_equal = bool(existing_signatures) and existing_signatures == proposed_signatures
+                signature_compare_duration = time.time() - signature_compare_started_at
+                signature_duration = (
+                    proposed_signature_duration
+                    + existing_signature_fetch_duration
+                    + signature_compare_duration
+                )
+                if self.current_trace_id:
+                    self.logger.info(
+                        f"[{self.current_trace_id}] harmony phases for image {image_id}: "
+                        f"proposed_signature_build={proposed_signature_duration:.3f}s "
+                        f"existing_signature_fetch={existing_signature_fetch_duration:.3f}s "
+                        f"signature_equality={signature_compare_duration:.3f}s "
+                        f"harmonize={harmonize_duration:.3f}s "
+                        f"signature_compare={signature_duration:.3f}s"
+                    )
+                if signatures_equal:
                     self.logger.info(
                         f"Skipping no-op harmony for {image_filename}: merged boxes unchanged"
                     )
                     if self.current_trace_id:
                         self.logger.info(
-                            f"[{self.current_trace_id}] harmony no-op for image {image_id}"
+                            f"[{self.current_trace_id}] harmony no-op for image {image_id} "
+                            f"(db_health={db_health_duration:.3f}s total={time.time() - total_started_at:.3f}s)"
                         )
-                    return {'success': True, 'merged_boxes_created': True}
+                    return {
+                        'success': True,
+                        'merged_boxes_created': True,
+                        'merged_box_count': len(proposed_signatures),
+                        'reason': 'Merged boxes unchanged',
+                    }
 
                 # Safe atomic DELETE + INSERT with foreign key handling
+                cursor_setup_started_at = time.time()
                 cursor = self.db_conn.cursor()
+                cursor_setup_duration = time.time() - cursor_setup_started_at
 
                 # Acquire per-image advisory lock to serialize concurrent harmony workers.
                 # The lock is transaction-scoped: automatically released on commit/rollback.
                 # This prevents two workers from simultaneously deleting and reinserting
                 # merged_boxes for the same image, which would produce duplicate rows.
+                advisory_lock_started_at = time.time()
                 cursor.execute("SELECT pg_advisory_xact_lock(%s)", (image_id,))
+                advisory_lock_duration = time.time() - advisory_lock_started_at
 
                 # Progressive harmonization: always reharmonize with latest bbox results
 
@@ -1334,9 +1412,11 @@ class HarmonyWorker(BaseWorker):
                 # Step 3: Insert new merged boxes - ONE ROW PER MERGED BOX
                 merged_box_count = 0
                 insert_boxes_started_at = time.time()
+                insert_loop_python_duration = 0.0
                 for group_key, group_data in merged_data['grouped_objects'].items():
                     instances = group_data.get('instances', [])
                     for instance in instances:
+                        insert_python_started_at = time.time()
                         # Store merged box data directly
                         merged_box_data = {
                             'cluster_id': instance.get('cluster_id', ''),
@@ -1365,9 +1445,12 @@ class HarmonyWorker(BaseWorker):
                         ))
                         instance['merged_box_id'] = cursor.fetchone()[0]
                         merged_box_count += 1
+                        insert_loop_python_duration += time.time() - insert_python_started_at
                 insert_boxes_duration = time.time() - insert_boxes_started_at
                 
+                cursor_close_started_at = time.time()
                 cursor.close()
+                cursor_close_duration = time.time() - cursor_close_started_at
                 
                 services = merged_data['source_services']
                 detection_count = merged_data['total_detections']
@@ -1381,7 +1464,11 @@ class HarmonyWorker(BaseWorker):
                         f"[{self.current_trace_id}] harmony db stages for image {image_id}: "
                         f"clear_postprocessing={clear_postprocessing_duration:.3f}s "
                         f"delete_boxes={delete_boxes_duration:.3f}s "
-                        f"insert_boxes={insert_boxes_duration:.3f}s"
+                        f"insert_boxes={insert_boxes_duration:.3f}s "
+                        f"insert_loop_python={insert_loop_python_duration:.3f}s "
+                        f"cursor_setup={cursor_setup_duration:.3f}s "
+                        f"advisory_lock={advisory_lock_duration:.3f}s "
+                        f"cursor_close={cursor_close_duration:.3f}s"
                     )
                 
                 # Commit merged_boxes BEFORE dispatching to face/pose queues.
@@ -1392,10 +1479,11 @@ class HarmonyWorker(BaseWorker):
                 # FK target is visible when the workers arrive.
                 commit_started_at = time.time()
                 self.db_conn.commit()
+                commit_duration = time.time() - commit_started_at
                 if self.current_trace_id:
                     self.logger.info(
                         f"[{self.current_trace_id}] harmony committed merged boxes for image {image_id} "
-                        f"in {time.time() - commit_started_at:.3f}s"
+                        f"in {commit_duration:.3f}s"
                     )
 
                 # Dispatch bbox postprocessing jobs for each merged box
@@ -1404,11 +1492,14 @@ class HarmonyWorker(BaseWorker):
                     try:
                         self.dispatch_bbox_postprocessing(image_id, image_filename, merged_data, image_data)
                         # Commit service_dispatch records written during dispatch
+                        dispatch_commit_started_at = time.time()
                         self.db_conn.commit()
+                        dispatch_commit_duration = time.time() - dispatch_commit_started_at
                         if self.current_trace_id:
                             self.logger.info(
                                 f"[{self.current_trace_id}] harmony dispatched postprocessing for image {image_id} "
-                                f"in {time.time() - dispatch_started_at:.3f}s"
+                                f"in {time.time() - dispatch_started_at:.3f}s "
+                                f"(dispatch_commit={dispatch_commit_duration:.3f}s)"
                             )
                     except Exception as e:
                         self.logger.error(f"Failed to dispatch postprocessing for {image_filename}: {e}")
@@ -1418,11 +1509,28 @@ class HarmonyWorker(BaseWorker):
                             self.db_conn.rollback()
                         except Exception:
                             pass
+
+                if self.current_trace_id:
+                    self.logger.info(
+                        f"[{self.current_trace_id}] harmony total phases for image {image_id}: "
+                        f"db_health={db_health_duration:.3f}s "
+                        f"bbox_fetch={bbox_fetch_duration:.3f}s "
+                        f"harmonize={harmonize_duration:.3f}s "
+                        f"signature_compare={signature_duration:.3f}s "
+                        f"db_rewrite={clear_postprocessing_duration + delete_boxes_duration + insert_boxes_duration:.3f}s "
+                        f"commit={commit_duration:.3f}s "
+                        f"overall={time.time() - total_started_at:.3f}s"
+                    )
                 
                 if attempt > 0:
                     self.logger.info(f"Successfully processed {image_filename} after {attempt + 1} attempts")
                 
-                return {'success': True, 'merged_boxes_created': merged_box_count > 0}
+                return {
+                    'success': True,
+                    'merged_boxes_created': merged_box_count > 0,
+                    'merged_box_count': merged_box_count,
+                    'reason': None,
+                }
                 
             except Exception as e:
                 self.logger.error(f"Error updating merged boxes for image {image_id} (attempt {attempt + 1}/{max_retries}): {e}")
@@ -1440,9 +1548,19 @@ class HarmonyWorker(BaseWorker):
                     time.sleep(2)
                     continue
                     
-                return {'success': False, 'merged_boxes_created': False}
-        
-        return {'success': False, 'merged_boxes_created': False}
+                return {
+                    'success': False,
+                    'merged_boxes_created': False,
+                    'merged_box_count': 0,
+                    'reason': str(e),
+                }
+
+        return {
+            'success': False,
+            'merged_boxes_created': False,
+            'merged_box_count': 0,
+            'reason': 'Harmony update exhausted retries',
+        }
     
     
     

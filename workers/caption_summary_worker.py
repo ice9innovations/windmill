@@ -107,44 +107,172 @@ class CaptionSummaryWorker(BaseWorker):
             captions = self._fetch_captions(image_id, tier_vlm_services)
 
             if len(captions) <= existing_count:
+                self._store_terminal_service_result(
+                    image_id,
+                    {
+                        'service': 'caption_summary',
+                        'status': 'success',
+                        'summary_caption': None,
+                        'metadata': {
+                            'no_usable_data': True,
+                            'reason': 'Already synthesized with current caption count',
+                            'existing_count': existing_count,
+                            'available_count': len(captions),
+                            'processed_at': datetime.now().isoformat(),
+                        },
+                    },
+                    processing_time=round(time.time() - start_time, 3),
+                )
                 self.logger.info(
                     f"caption_summary: image {image_id} already synthesized with "
                     f"{existing_count} caption(s), still {len(captions)} available — skipping"
+                )
+                self._record_service_event(
+                    image_id=image_id,
+                    service='caption_summary',
+                    event_type='completed',
+                    source_service='noun_consensus',
+                    source_stage='caption_summary_run',
+                    data={'reason': 'Already synthesized with current caption count'},
+                    commit=True,
                 )
                 self._safe_ack(ch, method.delivery_tag)
                 return
 
             if len(captions) < MIN_CAPTIONS:
+                self._store_terminal_service_result(
+                    image_id,
+                    {
+                        'service': 'caption_summary',
+                        'status': 'success',
+                        'summary_caption': None,
+                        'metadata': {
+                            'no_usable_data': True,
+                            'reason': f'Need at least {MIN_CAPTIONS} captions',
+                            'available_count': len(captions),
+                            'processed_at': datetime.now().isoformat(),
+                        },
+                    },
+                    processing_time=round(time.time() - start_time, 3),
+                )
                 self.logger.info(
                     f"caption_summary: image {image_id} has {len(captions)} caption(s), "
                     f"need {MIN_CAPTIONS} — skipping"
                 )
+                self._record_service_event(
+                    image_id=image_id,
+                    service='caption_summary',
+                    event_type='completed',
+                    source_service='noun_consensus',
+                    source_stage='caption_summary_run',
+                    data={'reason': f'Need at least {MIN_CAPTIONS} captions'},
+                    commit=True,
+                )
                 self._safe_ack(ch, method.delivery_tag)
                 return
-
-            # Record that caption_summary was triggered — after both skip guards
-            self._record_service_dispatch(image_id, 'caption_summary')
 
             # Fetch supporting consensus data (both optional — prompt degrades gracefully)
             nouns = self._fetch_noun_consensus(image_id)
             verbs = self._fetch_verb_consensus(image_id)
 
             # Call caption-synthesis service
-            summary, synthesis_model = self._call_synthesis_service(captions, nouns, verbs, image_id)
+            synthesis_result = self._call_synthesis_service(captions, nouns, verbs, image_id)
+            if synthesis_result is None:
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
+                self.job_failed("Caption synthesis transport failure")
+                return
 
-            if not summary:
-                self.logger.error(
-                    f"caption_summary: empty response from synthesis service for image {image_id}, skipping"
+            if synthesis_result.get('status', 'success') != 'success':
+                self._store_terminal_service_result(
+                    image_id,
+                    synthesis_result,
+                    status=synthesis_result.get('status', 'failed') or 'failed',
+                    processing_time=round(time.time() - start_time, 3),
+                    service='caption_summary',
                 )
-                self._safe_nack(ch, method.delivery_tag, requeue=False)
-                self.job_failed("Empty synthesis response")
+                self._record_service_event(
+                    image_id=image_id,
+                    service='caption_summary',
+                    event_type='failed',
+                    source_service='noun_consensus',
+                    source_stage='caption_summary_run',
+                    data={
+                        'error_message': synthesis_result.get('error_message')
+                        or synthesis_result.get('error')
+                        or synthesis_result.get('message')
+                    },
+                    commit=True,
+                )
+                self._safe_ack(ch, method.delivery_tag)
+                self.job_completed_successfully()
+                self.logger.warning(
+                    f"caption_summary: image {image_id} returned terminal non-success: "
+                    f"{synthesis_result.get('error_message') or synthesis_result.get('error') or synthesis_result.get('message') or 'no reason provided'}"
+                )
+                return
+
+            summary = synthesis_result.get('summary', '').strip()
+            synthesis_model = synthesis_result.get('model', 'unknown')
+            if not summary:
+                synthesis_result = {
+                    'service': 'caption_summary',
+                    'status': 'failed',
+                    'summary_caption': None,
+                    'error_message': 'Caption synthesis returned empty summary',
+                    'metadata': {
+                        'terminal_http_error': False,
+                        'processed_at': datetime.now().isoformat(),
+                    },
+                }
+                self._store_terminal_service_result(
+                    image_id,
+                    synthesis_result,
+                    status='failed',
+                    processing_time=round(time.time() - start_time, 3),
+                    service='caption_summary',
+                )
+                self._record_service_event(
+                    image_id=image_id,
+                    service='caption_summary',
+                    event_type='failed',
+                    source_service='noun_consensus',
+                    source_stage='caption_summary_run',
+                    data={'error_message': 'Caption synthesis returned empty summary'},
+                    commit=True,
+                )
+                self._safe_ack(ch, method.delivery_tag)
+                self.job_completed_successfully()
+                self.logger.warning(
+                    f"caption_summary: empty response from synthesis service for image {image_id}"
+                )
                 return
 
             services_present = sorted(captions.keys())
             self._upsert(image_id, summary, synthesis_model, services_present,
                          processing_time=round(time.time() - start_time, 3))
-            self._update_service_dispatch(image_id, service='caption_summary')
-
+            self._store_terminal_service_result(
+                image_id,
+                {
+                    'service': 'caption_summary',
+                    'status': 'success',
+                    'summary_caption': summary,
+                    'model': synthesis_model,
+                    'services_present': services_present,
+                    'metadata': {
+                        'processed_at': datetime.now().isoformat(),
+                    },
+                },
+                processing_time=round(time.time() - start_time, 3),
+            )
+            self._record_service_event(
+                image_id=image_id,
+                service='caption_summary',
+                event_type='completed',
+                source_service='noun_consensus',
+                source_stage='caption_summary_run',
+                data={'services_present': services_present},
+                commit=True,
+            )
 
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
@@ -248,31 +376,22 @@ class CaptionSummaryWorker(BaseWorker):
 
     def _call_synthesis_service(
         self, captions: dict, nouns: list, verbs: list, image_id: int
-    ) -> tuple:
-        """POST captions and consensus data to the caption-synthesis AF service.
-
-        Returns (summary: str, model: str). Both are empty strings on failure.
-        """
+    ) -> dict:
+        """POST captions and consensus data to the caption-synthesis AF service."""
         try:
             resp = requests.post(
                 self.synthesis_url,
                 json={"captions": captions, "nouns": nouns, "verbs": verbs},
                 timeout=90,
             )
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get('status') != 'success':
-                self.logger.error(
-                    f"caption_summary: synthesis service error for image {image_id}: "
-                    f"{data.get('error', 'unknown')}"
-                )
-                return '', ''
-            return data.get('summary', '').strip(), data.get('model', 'unknown')
-        except Exception as e:
+            return self._coerce_terminal_http_response(resp, service='caption_summary')
+        except requests.RequestException as e:
+            if getattr(e, 'response', None) is not None:
+                return self._coerce_terminal_http_response(e.response, service='caption_summary')
             self.logger.error(
-                f"caption_summary: synthesis service call failed for image {image_id}: {e}"
+                f"caption_summary: synthesis service call failed for image {image_id} before terminal response: {e}"
             )
-            return '', ''
+            return None
 
     # ------------------------------------------------------------------
     # DB write

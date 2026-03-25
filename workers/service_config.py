@@ -201,21 +201,20 @@ class ServiceConfig:
         return matching_services
 
     def get_all_tiered_service_names(self) -> List[str]:
-        """Get short names of all customer-facing tiered services (excludes tier: system)"""
+        """Get short names of all customer-facing tiered services."""
         names = set()
         for category, services in self.raw_config['services'].items():
             for service_name, service_config in services.items():
                 if not service_config:
                     continue
                 tiers = service_config.get('tier') or []
-                if tiers and tiers != ['system']:
+                if tiers:
                     names.add(service_name)
         return sorted(names)
 
     def get_valid_tiers(self) -> frozenset:
         """Return the set of all customer-facing tier names defined in service_config.yaml.
 
-        Excludes 'system' — that is an internal routing tag, not a customer tier.
         Derived from the config so adding a new tier automatically makes it valid.
         Result is cached on the instance — the scan runs once per process.
         """
@@ -226,8 +225,7 @@ class ServiceConfig:
                     if not service_config:
                         continue
                     for t in (service_config.get('tier') or []):
-                        if t != 'system':
-                            tiers.add(t)
+                        tiers.add(t)
             self._valid_tiers_cache = frozenset(tiers)
         return self._valid_tiers_cache
 

@@ -22,7 +22,7 @@ class BboxPoseWorker(PostProcessingWorker):
     def process_message(self, ch, method, properties, body):
         """Store bbox context for coordinate transformation, then call parent."""
         try:
-            self.current_bbox = json.loads(body.decode('utf-8')).get('bbox', {})
+            self.current_bbox = self._parse_message_body(body).get('bbox', {})
         except Exception:
             self.current_bbox = {}
         return super().process_message(ch, method, properties, body)
@@ -41,13 +41,10 @@ class BboxPoseWorker(PostProcessingWorker):
                 timeout=(5, 5)  # (connection timeout, read timeout)
             )
 
-            if response.status_code == 200:
-                pose_data = response.json()
-                if pose_data.get('status') == 'success' and pose_data.get('predictions'):
-                    return self._transform_landmarks_to_full_image(pose_data)
-
-            self.logger.warning(f"Pose service returned status {response.status_code}: {response.text[:200]}")
-            return None
+            pose_data = self._coerce_terminal_http_response(response)
+            if pose_data.get('status') == 'success' and pose_data.get('predictions'):
+                return self._transform_landmarks_to_full_image(pose_data)
+            return pose_data
 
         except requests.exceptions.Timeout as e:
             self.logger.error(f"Pose service timeout after 5 seconds: {e}")

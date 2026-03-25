@@ -31,13 +31,7 @@ class BboxColorsWorker(PostProcessingWorker):
                 timeout=self.request_timeout
             )
             
-            if response.status_code == 200:
-                colors_data = response.json()
-                if colors_data.get('status') == 'success' and colors_data.get('predictions'):
-                    return colors_data
-            
-            self.logger.warning(f"Colors service returned status {response.status_code}: {response.text[:200]}")
-            return None
+            return self._coerce_terminal_http_response(response)
             
         except Exception as e:
             self.logger.error(f"Error processing colors: {e}")

@@ -142,9 +142,6 @@ stop_worker() {
     
     # Map service names to actual worker files (same mapping as start_worker)
     case "$worker" in
-        "harmony")
-            worker_file="workers/harmony_worker.py"
-            ;;
         "consensus")
             worker_file="workers/consensus_worker.py"
             ;;
@@ -199,9 +196,6 @@ start_worker() {
     
     # Map service names to actual worker files
     case "$worker" in
-        "harmony")
-            worker_file="workers/harmony_worker.py"
-            ;;
         "consensus")
             worker_file="workers/consensus_worker.py"
             ;;

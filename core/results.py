@@ -27,7 +27,7 @@ def fetch_results(cur, image_id):
     # Service results
     cur.execute(
         """SELECT service, data, status, processing_time, result_created
-           FROM results WHERE image_id = %s AND status = 'success'
+           FROM results WHERE image_id = %s
            ORDER BY result_created""",
         (image_id,),
     )
@@ -35,6 +35,7 @@ def fetch_results(cur, image_id):
     for r in cur.fetchall():
         service_results[r['service']] = {
             "data":            r['data'],
+            "status":          r['status'],
             "processing_time": r['processing_time'],
             "result_created":  r['result_created'].isoformat() if r['result_created'] else None,
         }
@@ -81,13 +82,14 @@ def fetch_results(cur, image_id):
         if content_analysis.get('created'):
             content_analysis['created'] = content_analysis['created'].isoformat()
 
-    # Postprocessing — also resolve source_bbox for canvas coordinate transforms.
+    # Postprocessing — include terminal failures too, and resolve source_bbox for
+    # canvas coordinate transforms.
     cur.execute(
-        """SELECT p.service, p.merged_box_id, p.data, p.processing_time,
+        """SELECT p.service, p.merged_box_id, p.data, p.status, p.error_message, p.processing_time,
                   mb.merged_data->'merged_bbox' AS source_bbox
            FROM postprocessing p
            LEFT JOIN merged_boxes mb ON mb.merged_id = p.merged_box_id
-           WHERE p.image_id = %s AND p.status = 'success'""",
+           WHERE p.image_id = %s""",
         (image_id,),
     )
     postprocessing = [dict(r) for r in cur.fetchall()]
@@ -171,13 +173,16 @@ def fetch_results(cur, image_id):
             "updated_at":       caption_summary_row['updated_at'].isoformat() if caption_summary_row['updated_at'] else None,
         }
 
-    # Service dispatch — most recent status per (service, cluster_id).
+    # Service dispatch — full observed dispatch set.
+    #
+    # Do not collapse rows with DISTINCT ON. Completion semantics need the
+    # actual number of dispatches that occurred, not just the latest status per
+    # (service, cluster_id).
     cur.execute(
-        """SELECT DISTINCT ON (service, cluster_id)
-                  service, cluster_id, status, failed_reason, dispatched_at
+        """SELECT dispatch_id, service, cluster_id, status, failed_reason, dispatched_at
            FROM service_dispatch
            WHERE image_id = %s
-           ORDER BY service, cluster_id NULLS LAST, dispatched_at DESC""",
+           ORDER BY dispatched_at ASC, dispatch_id ASC""",
         (image_id,),
     )
     service_dispatch = []
@@ -186,6 +191,56 @@ def fetch_results(cur, image_id):
         if row.get('dispatched_at'):
             row['dispatched_at'] = row['dispatched_at'].isoformat()
         service_dispatch.append(row)
+
+    # Status-facing current dispatch view.
+    current_service_dispatch_map = {}
+    for row in service_dispatch:
+        key = (row.get('service'), row.get('cluster_id'))
+        current_service_dispatch_map[key] = row
+    current_service_dispatch = list(current_service_dispatch_map.values())
+
+    # Postprocessing events — append-only child-work breadcrumbs.
+    cur.execute(
+        """SELECT event_id, service, cluster_id, event_type, merged_box_id,
+                  source_service, source_stage, data, created_at
+           FROM postprocessing_events
+           WHERE image_id = %s
+           ORDER BY created_at ASC, event_id ASC""",
+        (image_id,),
+    )
+    postprocessing_events = []
+    for r in cur.fetchall():
+        row = dict(r)
+        if row.get('created_at'):
+            row['created_at'] = row['created_at'].isoformat()
+        postprocessing_events.append(row)
+
+    current_postprocessing_event_map = {}
+    for row in postprocessing_events:
+        key = (row.get('service'), row.get('cluster_id'))
+        current_postprocessing_event_map[key] = row
+    current_postprocessing_events = list(current_postprocessing_event_map.values())
+
+    # Service events — append-only image-level internal/progressive breadcrumbs.
+    cur.execute(
+        """SELECT event_id, service, event_type, source_service, source_stage, data, created_at
+           FROM service_events
+           WHERE image_id = %s
+           ORDER BY created_at ASC, event_id ASC""",
+        (image_id,),
+    )
+    service_events = []
+    for r in cur.fetchall():
+        row = dict(r)
+        if row.get('created_at'):
+            row['created_at'] = row['created_at'].isoformat()
+        service_events.append(row)
+
+    current_service_event_map = {}
+    for row in service_events:
+        key = row.get('service')
+        current_service_event_map[key] = row
+    current_service_events = list(current_service_event_map.values())
 
     # Resolve source_bbox for SAM3-dispatched postprocessing rows.
     if sam3_results:
@@ -225,4 +280,9 @@ def fetch_results(cur, image_id):
         "postprocessing":   postprocessing,
         "sam3":             sam3_results,
         "service_dispatch": service_dispatch,
+        "current_service_dispatch": current_service_dispatch,
+        "postprocessing_events": postprocessing_events,
+        "current_postprocessing_events": current_postprocessing_events,
+        "service_events": service_events,
+        "current_service_events": current_service_events,
     }

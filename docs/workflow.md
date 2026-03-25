@@ -10,7 +10,6 @@ The runtime sources of truth remain:
 
 - [core/dispatch.py](/home/sd/windmill/core/dispatch.py) for expected downstream computation
 - [workers/base_worker.py](/home/sd/windmill/workers/base_worker.py) for primary downstream triggers
-- [workers/harmony_worker.py](/home/sd/windmill/workers/harmony_worker.py) for spatial postprocessing and consensus retrigger
 - [workers/noun_consensus_worker.py](/home/sd/windmill/workers/noun_consensus_worker.py) for grounding and caption-summary triggers
 - [workers/consensus_worker.py](/home/sd/windmill/workers/consensus_worker.py) for content-analysis trigger
 
@@ -39,10 +38,8 @@ flowchart TD
     PrimaryWorkers --> ConsensusEligible[Consensus-eligible primaries]
     PrimaryWorkers --> Nudenet[nudenet]
 
-    Spatial --> Harmony[harmony]
-    Harmony --> Face[face]
-    Harmony --> Pose[pose]
-    Harmony --> Consensus[consensus]
+    Spatial --> Face[face]
+    Spatial --> Pose[pose]
 
     VLM --> Noun[noun_consensus]
     VLM --> Verb[verb_consensus]
@@ -61,20 +58,18 @@ These conditions document what `compute_expected_downstream()` currently models.
 
 | Downstream stage | Expected when |
 |---|---|
-| `harmony` | at least one spatial primary was submitted and the tier allows `system.harmony` |
-| `consensus` | at least one submitted primary has `consensus: true` and the tier allows `system.harmony` |
+| `consensus` | at least one submitted primary has `consensus: true` |
 | `noun_consensus` | at least one submitted primary is a VLM |
 | `verb_consensus` | at least one submitted primary is a VLM |
-| `sam3` | at least one submitted primary is a VLM and the tier allows `system.sam3` |
-| `caption_summary` | at least two submitted primaries are VLMs and the tier allows `system.caption_summary` |
-| `content_analysis` | `nudenet` was submitted and the tier allows `system.content_analysis` |
-| `rembg` | the tier allows `system.rembg` |
+| `sam3` | at least one submitted primary is a VLM and the tier includes the `system.sam3` service |
+| `caption_summary` | at least two submitted primaries are VLMs and the tier includes the `system.caption_summary` service |
+| `content_analysis` | `nudenet` was submitted and the tier includes the `system.content_analysis` service |
+| `rembg` | the tier includes the `system.rembg` service |
 | `florence2_grounding` | `florence2` was submitted |
 
 ## Important Nuances
 
-- `consensus` is currently expected using the same tier gate as `system.harmony` because that is how [core/dispatch.py](/home/sd/windmill/core/dispatch.py) is written today.
-- `harmony` retriggers `consensus` after merged boxes are updated.
+- `system.caption_summary`, etc. are full service identifiers, not names of a separate `system` tier.
 - `noun_consensus` triggers `florence2_grounding` progressively and may do so more than once as VLM results arrive.
 - `caption_summary` is progressive and can retrigger as additional captions arrive.
 - `rembg` is producer-triggered rather than worker-triggered in the current deployment model, but it is still part of the expected downstream product set.
