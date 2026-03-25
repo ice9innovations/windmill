@@ -197,26 +197,13 @@ services:
         - premium
         - batch
 
-  postprocessing:
-    # Postprocessing Services - Run on cropped bbox regions or captions
-    colors_post:
-      queue_name: colors_post
-      host: localhost
-      port: 7770
-      endpoint: /analyze
-      service_type: colors
-      consensus: false
-      tier:
-        - basic
-        - premium
-        - batch
-
     face:
       queue_name: face
       host: localhost
       port: 7772
       endpoint: /analyze
       service_type: specialized
+      consensus: false
       tier:
         - basic
         - premium
@@ -233,6 +220,9 @@ services:
         - basic
         - premium
         - batch
+
+  postprocessing:
+    {}
 
   system:
 
