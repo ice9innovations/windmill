@@ -121,6 +121,7 @@ class ConsensusWorkerMergeFocused(BaseWorker):
             source_service='consensus',
             source_stage='content_analysis_trigger',
             data={'tier': tier},
+            commit=True,
         )
         self._enqueue_publish(
             self._get_queue_name('system.content_analysis'),

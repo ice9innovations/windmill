@@ -313,15 +313,23 @@ class BaseWorker:
     def _build_queue_params(self, **overrides):
         """Build pika ConnectionParameters with optional TLS support."""
         credentials = pika.PlainCredentials(self.queue_user, self.queue_password)
+        heartbeat = int(os.getenv('QUEUE_HEARTBEAT_SECONDS', '300'))
+        blocked_timeout = int(os.getenv('QUEUE_BLOCKED_TIMEOUT_SECONDS', '600'))
+        socket_timeout = int(os.getenv('QUEUE_SOCKET_TIMEOUT_SECONDS', '30'))
+        connection_attempts = int(os.getenv('QUEUE_CONNECTION_ATTEMPTS', '10'))
+        retry_delay = int(os.getenv('QUEUE_CONNECTION_RETRY_DELAY_SECONDS', '5'))
         kwargs = dict(
             host=self.queue_host,
             port=self.queue_port,
             credentials=credentials,
-            heartbeat=60,
-            blocked_connection_timeout=300,
-            connection_attempts=10,
-            retry_delay=5,
-            socket_timeout=10,
+            # BlockingConnection heartbeats are serviced by the adapter loop.
+            # Many workers spend long stretches inside message callbacks, so a
+            # 60s heartbeat is too aggressive and causes gratuitous reconnects.
+            heartbeat=heartbeat,
+            blocked_connection_timeout=blocked_timeout,
+            connection_attempts=connection_attempts,
+            retry_delay=retry_delay,
+            socket_timeout=socket_timeout,
         )
         if self.queue_ssl:
             ssl_context = ssl.create_default_context()
@@ -576,11 +584,17 @@ class BaseWorker:
             return
         image_id = None
         trace_id = None
+        cluster_id = None
+        source_service = None
+        source_stage = None
         try:
             payload = json.loads(body)
             if isinstance(payload, dict):
                 image_id = payload.get('image_id')
                 trace_id = payload.get('trace_id')
+                cluster_id = payload.get('cluster_id')
+                source_service = payload.get('source_service')
+                source_stage = payload.get('source_stage')
         except Exception:
             pass
         bits = [
@@ -590,6 +604,10 @@ class BaseWorker:
         ]
         if image_id is not None:
             bits.insert(1, f"image={image_id}")
+        if cluster_id is not None:
+            bits.insert(2, f"cluster={cluster_id}")
+        if source_service or source_stage:
+            bits.insert(3, f"source={source_service or 'unknown'}:{source_stage or 'unknown'}")
         if retried:
             bits.append("retried=true")
         prefix = f"[{trace_id}] " if trace_id else ""
@@ -952,12 +970,11 @@ class BaseWorker:
     ):
         """Append one postprocessing event row. Best-effort and mutation-free."""
         if not cluster_id:
-            return
+            return {'insert': 0.0, 'commit': 0.0}
 
         try:
             cursor = self.db_conn.cursor()
-            if not getattr(self.db_conn, "autocommit", False):
-                cursor.execute("SAVEPOINT before_postprocessing_event")
+            insert_started_at = time.time()
             cursor.execute(
                 """
                 INSERT INTO postprocessing_events (
@@ -977,22 +994,23 @@ class BaseWorker:
                     json.dumps(data) if data is not None else None,
                 ),
             )
+            insert_duration = time.time() - insert_started_at
+            commit_duration = 0.0
             if getattr(self.db_conn, "autocommit", False) or commit:
+                commit_started_at = time.time()
                 self.db_conn.commit()
+                commit_duration = time.time() - commit_started_at
             cursor.close()
+            return {'insert': insert_duration, 'commit': commit_duration}
         except Exception as e:
             self.logger.warning(
                 f"Failed to record postprocessing_event for {service}/{image_id}/{cluster_id}: {e}"
             )
             try:
-                if getattr(self.db_conn, "autocommit", False):
-                    self.db_conn.rollback()
-                else:
-                    rollback_cursor = self.db_conn.cursor()
-                    rollback_cursor.execute("ROLLBACK TO SAVEPOINT before_postprocessing_event")
-                    rollback_cursor.close()
+                self.db_conn.rollback()
             except Exception:
                 pass
+            return {'insert': 0.0, 'commit': 0.0}
 
     def _record_service_event(
         self,
@@ -1007,8 +1025,7 @@ class BaseWorker:
         """Append one image-level service event row. Best-effort and mutation-free."""
         try:
             cursor = self.db_conn.cursor()
-            if not getattr(self.db_conn, "autocommit", False):
-                cursor.execute("SAVEPOINT before_service_event")
+            insert_started_at = time.time()
             cursor.execute(
                 """
                 INSERT INTO service_events (
@@ -1025,22 +1042,23 @@ class BaseWorker:
                     json.dumps(data) if data is not None else None,
                 ),
             )
+            insert_duration = time.time() - insert_started_at
+            commit_duration = 0.0
             if getattr(self.db_conn, "autocommit", False) or commit:
+                commit_started_at = time.time()
                 self.db_conn.commit()
+                commit_duration = time.time() - commit_started_at
             cursor.close()
+            return {'insert': insert_duration, 'commit': commit_duration}
         except Exception as e:
             self.logger.warning(
                 f"Failed to record service_event for {service}/{image_id}: {e}"
             )
             try:
-                if getattr(self.db_conn, "autocommit", False):
-                    self.db_conn.rollback()
-                else:
-                    rollback_cursor = self.db_conn.cursor()
-                    rollback_cursor.execute("ROLLBACK TO SAVEPOINT before_service_event")
-                    rollback_cursor.close()
+                self.db_conn.rollback()
             except Exception:
                 pass
+            return {'insert': 0.0, 'commit': 0.0}
 
     def _store_terminal_service_result(
         self,

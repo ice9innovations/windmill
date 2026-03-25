@@ -16,6 +16,7 @@ import sys
 import json
 import time
 import logging
+from contextlib import contextmanager
 import psycopg2
 import pika
 from datetime import datetime
@@ -295,39 +296,81 @@ class NounConsensusWorker(BaseWorker):
             if available_count <= last_count:
                 return  # Nothing new since last synthesis
 
-            # Declare caption_summary queue on consume channel (idempotent — queue is broker-side)
-            queue_name = self._get_queue_name('system.caption_summary')
-            dlq = f"{queue_name}.dlq"
-            self.channel.queue_declare(queue=dlq, durable=True)
-            self.channel.queue_declare(
-                queue=queue_name, durable=True,
-                arguments={'x-dead-letter-exchange': '', 'x-dead-letter-routing-key': dlq},
-            )
-            self._record_service_event(
-                image_id=image_id,
-                service='caption_summary',
-                event_type='enqueued',
-                source_service='noun_consensus',
-                source_stage='caption_summary_trigger',
-                data={
-                    'available_count': available_count,
-                    'last_count': last_count,
-                    'tier': tier,
-                },
-            )
-            self._enqueue_publish(
-                queue_name,
-                json.dumps({'image_id': image_id, 'image_data': image_data, 'tier': tier}),
-            )
-            self.logger.info(
-                f"noun_consensus: triggered caption_summary update for image {image_id} "
-                f"({available_count} captions available, last synthesis had {last_count})"
-            )
+            with self._image_service_lock(image_id, 42002):
+                if not self._should_trigger_caption_summary(image_id, available_count, tier):
+                    self.logger.debug(
+                        f"noun_consensus: caption_summary already current/in-flight for "
+                        f"image {image_id} with {available_count} captions; skipping trigger"
+                    )
+                    return
+
+                # Declare caption_summary queue on consume channel (idempotent — queue is broker-side)
+                queue_name = self._get_queue_name('system.caption_summary')
+                dlq = f"{queue_name}.dlq"
+                self.channel.queue_declare(queue=dlq, durable=True)
+                self.channel.queue_declare(
+                    queue=queue_name, durable=True,
+                    arguments={'x-dead-letter-exchange': '', 'x-dead-letter-routing-key': dlq},
+                )
+                self._record_service_event(
+                    image_id=image_id,
+                    service='caption_summary',
+                    event_type='enqueued',
+                    source_service='noun_consensus',
+                    source_stage='caption_summary_trigger',
+                    data={
+                        'available_count': available_count,
+                        'last_count': last_count,
+                        'tier': tier,
+                    },
+                )
+                self._enqueue_publish(
+                    queue_name,
+                    json.dumps({'image_id': image_id, 'image_data': image_data, 'tier': tier}),
+                )
+                self.logger.info(
+                    f"noun_consensus: triggered caption_summary update for image {image_id} "
+                    f"({available_count} captions available, last synthesis had {last_count})"
+                )
         except Exception as e:
             self.logger.error(
                 f"noun_consensus: failed to check/trigger caption_summary for image {image_id}: {e}"
             )
             raise
+
+    def _should_trigger_caption_summary(self, image_id: int, available_count: int, tier: str) -> bool:
+        """Return True only when caption_summary needs a new run for this caption count."""
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                SELECT event_type, data
+                FROM service_events
+                WHERE image_id = %s
+                  AND service = 'caption_summary'
+                ORDER BY event_id DESC
+                LIMIT 1
+                """,
+                (image_id,),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            if not row:
+                return True
+
+            event_type, data = row
+            if event_type != 'enqueued' or not isinstance(data, dict):
+                return True
+
+            return not (
+                data.get('available_count') == available_count
+                and data.get('tier') == tier
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"noun_consensus: failed caption_summary dedupe check for image {image_id}: {e}"
+            )
+            return True
 
     def _trigger_florence2_grounding(self, image_id: int, image_data: str, nouns: list, subject_noun: str = None, tier: str = 'free'):
         """Publish a Florence-2 grounding request for the final noun consensus.
@@ -336,37 +379,129 @@ class NounConsensusWorker(BaseWorker):
             self.logger.debug(f"noun_consensus: skipping Florence-2 grounding for tier '{tier}' image {image_id}")
             return
         try:
-            queue_name = self._get_queue_by_service_type('grounding')
-            self._record_service_event(
-                image_id=image_id,
-                service='florence2_grounding',
-                event_type='enqueued',
-                source_service='noun_consensus',
-                source_stage='grounding_trigger',
-                data={
-                    'nouns': nouns,
-                    'subject_noun': subject_noun,
-                    'tier': tier,
-                },
-            )
-            self._enqueue_publish(
-                queue_name,
-                json.dumps({
-                    'image_id': image_id,
-                    'image_data': image_data,
-                    'nouns': nouns,
-                    'subject_noun': subject_noun,
-                    'triggered_at': datetime.now().isoformat(),
-                    'tier': tier,
-                }),
-            )
-            self.logger.info(
-                f"noun_consensus: triggered Florence-2 grounding for image {image_id} "
-                f"with {len(nouns)} nouns: {nouns}"
-            )
+            with self._image_service_lock(image_id, 42001):
+                if not self._should_trigger_florence2_grounding(image_id, nouns):
+                    self.logger.debug(
+                        f"noun_consensus: Florence-2 grounding already current/in-flight "
+                        f"for image {image_id} with {len(nouns)} nouns; skipping trigger"
+                    )
+                    return
+                queue_name = self._get_queue_by_service_type('grounding')
+                self._record_service_event(
+                    image_id=image_id,
+                    service='florence2_grounding',
+                    event_type='enqueued',
+                    source_service='noun_consensus',
+                    source_stage='grounding_trigger',
+                    data={
+                        'nouns': nouns,
+                        'subject_noun': subject_noun,
+                        'tier': tier,
+                    },
+                )
+                self._enqueue_publish(
+                    queue_name,
+                    json.dumps({
+                        'image_id': image_id,
+                        'image_data': image_data,
+                        'nouns': nouns,
+                        'subject_noun': subject_noun,
+                        'triggered_at': datetime.now().isoformat(),
+                        'tier': tier,
+                    }),
+                )
+                self.logger.info(
+                    f"noun_consensus: triggered Florence-2 grounding for image {image_id} "
+                    f"with {len(nouns)} nouns: {nouns}"
+                )
         except Exception as e:
             self.logger.error(f"noun_consensus: failed to trigger Florence-2 grounding for image {image_id}: {e}")
             raise
+
+    @contextmanager
+    def _image_service_lock(self, image_id: int, lock_key: int):
+        cursor = self.db_conn.cursor()
+        try:
+            cursor.execute("SELECT pg_advisory_lock(%s, %s)", (int(lock_key), int(image_id)))
+            yield
+        finally:
+            try:
+                cursor.execute("SELECT pg_advisory_unlock(%s, %s)", (int(lock_key), int(image_id)))
+            finally:
+                cursor.close()
+
+    def _should_trigger_florence2_grounding(self, image_id: int, nouns: list) -> bool:
+        """Return True only when Florence-2 needs a new run for this noun set.
+
+        Suppress duplicate enqueue churn when:
+        - the latest stored Florence-2 result already used the same noun set, or
+        - an identical Florence-2 request is already enqueued and has not settled yet.
+        """
+        normalized = sorted({n.lower().strip() for n in nouns if n})
+        if not normalized:
+            return False
+
+        try:
+            cursor = self.db_conn.cursor()
+
+            # If the last stored Florence-2 result already used this exact noun set,
+            # noun_consensus does not need to enqueue the same work again.
+            cursor.execute(
+                """
+                SELECT data->'metadata'->>'nouns_queried'
+                FROM results
+                WHERE image_id = %s
+                  AND service = 'florence2_grounding'
+                ORDER BY result_created DESC
+                LIMIT 1
+                """,
+                (image_id,),
+            )
+            row = cursor.fetchone()
+            if row and row[0]:
+                try:
+                    previous = sorted({n.lower().strip() for n in json.loads(row[0]) if n})
+                    if previous == normalized:
+                        cursor.close()
+                        return False
+                except Exception:
+                    pass
+
+            # If any Florence-2 enqueue for the same noun set exists without a later
+            # terminal event for that same noun set, do not stack more copies behind it.
+            cursor.execute(
+                """
+                SELECT event_type, data
+                FROM service_events
+                WHERE image_id = %s
+                  AND service = 'florence2_grounding'
+                ORDER BY event_id DESC
+                """,
+                (image_id,),
+            )
+            rows = cursor.fetchall()
+            cursor.close()
+            if not rows:
+                return True
+
+            seen_terminal_for_same_set = False
+            for event_type, data in rows:
+                if not isinstance(data, dict):
+                    continue
+                event_nouns = data.get('nouns') or []
+                event_normalized = sorted({n.lower().strip() for n in event_nouns if n})
+                if event_normalized != normalized:
+                    continue
+                if event_type == 'enqueued' and not seen_terminal_for_same_set:
+                    return False
+                if event_type in ('completed', 'failed'):
+                    seen_terminal_for_same_set = True
+            return True
+        except Exception as e:
+            self.logger.warning(
+                f"noun_consensus: failed Florence-2 dedupe check for image {image_id}: {e}"
+            )
+            return True
 
 
     def _fetch_vlm_nouns(self, image_id: int) -> tuple:

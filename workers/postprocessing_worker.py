@@ -61,7 +61,16 @@ class PostProcessingWorker(BaseWorker):
         """Process the cropped image with the specific service - override in subclasses"""
         raise NotImplementedError("Subclasses must implement process_service")
     
-    def save_postprocessing_result(self, merged_box_id, image_id, result_data, bbox, cluster_id, processing_time=None):
+    def save_postprocessing_result(
+        self,
+        merged_box_id,
+        image_id,
+        result_data,
+        bbox,
+        cluster_id,
+        processing_time=None,
+        commit=True,
+    ):
         """Save postprocessing result to database"""
         try:
             cursor = self.db_conn.cursor()
@@ -82,6 +91,7 @@ class PostProcessingWorker(BaseWorker):
                 )
 
             # Insert postprocessing result
+            insert_started_at = time.time()
             cursor.execute("""
                 INSERT INTO postprocessing (merged_box_id, image_id, service, data, status, error_message, processing_time)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -94,10 +104,15 @@ class PostProcessingWorker(BaseWorker):
                 error_message,
                 processing_time,
             ))
+            insert_duration = time.time() - insert_started_at
             
-            self.db_conn.commit()
+            commit_duration = 0.0
+            if commit:
+                commit_started_at = time.time()
+                self.db_conn.commit()
+                commit_duration = time.time() - commit_started_at
             cursor.close()
-            return True
+            return True, {'insert': insert_duration, 'commit': commit_duration}
             
         except Exception as e:
             error_str = str(e)
@@ -106,7 +121,7 @@ class PostProcessingWorker(BaseWorker):
                 self.logger.info(f"Merged_box_id {merged_box_id} no longer exists (superseded by reharmonization) - skipping")
                 if self.db_conn:
                     self.db_conn.rollback()
-                return True  # Return success to acknowledge the message
+                return True, {'insert': 0.0, 'commit': 0.0}  # Return success to acknowledge the message
             else:
                 self.logger.error(f"Error saving postprocessing result: {e}")
                 if self.db_conn:
@@ -114,7 +129,7 @@ class PostProcessingWorker(BaseWorker):
                         self.db_conn.rollback()
                     except Exception:
                         pass
-                return False
+                return False, {'insert': 0.0, 'commit': 0.0}
     
 
     def process_message(self, ch, method, properties, body):
@@ -196,17 +211,21 @@ class PostProcessingWorker(BaseWorker):
             # Save terminal result
             if result_data is not None:
                 save_started_at = time.time()
-                success = self.save_postprocessing_result(
-                    merged_box_id, image_id, result_data, bbox, cluster_id, processing_time
+                success, save_timings = self.save_postprocessing_result(
+                    merged_box_id,
+                    image_id,
+                    result_data,
+                    bbox,
+                    cluster_id,
+                    processing_time,
+                    commit=False,
                 )
                 save_duration = time.time() - save_started_at
                 if success:
-                    self._safe_ack(ch, method.delivery_tag)
-                    event_write_started_at = time.time()
                     terminal_event_type = 'completed'
                     if isinstance(result_data, dict) and (result_data.get('status') or 'success') != 'success':
                         terminal_event_type = 'failed'
-                    self._record_postprocessing_event(
+                    event_timings = self._record_postprocessing_event(
                         image_id=image_id,
                         merged_box_id=merged_box_id,
                         service=self._get_clean_service_name(),
@@ -223,13 +242,18 @@ class PostProcessingWorker(BaseWorker):
                         },
                         commit=True,
                     )
-                    event_write_duration = time.time() - event_write_started_at
+                    event_write_duration = event_timings['insert'] + event_timings['commit']
+                    self._safe_ack(ch, method.delivery_tag)
                     timing = [
                         f"{self.service_name} image={image_id}",
                         f"cluster={cluster_id}",
                         f"service_call={processing_time:.3f}s",
                         f"save={save_duration:.3f}s",
+                        f"save_insert={save_timings['insert']:.3f}s",
+                        f"save_commit={save_timings['commit']:.3f}s",
                         f"event_write={event_write_duration:.3f}s",
+                        f"event_insert={event_timings['insert']:.3f}s",
+                        f"event_commit={event_timings['commit']:.3f}s",
                         f"total={time.time() - worker_received_at:.3f}s",
                     ]
                     if upstream_queue_wait is not None:
