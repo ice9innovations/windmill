@@ -231,6 +231,14 @@ services:
     # separate "system" tier.
     # Consensus does not trigger consensus.
 
+    consensus:
+      queue_name: consensus
+      service_type: consensus
+      tier:
+        - basic
+        - premium
+        - batch
+
     content_analysis:
       queue_name: content_analysis
       service_type: content_analysis
