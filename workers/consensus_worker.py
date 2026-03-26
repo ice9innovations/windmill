@@ -1001,6 +1001,7 @@ class ConsensusWorkerMergeFocused(BaseWorker):
                     'reason': 'No service results available',
                     'processing_time': round(t1 - t0, 3),
                     'services_count': 0,
+                    'changed': False,
                 }
 
             # Calculate consensus
@@ -1015,14 +1016,42 @@ class ConsensusWorkerMergeFocused(BaseWorker):
                     'reason': 'No usable consensus data',
                     'processing_time': round(t2 - t1, 3),
                     'services_count': len(service_results),
+                    'changed': False,
                 }
 
             t3 = time.time()
 
-            # Atomic DELETE + INSERT
             cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                SELECT consensus_data
+                FROM consensus
+                WHERE image_id = %s
+                LIMIT 1
+                """,
+                (image_id,),
+            )
+            existing_row = cursor.fetchone()
+            existing_consensus = existing_row[0] if existing_row else None
 
-            # Delete old consensus
+            if existing_consensus == consensus_data:
+                cursor.close()
+                t4 = time.time()
+                result_count = len(consensus_data.get('votes', {}).get('consensus', []))
+                self.logger.info(
+                    f"Consensus unchanged for {image_filename}: {result_count} emojis from {len(service_results)} services "
+                    f"[fetch={t1-t0:.3f}s calc={t2-t1:.3f}s health={t3-t2:.3f}s write=0.000s total={t4-t0:.3f}s]"
+                )
+                return {
+                    'status': 'success',
+                    'consensus_data': consensus_data,
+                    'reason': 'Consensus unchanged',
+                    'processing_time': round(t4 - t0, 3),
+                    'services_count': len(service_results),
+                    'changed': False,
+                }
+
+            # Atomic DELETE + INSERT
             cursor.execute("DELETE FROM consensus WHERE image_id = %s", (image_id,))
             deleted_count = cursor.rowcount
 
@@ -1050,6 +1079,7 @@ class ConsensusWorkerMergeFocused(BaseWorker):
                 'reason': None,
                 'processing_time': round(t4 - t0, 3),
                 'services_count': len(service_results),
+                'changed': True,
             }
 
         except Exception as e:
@@ -1099,6 +1129,7 @@ class ConsensusWorkerMergeFocused(BaseWorker):
             consensus_data = consensus_result.get('consensus_data')
             reason = consensus_result.get('reason')
             processing_time = consensus_result.get('processing_time')
+            changed = consensus_result.get('changed', False)
 
             if result_status == 'success':
                 self._store_terminal_service_result(
@@ -1131,7 +1162,7 @@ class ConsensusWorkerMergeFocused(BaseWorker):
                 self.logger.info(f"Completed merge-focused consensus for {image_filename}")
 
                 # Trigger content analysis after consensus completes (basic+ only)
-                if consensus_data is not None:
+                if consensus_data is not None and changed:
                     self.trigger_content_analysis(image_id, image_filename, tier)
             else:
                 self.logger.error(f"Failed to update merge-focused consensus for {image_filename}")

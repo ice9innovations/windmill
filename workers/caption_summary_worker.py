@@ -75,6 +75,7 @@ class CaptionSummaryWorker(BaseWorker):
     def process_message(self, ch, method, properties, body):
         """Override base process_message — DB fetch + caption-synthesis service call."""
         start_time = time.time()
+        previous_autocommit = None
 
         try:
             if not self.ensure_database_connection():
@@ -107,6 +108,8 @@ class CaptionSummaryWorker(BaseWorker):
             captions = self._fetch_captions(image_id, tier_vlm_services)
 
             if len(captions) <= existing_count:
+                previous_autocommit = self.db_conn.autocommit
+                self.db_conn.autocommit = False
                 self._store_terminal_service_result(
                     image_id,
                     {
@@ -122,6 +125,7 @@ class CaptionSummaryWorker(BaseWorker):
                         },
                     },
                     processing_time=round(time.time() - start_time, 3),
+                    commit=False,
                 )
                 self.logger.info(
                     f"caption_summary: image {image_id} already synthesized with "
@@ -134,12 +138,15 @@ class CaptionSummaryWorker(BaseWorker):
                     source_service='noun_consensus',
                     source_stage='caption_summary_run',
                     data={'reason': 'Already synthesized with current caption count'},
-                    commit=True,
+                    commit=False,
                 )
+                self.db_conn.commit()
                 self._safe_ack(ch, method.delivery_tag)
                 return
 
             if len(captions) < MIN_CAPTIONS:
+                previous_autocommit = self.db_conn.autocommit
+                self.db_conn.autocommit = False
                 self._store_terminal_service_result(
                     image_id,
                     {
@@ -154,6 +161,7 @@ class CaptionSummaryWorker(BaseWorker):
                         },
                     },
                     processing_time=round(time.time() - start_time, 3),
+                    commit=False,
                 )
                 self.logger.info(
                     f"caption_summary: image {image_id} has {len(captions)} caption(s), "
@@ -166,8 +174,9 @@ class CaptionSummaryWorker(BaseWorker):
                     source_service='noun_consensus',
                     source_stage='caption_summary_run',
                     data={'reason': f'Need at least {MIN_CAPTIONS} captions'},
-                    commit=True,
+                    commit=False,
                 )
+                self.db_conn.commit()
                 self._safe_ack(ch, method.delivery_tag)
                 return
 
@@ -183,12 +192,15 @@ class CaptionSummaryWorker(BaseWorker):
                 return
 
             if synthesis_result.get('status', 'success') != 'success':
+                previous_autocommit = self.db_conn.autocommit
+                self.db_conn.autocommit = False
                 self._store_terminal_service_result(
                     image_id,
                     synthesis_result,
                     status=synthesis_result.get('status', 'failed') or 'failed',
                     processing_time=round(time.time() - start_time, 3),
                     service='caption_summary',
+                    commit=False,
                 )
                 self._record_service_event(
                     image_id=image_id,
@@ -201,8 +213,9 @@ class CaptionSummaryWorker(BaseWorker):
                         or synthesis_result.get('error')
                         or synthesis_result.get('message')
                     },
-                    commit=True,
+                    commit=False,
                 )
+                self.db_conn.commit()
                 self._safe_ack(ch, method.delivery_tag)
                 self.job_completed_successfully()
                 self.logger.warning(
@@ -214,6 +227,8 @@ class CaptionSummaryWorker(BaseWorker):
             summary = synthesis_result.get('summary', '').strip()
             synthesis_model = synthesis_result.get('model', 'unknown')
             if not summary:
+                previous_autocommit = self.db_conn.autocommit
+                self.db_conn.autocommit = False
                 synthesis_result = {
                     'service': 'caption_summary',
                     'status': 'failed',
@@ -230,6 +245,7 @@ class CaptionSummaryWorker(BaseWorker):
                     status='failed',
                     processing_time=round(time.time() - start_time, 3),
                     service='caption_summary',
+                    commit=False,
                 )
                 self._record_service_event(
                     image_id=image_id,
@@ -238,8 +254,9 @@ class CaptionSummaryWorker(BaseWorker):
                     source_service='noun_consensus',
                     source_stage='caption_summary_run',
                     data={'error_message': 'Caption synthesis returned empty summary'},
-                    commit=True,
+                    commit=False,
                 )
+                self.db_conn.commit()
                 self._safe_ack(ch, method.delivery_tag)
                 self.job_completed_successfully()
                 self.logger.warning(
@@ -248,8 +265,10 @@ class CaptionSummaryWorker(BaseWorker):
                 return
 
             services_present = sorted(captions.keys())
+            previous_autocommit = self.db_conn.autocommit
+            self.db_conn.autocommit = False
             self._upsert(image_id, summary, synthesis_model, services_present,
-                         processing_time=round(time.time() - start_time, 3))
+                         processing_time=round(time.time() - start_time, 3), commit=False)
             self._store_terminal_service_result(
                 image_id,
                 {
@@ -263,6 +282,7 @@ class CaptionSummaryWorker(BaseWorker):
                     },
                 },
                 processing_time=round(time.time() - start_time, 3),
+                commit=False,
             )
             self._record_service_event(
                 image_id=image_id,
@@ -271,8 +291,9 @@ class CaptionSummaryWorker(BaseWorker):
                 source_service='noun_consensus',
                 source_stage='caption_summary_run',
                 data={'services_present': services_present},
-                commit=True,
+                commit=False,
             )
+            self.db_conn.commit()
 
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
@@ -284,9 +305,20 @@ class CaptionSummaryWorker(BaseWorker):
             )
 
         except Exception as e:
+            if self.db_conn and previous_autocommit is False:
+                try:
+                    self.db_conn.rollback()
+                except Exception:
+                    pass
             self.logger.error(f"caption_summary: error processing message: {e}")
             self._safe_nack(ch, method.delivery_tag, requeue=True)
             self.job_failed(str(e))
+        finally:
+            if self.db_conn and previous_autocommit is not None:
+                try:
+                    self.db_conn.autocommit = previous_autocommit
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Data fetching
@@ -398,7 +430,7 @@ class CaptionSummaryWorker(BaseWorker):
     # ------------------------------------------------------------------
 
     def _upsert(self, image_id: int, summary: str, model: str, services_present: list,
-                processing_time: float = None):
+                processing_time: float = None, commit: bool = True):
         """Insert or update the caption_summary row for this image."""
         try:
             cursor = self.db_conn.cursor()
@@ -418,7 +450,8 @@ class CaptionSummaryWorker(BaseWorker):
                 """,
                 (image_id, summary, model, services_present, len(services_present), processing_time)
             )
-            self.db_conn.commit()
+            if commit:
+                self.db_conn.commit()
             cursor.close()
         except Exception as e:
             self.logger.error(f"caption_summary: upsert failed for image {image_id}: {e}")

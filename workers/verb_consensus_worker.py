@@ -50,6 +50,7 @@ class VerbConsensusWorker(BaseWorker):
     def process_message(self, ch, method, properties, body):
         """Override base process_message - no ML service call, DB-only logic."""
         start_time = time.time()
+        timing = {}
 
         try:
             if not self.ensure_database_connection():
@@ -66,7 +67,9 @@ class VerbConsensusWorker(BaseWorker):
                 f"(triggered by {triggering_service})"
             )
 
+            t0 = time.time()
             service_verb_map, service_svo_map = self._fetch_vlm_verbs(image_id)
+            timing['fetch_vlm_verbs'] = time.time() - t0
 
             if not service_verb_map:
                 processing_time = round(time.time() - start_time, 3)
@@ -102,14 +105,19 @@ class VerbConsensusWorker(BaseWorker):
                 self.job_completed_successfully()
                 return
 
+            t0 = time.time()
             collapsed = collapse_synonyms(service_verb_map)
+            timing['collapse_synonyms'] = time.time() - t0
 
             services_present = sorted(service_verb_map.keys())
+            t0 = time.time()
             self._upsert_verb_consensus(
                 image_id, collapsed, service_svo_map, services_present,
                 processing_time=round(time.time() - start_time, 3),
             )
+            timing['upsert_verb_consensus'] = time.time() - t0
 
+            t0 = time.time()
             self._store_terminal_service_result(
                 image_id,
                 {
@@ -120,10 +128,13 @@ class VerbConsensusWorker(BaseWorker):
                     'services_present': services_present,
                     'metadata': {
                         'processed_at': datetime.now().isoformat(),
+                        'services_present': services_present,
                     },
                 },
                 processing_time=round(time.time() - start_time, 3),
             )
+            timing['store_terminal_result'] = time.time() - t0
+            t0 = time.time()
             self._record_service_event(
                 image_id=image_id,
                 service='verb_consensus',
@@ -132,6 +143,18 @@ class VerbConsensusWorker(BaseWorker):
                 source_stage='verb_consensus_run',
                 data={'services_present': services_present},
                 commit=True,
+            )
+            timing['record_completed_event'] = time.time() - t0
+
+            total_duration = time.time() - start_time
+            slow_bits = " ".join(
+                f"{name}={duration:.3f}s"
+                for name, duration in timing.items()
+                if duration >= 0.05
+            )
+            self.logger.info(
+                f"verb_consensus timing image={image_id} total={total_duration:.3f}s "
+                f"{slow_bits}".rstrip()
             )
 
             self._safe_ack(ch, method.delivery_tag)

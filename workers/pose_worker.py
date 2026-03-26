@@ -11,21 +11,27 @@ import io
 import json
 import requests
 from postprocessing_worker import PostProcessingWorker
+from base_worker import BaseWorker
 
 class BboxPoseWorker(PostProcessingWorker):
     """Worker for pose estimation on cropped person bounding boxes"""
 
     def __init__(self):
-        super().__init__('postprocessing.pose')
+        super().__init__('primary.pose')
         self.current_bbox = None
 
     def process_message(self, ch, method, properties, body):
-        """Store bbox context for coordinate transformation, then call parent."""
+        """Handle both legacy bbox messages and new primary image messages."""
         try:
-            self.current_bbox = self._parse_message_body(body).get('bbox', {})
+            message = self._parse_message_body(body)
+            if 'cropped_image_data' in message:
+                self.current_bbox = message.get('bbox', {})
+                return super().process_message(ch, method, properties, body)
+            self.current_bbox = None
+            return BaseWorker.process_message(self, ch, method, properties, body)
         except Exception:
             self.current_bbox = {}
-        return super().process_message(ch, method, properties, body)
+            return super().process_message(ch, method, properties, body)
 
     def process_service(self, cropped_image_data):
         """Process pose estimation on cropped image"""

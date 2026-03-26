@@ -140,10 +140,9 @@ class XaiWorker(BaseWorker):
         )
 
     def _fire_downstream(self, image_id, message):
-        """Trigger noun_consensus, verb_consensus, and consensus so the pipeline doesn't stall."""
+        """Trigger noun_consensus and verb_consensus so the pipeline doesn't stall."""
         self.trigger_noun_consensus(image_id, message)
         self.trigger_verb_consensus(image_id, message)
-        self.trigger_consensus(image_id, message)
 
 
 if __name__ == "__main__":

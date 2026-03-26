@@ -35,11 +35,10 @@ class Florence2GroundingWorker(BaseWorker):
 
     def __init__(self):
         super().__init__('system.florence2_grounding')
-        self._colors_post_queue = self._get_queue_name('postprocessing.colors_post')
 
     def _declare_additional_queues(self, declare_with_dlq):
-        """Declare colors_post queue on the publish channel."""
-        declare_with_dlq(self._publish_channel, self._colors_post_queue)
+        """No additional queues."""
+        return
 
     def _crop_bbox_from_image_data(self, image_data_b64: str, bbox: dict):
         try:
@@ -65,6 +64,7 @@ class Florence2GroundingWorker(BaseWorker):
 
     def process_message(self, ch, method, properties, body):
         start_time = time.time()
+        previous_autocommit = None
 
         try:
             if not self.ensure_database_connection():
@@ -162,7 +162,9 @@ class Florence2GroundingWorker(BaseWorker):
             processing_time = round(time.time() - start_time, 3)
 
             if result_status != 'success':
-                self._store_result(image_id, result, processing_time)
+                previous_autocommit = self.db_conn.autocommit
+                self.db_conn.autocommit = False
+                self._store_result(image_id, result, processing_time, commit=False)
                 self._record_service_event(
                     image_id=image_id,
                     service='florence2_grounding',
@@ -172,8 +174,9 @@ class Florence2GroundingWorker(BaseWorker):
                     data={
                         'error_message': result.get('error') or result.get('message'),
                     },
-                    commit=True,
+                    commit=False,
                 )
+                self.db_conn.commit()
                 self._safe_ack(ch, method.delivery_tag)
                 self.job_completed_successfully()
                 self.logger.warning(
@@ -183,8 +186,6 @@ class Florence2GroundingWorker(BaseWorker):
                 return
 
             # Embed the noun set in metadata so dedup can read it back next trigger.
-            # Also record the colors_post dispatch count so the API can gate
-            # is_complete on all bbox-level color jobs finishing.
             predictions = result.get('predictions', [])
 
             # Florence-2 occasionally returns inverted bbox coordinates (y2 < y1 in
@@ -203,17 +204,12 @@ class Florence2GroundingWorker(BaseWorker):
                         h = -h
                     p['bbox'] = [x, y, w, h]
 
-            colors_post_count = sum(
-                1 for p in predictions
-                if p.get('bbox') and len(p['bbox']) >= 4
-                and p['bbox'][2] >= MIN_COLORS_SIZE[0]
-                and p['bbox'][3] >= MIN_COLORS_SIZE[1]
-            )
             result.setdefault('metadata', {})['nouns_queried'] = json.dumps(nouns)
-            result['metadata']['colors_post_dispatched'] = colors_post_count
+            result['metadata']['colors_post_dispatched'] = 0
 
-            self._store_result(image_id, result, processing_time)
-            self._dispatch_colors_post(image_id, image_data, predictions, tier, message.get('trace_id'))
+            previous_autocommit = self.db_conn.autocommit
+            self.db_conn.autocommit = False
+            self._store_result(image_id, result, processing_time, commit=False)
 
             # Mark nouns that were successfully grounded back in noun_consensus.
             # Must happen before ACK so the grounding_validated backfill is
@@ -224,7 +220,7 @@ class Florence2GroundingWorker(BaseWorker):
                 if p.get('label')
             ]
             if grounded_labels:
-                self._validate_noun_consensus(image_id, nouns, grounded_labels)
+                self._validate_noun_consensus(image_id, nouns, grounded_labels, commit=False)
 
             self._record_service_event(
                 image_id=image_id,
@@ -236,8 +232,9 @@ class Florence2GroundingWorker(BaseWorker):
                     'prediction_count': len(result.get('predictions', [])),
                     'nouns_queried': nouns,
                 },
-                commit=True,
+                commit=False,
             )
+            self.db_conn.commit()
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
 
@@ -248,9 +245,20 @@ class Florence2GroundingWorker(BaseWorker):
             )
 
         except Exception as e:
+            if self.db_conn and previous_autocommit is False:
+                try:
+                    self.db_conn.rollback()
+                except Exception:
+                    pass
             self.logger.error(f"florence2_grounding: error processing message: {e}")
             self._safe_nack(ch, method.delivery_tag, requeue=True)
             self.job_failed(str(e))
+        finally:
+            if self.db_conn and previous_autocommit is not None:
+                try:
+                    self.db_conn.autocommit = previous_autocommit
+                except Exception:
+                    pass
 
     def _build_grounding_prompt(self, nouns: list) -> str:
         """Build a comma-separated noun prompt for CAPTION_TO_PHRASE_GROUNDING.
@@ -354,7 +362,7 @@ class Florence2GroundingWorker(BaseWorker):
             self.logger.error(f"florence2_grounding: REST call failed before terminal response: {e}")
             return None
 
-    def _store_result(self, image_id: int, data: dict, processing_time: float):
+    def _store_result(self, image_id: int, data: dict, processing_time: float, commit: bool = True):
         """Insert Florence-2 grounding result into the results table."""
         try:
             cursor = self.db_conn.cursor()
@@ -373,7 +381,8 @@ class Florence2GroundingWorker(BaseWorker):
                     processing_time,
                 ),
             )
-            self.db_conn.commit()
+            if commit:
+                self.db_conn.commit()
             cursor.close()
         except Exception as e:
             self.logger.error(
@@ -382,7 +391,7 @@ class Florence2GroundingWorker(BaseWorker):
             raise
 
     def _validate_noun_consensus(
-        self, image_id: int, queried_nouns: list, grounded_labels: list
+        self, image_id: int, queried_nouns: list, grounded_labels: list, commit: bool = True
     ):
         """Set grounding_validated=true on noun_consensus nouns that Florence-2 grounded.
 
@@ -421,7 +430,8 @@ class Florence2GroundingWorker(BaseWorker):
                 """,
                 (validated, image_id),
             )
-            self.db_conn.commit()
+            if commit:
+                self.db_conn.commit()
             cursor.close()
             self.logger.info(
                 f"florence2_grounding: validated {len(validated)} nouns "
@@ -432,100 +442,6 @@ class Florence2GroundingWorker(BaseWorker):
                 f"florence2_grounding: failed to write validation "
                 f"for image {image_id}: {e}"
             )
-
-
-    def _dispatch_colors_post(self, image_id: int, image_data_b64: str, predictions: list, tier: str = 'free', trace_id: str = None):
-        """Send direct colors_post jobs."""
-        if not predictions:
-            return
-
-        dispatched = 0
-        skipped_existing = 0
-        for index, pred in enumerate(predictions):
-            bbox_arr = pred.get('bbox')
-            label = pred.get('label', 'unknown')
-            if not bbox_arr or len(bbox_arr) < 4:
-                continue
-
-            x, y, w, h = bbox_arr[0], bbox_arr[1], bbox_arr[2], bbox_arr[3]
-
-            if w < MIN_COLORS_SIZE[0] or h < MIN_COLORS_SIZE[1]:
-                continue
-
-            cluster_id = f"grounding_{label}_{index}"
-            if self._has_active_or_completed_colors_dispatch(image_id, cluster_id):
-                skipped_existing += 1
-                continue
-
-            bbox = {'x': x, 'y': y, 'width': w, 'height': h}
-            cropped_image_data = self._crop_bbox_from_image_data(image_data_b64, bbox)
-            if not cropped_image_data:
-                continue
-
-            self._record_postprocessing_event(
-                image_id=image_id,
-                merged_box_id=None,
-                service='colors_post',
-                cluster_id=cluster_id,
-                event_type='enqueued',
-                source_service='florence2_grounding',
-                source_stage='grounding_complete',
-                data={'bbox': bbox, 'label': label},
-            )
-            message = {
-                'merged_box_id': None,
-                'image_id': image_id,
-                'cluster_id': cluster_id,
-                'bbox': bbox,
-                'cropped_image_data': cropped_image_data,
-                'trace_id': trace_id,
-                'tier': tier,
-                'source_service': 'florence2_grounding',
-                'source_stage': 'grounding_complete',
-                'dispatch_enqueued_at': datetime.now().isoformat(),
-                'metadata': {'label': label},
-            }
-            self._enqueue_publish(self._colors_post_queue, json.dumps(message))
-            dispatched += 1
-
-        if dispatched:
-            self.logger.info(
-                f"florence2_grounding: dispatched {dispatched} colors_post jobs "
-                f"for image {image_id}"
-            )
-        elif skipped_existing:
-            self.logger.info(
-                f"florence2_grounding: skipped {skipped_existing} duplicate colors_post job(s) "
-                f"for image {image_id}"
-            )
-
-    def _has_active_or_completed_colors_dispatch(self, image_id: int, cluster_id: str) -> bool:
-        """Return True when colors_post for this image/cluster is already live or settled."""
-        try:
-            cursor = self.db_conn.cursor()
-            cursor.execute(
-                """
-                SELECT event_type
-                FROM postprocessing_events
-                WHERE image_id = %s
-                  AND service = 'colors_post'
-                  AND cluster_id = %s
-                ORDER BY event_id DESC
-                LIMIT 1
-                """,
-                (image_id, cluster_id),
-            )
-            row = cursor.fetchone()
-            cursor.close()
-            if not row:
-                return False
-            return row[0] in ('enqueued', 'completed')
-        except Exception as e:
-            self.logger.warning(
-                f"florence2_grounding: duplicate colors_post check failed for "
-                f"image {image_id} cluster {cluster_id}: {e}"
-            )
-            return False
 
 
 if __name__ == '__main__':

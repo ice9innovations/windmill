@@ -12,7 +12,6 @@ WORKFLOW_VERSION = 1
 # not a separate customer tier namespace.
 
 PREDICATE_DESCRIPTIONS = {
-    'has_consensus_service': 'At least one submitted primary service has consensus=true.',
     'has_spatial_primary': 'At least one submitted primary service is spatial.',
     'has_vlm': 'At least one submitted primary service is a VLM.',
     'has_multi_vlm': 'At least two submitted primary services are VLMs.',
@@ -21,16 +20,6 @@ PREDICATE_DESCRIPTIONS = {
 }
 
 WORKFLOW_STAGES = {
-    'consensus': {
-        'kind': 'system',
-        'expected_when': ['has_consensus_service'],
-        'triggered_by': [
-            {
-                'source': 'primary.consensus_eligible',
-                'worker': 'workers/base_worker.py',
-            },
-        ],
-    },
     'noun_consensus': {
         'kind': 'system',
         'expected_when': ['has_vlm'],
@@ -77,8 +66,9 @@ WORKFLOW_STAGES = {
         'expected_when': ['has_nudenet', 'tier_allows:system.content_analysis'],
         'triggered_by': [
             {
-                'source': 'system.consensus',
-                'worker': 'workers/consensus_worker.py',
+                'source': 'system.noun_consensus',
+                'worker': 'workers/noun_consensus_worker.py',
+                'note': 'progressive; retriggered only when noun-consensus inputs materially advance',
             }
         ],
     },
@@ -110,10 +100,6 @@ WORKFLOW_STAGES = {
 def build_workflow_context(services_submitted, config, tier='free'):
     """Build the normalized predicate context for one submission."""
     services_submitted = services_submitted or []
-    has_consensus_service = any(
-        config.should_trigger_consensus(f'primary.{s}')
-        for s in services_submitted
-    )
     vlm_services = [
         s for s in services_submitted
         if config.is_vlm_service(f'primary.{s}')
@@ -121,7 +107,6 @@ def build_workflow_context(services_submitted, config, tier='free'):
     return {
         'services_submitted': services_submitted,
         'tier': tier,
-        'has_consensus_service': has_consensus_service,
         'has_spatial_primary': any(
             config.is_spatial_service(f'primary.{s}')
             for s in services_submitted

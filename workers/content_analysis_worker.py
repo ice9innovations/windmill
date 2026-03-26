@@ -10,6 +10,7 @@ sys.path.append(os.path.dirname(__file__))
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 import json
+import hashlib
 import time
 import psycopg2
 import yaml
@@ -180,7 +181,6 @@ class ContentAnalysisWorker(BaseWorker):
 
         Returns dict with:
         - results: all service results
-        - consensus: consensus detections
         - captions: VLM captions
         - nudenet_detections: NudeNet anatomy detections
         """
@@ -259,27 +259,16 @@ class ContentAnalysisWorker(BaseWorker):
                             continue
                         yolo_person_bboxes.append({'id': i, 'bbox': bbox})
 
-            # Get consensus
-            cursor.execute("""
-                SELECT consensus_data
-                FROM consensus
-                WHERE image_id = %s
-            """, (image_id,))
-
-            consensus_data = None
-            row = cursor.fetchone()
-            if row:
-                consensus_data = row[0]
-
-            # Get face service results from postprocessing
+            face_service_detections = []
             cursor.execute("""
                 SELECT data
-                FROM postprocessing
+                FROM results
                 WHERE image_id = %s AND service = 'face' AND status = 'success'
+                ORDER BY result_created DESC
+                LIMIT 1
             """, (image_id,))
-
-            face_service_detections = []
-            for row in cursor.fetchall():
+            row = cursor.fetchone()
+            if row:
                 face_data = row[0]
                 if face_data and face_data.get('predictions'):
                     for pred in face_data['predictions']:
@@ -290,6 +279,23 @@ class ContentAnalysisWorker(BaseWorker):
                                 'confidence': pred.get('confidence', 0.0),
                                 'label': pred.get('label', 'face')
                             })
+            else:
+                cursor.execute("""
+                    SELECT data
+                    FROM postprocessing
+                    WHERE image_id = %s AND service = 'face' AND status = 'success'
+                """, (image_id,))
+                for row in cursor.fetchall():
+                    face_data = row[0]
+                    if face_data and face_data.get('predictions'):
+                        for pred in face_data['predictions']:
+                            if pred.get('bbox'):
+                                face_service_detections.append({
+                                    'bbox': pred['bbox'],
+                                    'keypoints': pred.get('keypoints'),
+                                    'confidence': pred.get('confidence', 0.0),
+                                    'label': pred.get('label', 'face')
+                                })
 
             # Fetch noun consensus data
             GENDERED_NOUNS = {
@@ -327,7 +333,6 @@ class ContentAnalysisWorker(BaseWorker):
             return {
                 'results': results,
                 'yolo_person_bboxes': yolo_person_bboxes,
-                'consensus': consensus_data,
                 'captions': captions,
                 'nudenet_detections': nudenet_detections,
                 'nsfw2_result': nsfw2_result,
@@ -340,6 +345,79 @@ class ContentAnalysisWorker(BaseWorker):
 
         except Exception as e:
             self.logger.error(f"Error fetching image data: {e}")
+            return None
+
+    def _build_input_fingerprint(self, image_data):
+        """Build a stable fingerprint for the inputs that drive content analysis."""
+        try:
+            captions = sorted(
+                (
+                    item.get('service', ''),
+                    item.get('text', ''),
+                )
+                for item in (image_data.get('captions') or [])
+            )
+
+            nudenet_detections = sorted(
+                json.dumps(item, sort_keys=True, separators=(',', ':'))
+                for item in (image_data.get('nudenet_detections') or [])
+            )
+
+            face_service_detections = sorted(
+                json.dumps(item, sort_keys=True, separators=(',', ':'))
+                for item in (image_data.get('face_service_detections') or [])
+            )
+
+            yolo_person_bboxes = sorted(
+                json.dumps(item, sort_keys=True, separators=(',', ':'))
+                for item in (image_data.get('yolo_person_bboxes') or [])
+            )
+
+            noun_consensus_nouns = sorted(
+                json.dumps(item, sort_keys=True, separators=(',', ':'))
+                for item in (image_data.get('noun_consensus_nouns') or [])
+            )
+
+            fingerprint_payload = {
+                'captions': captions,
+                'nudenet_detections': nudenet_detections,
+                'nsfw2_result': image_data.get('nsfw2_result'),
+                'image_width': image_data.get('image_width'),
+                'image_height': image_data.get('image_height'),
+                'yolo_person_bboxes': yolo_person_bboxes,
+                'face_service_detections': face_service_detections,
+                'noun_consensus_nouns': noun_consensus_nouns,
+                'noun_consensus_service_count': image_data.get('noun_consensus_service_count'),
+            }
+            serialized = json.dumps(fingerprint_payload, sort_keys=True, separators=(',', ':'))
+            return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
+        except Exception as e:
+            self.logger.warning(f"Failed to build content analysis fingerprint: {e}")
+            return None
+
+    def _latest_input_fingerprint(self, image_id):
+        """Return the last stored content-analysis input fingerprint, if any."""
+        try:
+            cursor = self.read_db_conn.cursor()
+            cursor.execute(
+                """
+                SELECT data->'metadata'->>'input_fingerprint'
+                FROM results
+                WHERE image_id = %s
+                  AND service = 'content_analysis'
+                  AND status = 'success'
+                ORDER BY result_created DESC
+                LIMIT 1
+                """,
+                (image_id,),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            return row[0] if row and row[0] else None
+        except Exception as e:
+            self.logger.warning(
+                f"Failed to fetch latest content-analysis fingerprint for image {image_id}: {e}"
+            )
             return None
 
     def correlate_with_nsfw2(self, scene_type, nsfw2_result, nudenet_detections=None):
@@ -467,13 +545,7 @@ class ContentAnalysisWorker(BaseWorker):
         try:
             captions = image_data['captions']
             nudenet_detections = image_data['nudenet_detections']
-            consensus_data = image_data.get('consensus')
             validated_gendered_nouns = image_data.get('validated_gendered_nouns', [])
-
-            # Extract consensus emojis if available
-            consensus_emojis = []
-            if consensus_data and 'votes' in consensus_data and 'consensus' in consensus_data['votes']:
-                consensus_emojis = [v['emoji'] for v in consensus_data['votes']['consensus']]
 
             # Extract keywords from captions
             extracted_keywords = extract_keywords_from_captions(captions)
@@ -724,6 +796,26 @@ class ContentAnalysisWorker(BaseWorker):
                 self.job_failed("Failed to fetch image data")
                 return
 
+            input_fingerprint = self._build_input_fingerprint(image_data)
+            previous_fingerprint = self._latest_input_fingerprint(image_id)
+            if input_fingerprint and previous_fingerprint == input_fingerprint:
+                self.logger.info(
+                    f"Skipping unchanged content analysis for image {image_id} "
+                    f"(fingerprint={input_fingerprint[:12]})"
+                )
+                self._record_service_event(
+                    image_id=image_id,
+                    service='content_analysis',
+                    event_type='completed',
+                    source_service=message.get('triggered_by'),
+                    source_stage='content_analysis_run',
+                    data={'reason': 'unchanged_input', 'input_fingerprint': input_fingerprint},
+                    commit=True,
+                )
+                self._safe_ack(ch, method.delivery_tag)
+                self.job_completed_successfully()
+                return
+
             # Run content analysis
             analysis = self.analyze_content(image_id, image_data)
             if not analysis:
@@ -766,6 +858,9 @@ class ContentAnalysisWorker(BaseWorker):
                     'status': 'success',
                     'full_analysis': analysis['full_analysis'],
                     'analysis_version': analysis['analysis_version'],
+                    'metadata': {
+                        'input_fingerprint': input_fingerprint,
+                    },
                 },
                 processing_time=round(time.time() - start_time, 3),
                 service='content_analysis',
@@ -776,6 +871,7 @@ class ContentAnalysisWorker(BaseWorker):
                 event_type='completed',
                 source_service=message.get('triggered_by'),
                 source_stage='content_analysis_run',
+                data={'input_fingerprint': input_fingerprint} if input_fingerprint else None,
                 commit=True,
             )
 

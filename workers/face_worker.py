@@ -11,67 +11,30 @@ import io
 import json
 import requests
 from postprocessing_worker import PostProcessingWorker
+from base_worker import BaseWorker
 
 class BboxFaceWorker(PostProcessingWorker):
     """Worker for face detection on cropped person bounding boxes"""
     
     def __init__(self):
-        super().__init__('postprocessing.face')
+        super().__init__('primary.face')
         self.current_bbox = None  # Store current person bbox for coordinate transformation
     
     def process_message(self, ch, method, properties, body):
-        """Override to store bbox data for coordinate transformation, then
-        re-trigger content_analysis so the face+NudeNet face correlation runs
-        with actual face service detections available."""
+        """Handle both legacy bbox messages and new primary image messages."""
         try:
             message = self._parse_message_body(body)
-            self.current_bbox = message.get('bbox', {})
-            image_id = message.get('image_id')
-            tier = message.get('tier', 'free')
+            if 'cropped_image_data' in message:
+                self.current_bbox = message.get('bbox', {})
+                return super().process_message(ch, method, properties, body)
 
-            # Call parent process_message which will call our process_service
-            result = super().process_message(ch, method, properties, body)
-
-            # Re-trigger content_analysis now that face detections are in the
-            # postprocessing table.  content_analysis runs earlier (from
-            # consensus) before face worker completes, so face_service_detections
-            # would be empty on that first pass.  This second trigger ensures
-            # correlate_faces() has real data to work with.
-            if image_id and result:
-                self._trigger_content_analysis(image_id, tier)
-
-            return result
+            self.current_bbox = None
+            return BaseWorker.process_message(self, ch, method, properties, body)
 
         except Exception as e:
             self.logger.error(f"Error in face message processing: {e}")
             self._safe_nack(ch, method.delivery_tag, requeue=True)
 
-    def _declare_additional_queues(self, declare_with_dlq):
-        """Declare content_analysis queue on the publish channel."""
-        declare_with_dlq(
-            self._publish_channel,
-            self._get_queue_name('system.content_analysis')
-        )
-
-    def _trigger_content_analysis(self, image_id: int, tier: str = 'free'):
-        """Enqueue a content_analysis re-run so face+NudeNet correlation runs
-        with face service results present (basic+ tiers only).
-
-        Uses _enqueue_publish so the publish goes through the dedicated background
-        connection rather than the consume channel. This prevents channel-death from
-        causing message floods.
-        """
-        if not self.config.is_available_for_tier('system.content_analysis', tier):
-            return
-
-        self._enqueue_publish(
-            self._get_queue_name('system.content_analysis'),
-            json.dumps({'image_id': image_id, 'tier': tier})
-        )
-        self.logger.debug(
-            f"face: enqueued content_analysis re-run for image {image_id}"
-        )
-    
     def process_service(self, cropped_image_data):
         """Process face detection on cropped image"""
         try:

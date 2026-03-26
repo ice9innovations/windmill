@@ -113,7 +113,8 @@ class BaseWorker:
         self.is_spatial = self.config.is_spatial_service(self.service_name)
         self.is_semantic = self.config.is_semantic_service(self.service_name)
         self.is_vlm = self.config.is_vlm_service(self.service_name)
-        self.enable_consensus_triggers = self.config.should_trigger_consensus(self.service_name)
+        # Consensus is no longer part of the live hot path.
+        self.enable_consensus_triggers = False
 
         # Enable direct bbox postprocessing triggers for spatial services
         self.enable_triggers = self.is_spatial
@@ -205,93 +206,8 @@ class BaseWorker:
             return None
 
     def _build_postprocessing_messages(self, image_id, message, result, tier, trace_id):
-        """Build direct face/pose postprocessing messages for single-spatial YOLO paths."""
-        if self.service_name not in self.bbox_services:
-            return []
-        if len(self.bbox_services) != 1:
-            return []
-        if self._get_clean_service_name() != 'yolo_v8':
-            return []
-        if not isinstance(result, dict):
-            return []
-
-        predictions = result.get('predictions') or []
-        if not predictions:
-            return []
-
-        messages = []
-        for index, prediction in enumerate(predictions):
-            bbox = self._normalize_prediction_bbox(prediction)
-            if not bbox:
-                continue
-
-            if bbox['width'] < 8 or bbox['height'] < 8:
-                continue
-
-            label = (prediction.get('label') or '').strip().lower()
-            emoji = self._normalize_person_emoji(prediction.get('emoji', ''))
-            if label != 'person' and emoji != '🧑':
-                continue
-
-            cluster_id = f"yolo_person_{index}"
-            cropped_image_data = self._crop_bbox_from_image_data(message.get('image_data'), bbox)
-            if not cropped_image_data:
-                continue
-
-            if self.config.is_available_for_tier('postprocessing.face', tier):
-                self._record_postprocessing_event(
-                    image_id=image_id,
-                    merged_box_id=None,
-                    service='face',
-                    cluster_id=cluster_id,
-                    event_type='enqueued',
-                    source_service=self._get_clean_service_name(),
-                    source_stage='result_stored',
-                    data={'bbox': bbox},
-                )
-                messages.append((
-                    self._get_queue_name('postprocessing.face'),
-                    json.dumps({
-                        'merged_box_id': None,
-                        'image_id': image_id,
-                        'cluster_id': cluster_id,
-                        'bbox': bbox,
-                        'cropped_image_data': cropped_image_data,
-                        'trace_id': trace_id,
-                        'tier': tier,
-                        'source_service': self._get_clean_service_name(),
-                        'source_stage': 'result_stored',
-                        'dispatch_enqueued_at': self._now_iso(),
-                    }),
-                ))
-            if self.config.is_available_for_tier('postprocessing.pose', tier):
-                self._record_postprocessing_event(
-                    image_id=image_id,
-                    merged_box_id=None,
-                    service='pose',
-                    cluster_id=cluster_id,
-                    event_type='enqueued',
-                    source_service=self._get_clean_service_name(),
-                    source_stage='result_stored',
-                    data={'bbox': bbox},
-                )
-                messages.append((
-                    self._get_queue_name('postprocessing.pose'),
-                    json.dumps({
-                        'merged_box_id': None,
-                        'image_id': image_id,
-                        'cluster_id': cluster_id,
-                        'bbox': bbox,
-                        'cropped_image_data': cropped_image_data,
-                        'trace_id': trace_id,
-                        'tier': tier,
-                        'source_service': self._get_clean_service_name(),
-                        'source_stage': 'result_stored',
-                        'dispatch_enqueued_at': self._now_iso(),
-                    }),
-                ))
-
-        return messages
+        """Legacy bbox postprocessing fanout is disabled."""
+        return []
 
     def _declare_additional_queues(self, declare_with_dlq):
         """Override in subclasses to declare additional downstream queues on the publish channel."""
@@ -353,10 +269,6 @@ class BaseWorker:
                 args['x-message-ttl'] = int(ttl_env)
             declarations.append((queue_name, args))
 
-        if self.enable_triggers:
-            if self.service_name in self.bbox_services and len(self.bbox_services) == 1:
-                add_queue(self._get_queue_name('postprocessing.face'))
-                add_queue(self._get_queue_name('postprocessing.pose'))
         if self.enable_consensus_triggers:
             add_queue(self._get_queue_by_service_type('consensus'))
         if self.enable_noun_consensus:
@@ -391,10 +303,6 @@ class BaseWorker:
                 args['x-message-ttl'] = int(ttl_env)
             channel.queue_declare(queue=queue_name, durable=True, arguments=args)
 
-        if self.enable_triggers:
-            if self.service_name in self.bbox_services and len(self.bbox_services) == 1:
-                declare_with_dlq(self._sync_publish_channel, self._get_queue_name('postprocessing.face'))
-                declare_with_dlq(self._sync_publish_channel, self._get_queue_name('postprocessing.pose'))
         if self.enable_consensus_triggers:
             declare_with_dlq(self._sync_publish_channel, self._get_queue_by_service_type('consensus'))
         if self.enable_noun_consensus:
@@ -1068,6 +976,7 @@ class BaseWorker:
         processing_time=None,
         service=None,
         source_trace_id=None,
+        commit=True,
     ):
         """Persist a terminal JSON result row for this service.
 
@@ -1093,7 +1002,8 @@ class BaseWorker:
                     processing_time,
                 ),
             )
-            self.db_conn.commit()
+            if commit:
+                self.db_conn.commit()
             cursor.close()
             return True
         except Exception as e:
@@ -1492,6 +1402,13 @@ class BaseWorker:
                     )
 
             if self.enable_noun_consensus:
+                self._record_service_event(
+                    image_id=image_id,
+                    service='noun_consensus',
+                    event_type='enqueued',
+                    source_service=self._get_clean_service_name(),
+                    source_stage='noun_consensus_trigger',
+                )
                 noun_consensus_message = {
                     'image_id': image_id,
                     'image_filename': message.get('image_filename', f'image_{image_id}'),
@@ -1507,6 +1424,13 @@ class BaseWorker:
                 ))
 
             if self.enable_verb_consensus:
+                self._record_service_event(
+                    image_id=image_id,
+                    service='verb_consensus',
+                    event_type='enqueued',
+                    source_service=self._get_clean_service_name(),
+                    source_stage='verb_consensus_trigger',
+                )
                 verb_consensus_message = {
                     'image_id': image_id,
                     'image_filename': message.get('image_filename', f'image_{image_id}'),
@@ -1521,6 +1445,13 @@ class BaseWorker:
                 ))
 
             if self.enable_consensus_triggers:
+                self._record_service_event(
+                    image_id=image_id,
+                    service='consensus',
+                    event_type='enqueued',
+                    source_service=self._get_clean_service_name(),
+                    source_stage='consensus_trigger',
+                )
                 consensus_message = {
                     'image_id': image_id,
                     'image_filename': message.get('image_filename', f'image_{image_id}'),

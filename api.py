@@ -517,7 +517,6 @@ def status(image_id):
             "service_events_total": len(results_data.get('service_events', [])),
             "service_events_pending": service_events_pending,
             "service_events_failed": service_events_failed,
-            "consensus_complete":     _sr.get('consensus') is not None,
             "content_analysis_complete": _sr.get('content_analysis') is not None,
             "noun_consensus_complete":    _sr.get('noun_consensus') is not None,
             "verb_consensus_complete":    _sr.get('verb_consensus') is not None,
