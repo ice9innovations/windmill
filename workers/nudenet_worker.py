@@ -112,6 +112,11 @@ class NudenetWorker(BaseWorker):
                 person_bboxes_deduplicated,
                 ''
             )
+            nsfw2_result = self._fetch_nsfw2_result(image_id)
+            nsfw2_correlation = self._build_spatial_nsfw2_correlation(
+                activity_analysis['scene_type'],
+                nsfw2_result,
+            )
 
             framing_analysis = classify_framing(
                 nudenet_detections,
@@ -138,6 +143,7 @@ class NudenetWorker(BaseWorker):
                     'spatial_gender_inference': spatial_gender,
                     'activity_analysis': activity_analysis,
                     'framing_analysis': framing_analysis,
+                    'nsfw2_correlation': nsfw2_correlation,
                     'person_deduplication': {
                         'raw_count': len(person_bboxes),
                         'deduplicated_count': len(person_bboxes_deduplicated),
@@ -205,6 +211,61 @@ class NudenetWorker(BaseWorker):
                 })
         return detections
 
+    def _fetch_nsfw2_result(self, image_id):
+        """Return stored NSFW2 verdict data if available before the spatial pass writes."""
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                "SELECT data FROM results WHERE image_id = %s AND service = 'nsfw2' AND status = 'success' LIMIT 1",
+                (image_id,),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+        except Exception as e:
+            self.logger.warning(f"Error fetching NSFW2 result for image {image_id}: {e}")
+            return None
+
+        if row is None:
+            return None
+
+        predictions = (row[0] or {}).get('predictions', [])
+        if not predictions:
+            return None
+
+        return {
+            'nsfw': predictions[0].get('nsfw', False),
+            'confidence': predictions[0].get('confidence', 0.0),
+            'emoji': predictions[0].get('emoji', ''),
+        }
+
+    def _build_spatial_nsfw2_correlation(self, scene_type, nsfw2_result):
+        """Build a consistent nsfw2_correlation block for the spatial-only pass."""
+        if not nsfw2_result:
+            return {
+                'agreement': None,
+                'nsfw2_verdict': 'unknown',
+                'nsfw2_confidence': 0.0,
+                'override_scene_type': False,
+                'new_scene_type': None,
+                'new_intimacy_level': None,
+                'reasoning': 'no_nsfw2_data',
+            }
+
+        nsfw2_says_nsfw = nsfw2_result.get('nsfw', False)
+        nsfw2_confidence = nsfw2_result.get('confidence', 0.0)
+        nsfw2_verdict = 'nsfw' if nsfw2_says_nsfw else 'sfw'
+        spatial_nsfw = scene_type in ['sexually_explicit', 'softcore_pornography', 'simple_nudity']
+
+        return {
+            'agreement': spatial_nsfw == nsfw2_says_nsfw,
+            'nsfw2_verdict': nsfw2_verdict,
+            'nsfw2_confidence': nsfw2_confidence,
+            'override_scene_type': False,
+            'new_scene_type': None,
+            'new_intimacy_level': None,
+            'reasoning': 'agreement' if spatial_nsfw == nsfw2_says_nsfw else 'spatial_nsfw2_disagreement',
+        }
+
     def _image_dimensions(self, image_data_b64):
         """Derive width/height from the base64 image already in memory."""
         img_bytes = base64.b64decode(image_data_b64)
@@ -232,7 +293,7 @@ class NudenetWorker(BaseWorker):
                 'activity_analysis': analysis['full_analysis']['activity_analysis'],
                 'framing_analysis': analysis['full_analysis']['framing_analysis'],
                 'face_correlations': {},
-                'nsfw2_correlation': {
+                'nsfw2_correlation': analysis['full_analysis'].get('nsfw2_correlation') or {
                     'agreement': None, 'nsfw2_verdict': 'unknown',
                     'nsfw2_confidence': 0.0, 'override_scene_type': False,
                     'new_scene_type': None, 'new_intimacy_level': None,
