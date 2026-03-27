@@ -16,7 +16,7 @@ Related docs:
 
 ## How It Works
 
-Images are submitted to the API (or directly via the producer) and dispatched into RabbitMQ queues. Workers consume from their queues, call the corresponding ML service, and write results to PostgreSQL. Downstream workers (harmony, consensus, noun consensus, SAM3, caption summary) trigger automatically as primary results arrive.
+Images are submitted to the API (or directly via the producer) and dispatched into RabbitMQ queues. Workers consume from their queues, call the corresponding ML service, and write results to PostgreSQL. Downstream workers trigger progressively as prerequisite results arrive, so noun grounding, segmentation, verb extraction, caption synthesis, and safety analysis can start before the full graph is complete.
 
 ```
 Submit image
@@ -30,9 +30,11 @@ Submit image
             │
             └─→ consensus_worker → consensus
                     └─→ noun_consensus_worker → noun_consensus
+                            ├─→ florence2_grounding_worker → florence2_grounding
                             ├─→ sam3_worker → sam3_results
-                            └─→ verb_consensus_worker → verb_consensus
-                                        └─→ caption_summary_worker → caption_summary
+                            ├─→ verb_consensus_worker → verb_consensus
+                            └─→ caption_summary_worker → caption_summary
+                                                            └─→ content_analysis_worker → content_analysis
 ```
 
 ---
@@ -228,7 +230,7 @@ Full results without status metadata. Use when processing is confirmed complete.
 
 Returns the machine-readable Windmill workflow contract: symbolic predicates, downstream stages, and trigger sources.
 
-This endpoint is intended for API consumers and other repos that need to reason about dependency relationships without reimplementing `compute_expected_downstream()`.
+This endpoint is intended for API consumers and other repos that need to reason about dependency relationships without reimplementing `core.workflow.compute_expected_downstream()`.
 
 ---
 
