@@ -47,8 +47,9 @@ class PostProcessingWorker(BaseWorker):
             return parsed
 
     def _is_valid_postprocessing_message(self, message):
-        required_keys = ('merged_box_id', 'image_id', 'cluster_id', 'bbox', 'cropped_image_data')
-        return all(key in message for key in required_keys)
+        required_keys = ('merged_box_id', 'image_id', 'cluster_id', 'bbox')
+        has_crop_payload = 'cropped_image_data' in message or 'crop_ref' in message
+        return all(key in message for key in required_keys) and has_crop_payload
     
     def connect_to_database(self):
         """Connect to DB and set autocommit=False for FK-safe transaction handling."""
@@ -57,7 +58,7 @@ class PostProcessingWorker(BaseWorker):
         self.db_conn.autocommit = False
         return True
     
-    def process_service(self, cropped_image_data):
+    def process_service(self, cropped_image_bytes):
         """Process the cropped image with the specific service - override in subclasses"""
         raise NotImplementedError("Subclasses must implement process_service")
     
@@ -84,7 +85,7 @@ class PostProcessingWorker(BaseWorker):
             error_message = None
             if isinstance(result_data, dict):
                 result_status = result_data.get('status', 'success') or 'success'
-                error_message = (
+                error_message = self._normalize_failed_reason(
                     result_data.get('error_message')
                     or result_data.get('error')
                     or result_data.get('message')
@@ -130,6 +131,50 @@ class PostProcessingWorker(BaseWorker):
                     except Exception:
                         pass
                 return False, {'insert': 0.0, 'commit': 0.0}
+
+    def _store_terminal_postprocessing_failure(
+        self,
+        merged_box_id,
+        image_id,
+        cluster_id,
+        bbox,
+        reason,
+        source_service=None,
+        source_stage=None,
+    ):
+        payload = {
+            'service': self._get_clean_service_name(),
+            'status': 'failed',
+            'predictions': [],
+            'error_message': reason,
+            'metadata': {
+                'terminal_worker_error': True,
+                'terminal_reason': 'crop_payload_unavailable',
+            },
+        }
+        success, _ = self.save_postprocessing_result(
+            merged_box_id,
+            image_id,
+            payload,
+            bbox,
+            cluster_id,
+            processing_time=0.0,
+            commit=False,
+        )
+        if not success:
+            return False
+        self._record_postprocessing_event(
+            image_id=image_id,
+            merged_box_id=merged_box_id,
+            service=self._get_clean_service_name(),
+            cluster_id=cluster_id,
+            event_type='failed',
+            source_service=source_service,
+            source_stage=source_stage or 'crop_transport_resolve',
+            data={'error_message': reason},
+            commit=True,
+        )
+        return True
     
 
     def process_message(self, ch, method, properties, body):
@@ -163,10 +208,39 @@ class PostProcessingWorker(BaseWorker):
             image_id = message['image_id']
             cluster_id = message['cluster_id']
             bbox = message['bbox']
-            cropped_image_data = message['cropped_image_data']
+            if self._is_dispatch_terminal(image_id, self._get_clean_service_name(), cluster_id=cluster_id):
+                self.logger.warning(
+                    f"{self.service_name}: dispatch already terminal for image {image_id} "
+                    f"cluster={cluster_id}, acking redelivery"
+                )
+                self._safe_ack(ch, method.delivery_tag)
+                return True
+            cropped_image_bytes = self.resolve_crop_bytes(message, required=True)
             trace_id = message.get('trace_id')
             source_service = message.get('source_service')
             source_stage = message.get('source_stage')
+            if cropped_image_bytes is None:
+                failure_reason = "crop_ref missing, expired, or otherwise unavailable"
+                if self._store_terminal_postprocessing_failure(
+                    merged_box_id=merged_box_id,
+                    image_id=image_id,
+                    cluster_id=cluster_id,
+                    bbox=bbox,
+                    reason=failure_reason,
+                    source_service=source_service,
+                    source_stage=source_stage,
+                ):
+                    self._update_service_dispatch(
+                        image_id=image_id,
+                        service=self._get_clean_service_name(),
+                        cluster_id=cluster_id,
+                        status='failed',
+                        reason=failure_reason,
+                    )
+                    self._safe_ack(ch, method.delivery_tag)
+                    return True
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
+                return False
             dispatch_enqueued_at = message.get('dispatch_enqueued_at')
             dispatch_received_at = message.get('dispatch_received_at')
             downstream_enqueued_at = message.get('downstream_enqueued_at')
@@ -205,7 +279,7 @@ class PostProcessingWorker(BaseWorker):
             # - dict => terminal service response, must be stored even if empty/no-findings/failed
             # - None => infrastructure/transport problem, retry
             start_time = time.time()
-            result_data = self.process_service(cropped_image_data)
+            result_data = self.process_service(cropped_image_bytes)
             processing_time = round(time.time() - start_time, 3)
 
             # Save terminal result

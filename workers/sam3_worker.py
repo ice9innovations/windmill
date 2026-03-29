@@ -55,7 +55,7 @@ class Sam3Worker(BaseWorker):
 
             message = json.loads(body)
             image_id = message['image_id']
-            image_data = message.get('image_data')
+            image_data = self.resolve_image_data_b64(message, required=True)
             nouns = message.get('nouns', [])
             subject_noun = message.get('subject_noun')
             tier = message.get('tier', 'free')
@@ -609,7 +609,7 @@ class Sam3Worker(BaseWorker):
             )
 
 
-    def _trigger_rembg(self, image_id: int, image_data: str = None):
+    def _trigger_rembg(self, image_id: int, image_transport: dict = None):
         """Publish image_id to the rembg queue for background removal refinement."""
         try:
             queue = self._get_queue_name('system.rembg')
@@ -622,7 +622,7 @@ class Sam3Worker(BaseWorker):
             self.channel.basic_publish(
                 exchange='',
                 routing_key=queue,
-                body=json.dumps({'image_id': image_id, 'image_data': image_data}),
+                body=json.dumps({'image_id': image_id, **(image_transport or {})}),
                 properties=pika.BasicProperties(delivery_mode=2)
             )
             self.logger.info(f"sam3: triggered rembg for image {image_id}")

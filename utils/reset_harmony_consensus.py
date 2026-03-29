@@ -8,12 +8,16 @@ and retriggers processing by sending messages to the harmony queue.
 DANGER: This will delete ALL harmony and consensus data!
 """
 import os
+import sys
 import json
 import logging
 import psycopg2
 import pika
 from datetime import datetime
 from dotenv import load_dotenv
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from core.image_store import is_valkey_image_store_enabled, put_image
 
 # Load environment variables
 load_dotenv()
@@ -163,28 +167,21 @@ class HarmonyConsensusReset:
                 pass
             return False
 
-    def fetch_image_data(self, image_url, image_path):
-        """Fetch image data - simplified version, you may need to adapt this"""
-        import base64
+    def fetch_image_bytes(self, image_url, image_path):
+        """Fetch image bytes from URL or local path."""
         import requests
-        from PIL import Image
-        import io
         
         try:
             if image_url:
                 # Download from URL
                 response = requests.get(image_url, timeout=30)
                 response.raise_for_status()
-                image_data = base64.b64encode(response.content)
+                return response.content
             elif image_path:
                 # Read from local file
                 with open(image_path, 'rb') as f:
-                    image_data = base64.b64encode(f.read())
-            else:
-                return None
-                
-            return image_data.decode('latin-1')  # For JSON transport
-            
+                    return f.read()
+            return None
         except Exception as e:
             logger.warning(f"Failed to fetch image data: {e}")
             return None
@@ -197,22 +194,27 @@ class HarmonyConsensusReset:
             
             for image_id, image_filename, image_url, image_path in images:
                 try:
-                    # Fetch image data (required for postprocessing)
-                    image_data = self.fetch_image_data(image_url, image_path)
+                    image_bytes = self.fetch_image_bytes(image_url, image_path)
                     
-                    if not image_data:
+                    if not image_bytes:
                         logger.warning(f"Skipping {image_filename} - could not fetch image data")
                         failed_count += 1
                         continue
+
+                    if is_valkey_image_store_enabled():
+                        image_transport = {'image_ref': put_image(image_bytes)}
+                    else:
+                        import base64
+                        image_transport = {'image_data': base64.b64encode(image_bytes).decode('latin-1')}
                     
                     # Create harmony message
                     message = {
                         'image_id': image_id,
                         'image_filename': image_filename or f'image_{image_id}',
-                        'image_data': image_data,
                         'service': 'harmony_reset',
                         'worker_id': 'reset_script',
-                        'processed_at': datetime.now().isoformat()
+                        'processed_at': datetime.now().isoformat(),
+                        **image_transport,
                     }
                     
                     # Send to harmony queue

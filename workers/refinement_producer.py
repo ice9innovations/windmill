@@ -19,6 +19,9 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from PIL import Image
 
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from core.image_store import is_valkey_image_store_enabled, put_crop
+
 class RefinementProducer:
     """Produces refinement jobs from consensus results"""
 
@@ -195,25 +198,22 @@ class RefinementProducer:
             'height': new_h
         }
 
-    def crop_and_encode_image(self, image, bbox):
-        """Crop image using bounding box and return base64 encoded result"""
+    def crop_image_bytes(self, image, bbox):
+        """Crop image using bounding box and return JPEG bytes."""
         try:
             # Crop using bounding box coordinates
             x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
             cropped = image.crop((x, y, x + w, y + h))
 
-            # Convert to base64
             buffer = io.BytesIO()
             cropped.save(buffer, format='JPEG')
-            cropped_base64 = base64.b64encode(buffer.getvalue()).decode()
-
-            return cropped_base64
+            return buffer.getvalue()
 
         except Exception as e:
-            self.logger.error(f"Error cropping and encoding image: {e}")
+            self.logger.error(f"Error cropping image: {e}")
             return None
 
-    def publish_refinement_job(self, image_id, image_filename, box_index, bbox_data, cropped_base64, crop_info):
+    def publish_refinement_job(self, image_id, image_filename, box_index, bbox_data, cropped_image_bytes, crop_info):
         """Publish a single refinement job to the queue"""
         try:
             refinement_job = {
@@ -228,11 +228,14 @@ class RefinementProducer:
                 },
                 'emoji': bbox_data['emoji'],
                 'confidence': bbox_data.get('confidence', 0.5),
-                'cropped_image_data': cropped_base64,
                 'crop_info': crop_info,  # For coordinate re-scaling
                 'expansion_pixels': self.expansion_pixels,
                 'produced_at': datetime.now().isoformat()
             }
+            if is_valkey_image_store_enabled():
+                refinement_job['crop_ref'] = put_crop(cropped_image_bytes)
+            else:
+                refinement_job['cropped_image_data'] = base64.b64encode(cropped_image_bytes).decode()
 
             self.queue_channel.basic_publish(
                 exchange='',
@@ -301,8 +304,8 @@ class RefinementProducer:
                 expanded_bbox = self.expand_bbox(original_bbox, image_width, image_height)
 
                 # Crop and encode the image
-                cropped_base64 = self.crop_and_encode_image(image, expanded_bbox)
-                if not cropped_base64:
+                cropped_image_bytes = self.crop_image_bytes(image, expanded_bbox)
+                if not cropped_image_bytes:
                     self.logger.error(f"Failed to crop image for box {box_index}")
                     continue
 
@@ -329,7 +332,7 @@ class RefinementProducer:
                 }
 
                 # Publish the refinement job
-                if self.publish_refinement_job(image_id, image_filename, box_index, box_data, cropped_base64, crop_info):
+                if self.publish_refinement_job(image_id, image_filename, box_index, box_data, cropped_image_bytes, crop_info):
                     jobs_created += 1
                 else:
                     self.logger.error(f"Failed to publish refinement job for box {box_index}")

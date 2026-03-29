@@ -25,6 +25,15 @@ from datetime import datetime
 from dotenv import load_dotenv
 from service_config import get_service_config
 
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from core.image_store import (
+    get_crop,
+    get_image,
+    get_image_store_config,
+    is_valkey_image_store_enabled,
+    put_crop,
+)
+
 class BaseWorker:
     """Base class for all ML service workers"""
     
@@ -124,6 +133,7 @@ class BaseWorker:
         
         # Performance configuration
         self.processing_delay = float(os.getenv('PROCESSING_DELAY', '0.0'))
+        self.image_store_config = get_image_store_config()
 
     def _get_required(self, key):
         """Get required environment variable or raise error"""
@@ -182,6 +192,97 @@ class BaseWorker:
     def _now_iso(self):
         return datetime.now().isoformat()
 
+    def _image_transport_fields(self, message):
+        if message.get('image_ref'):
+            return {'image_ref': message['image_ref']}
+        if message.get('image_data'):
+            return {'image_data': message['image_data']}
+        return {}
+
+    def _decode_base64_field(self, encoded_value, field_name):
+        if not encoded_value:
+            return None
+        try:
+            return base64.b64decode(encoded_value)
+        except Exception as e:
+            self.logger.error(f"Failed to decode {field_name}: {e}")
+            return None
+
+    def _normalize_failed_reason(self, value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (dict, list)):
+            try:
+                return json.dumps(value, ensure_ascii=True)[:1000]
+            except Exception:
+                return str(value)[:1000]
+        return str(value)[:1000]
+
+    def resolve_image_bytes(self, message, required=True):
+        image_ref = message.get('image_ref')
+        if image_ref:
+            image_bytes = get_image(image_ref, config=self.image_store_config)
+            if image_bytes is not None:
+                return image_bytes
+            self.logger.error(
+                f"{self.service_name}: image_ref missing or expired for image {message.get('image_id')}: {image_ref}"
+            )
+            if not required:
+                return None
+
+        image_data = message.get('image_data')
+        if image_data:
+            image_bytes = self._decode_base64_field(image_data, 'image_data')
+            if image_bytes is not None:
+                return image_bytes
+
+        if required:
+            self.logger.error(
+                f"{self.service_name}: no usable image payload for image {message.get('image_id')}"
+            )
+        return None
+
+    def resolve_image_data_b64(self, message, required=True):
+        image_data = message.get('image_data')
+        if image_data:
+            return image_data
+
+        image_bytes = self.resolve_image_bytes(message, required=required)
+        if image_bytes is None:
+            return None
+        return base64.b64encode(image_bytes).decode('utf-8')
+
+    def resolve_crop_bytes(self, message, required=True):
+        crop_ref = message.get('crop_ref')
+        if crop_ref:
+            crop_bytes = get_crop(crop_ref, config=self.image_store_config)
+            if crop_bytes is not None:
+                return crop_bytes
+            self.logger.error(
+                f"{self.service_name}: crop_ref missing or expired for merged_box_id {message.get('merged_box_id')}: {crop_ref}"
+            )
+            if not required:
+                return None
+
+        crop_data = message.get('cropped_image_data')
+        if crop_data:
+            crop_bytes = self._decode_base64_field(crop_data.encode('latin-1'), 'cropped_image_data')
+            if crop_bytes is not None:
+                return crop_bytes
+
+        if required:
+            self.logger.error(
+                f"{self.service_name}: no usable crop payload for merged_box_id {message.get('merged_box_id')}"
+            )
+        return None
+
+    def build_crop_transport_fields(self, crop_bytes):
+        if is_valkey_image_store_enabled():
+            return {'crop_ref': put_crop(crop_bytes, config=self.image_store_config)}
+        return {'cropped_image_data': base64.b64encode(crop_bytes).decode('latin-1')}
+
     def _crop_bbox_from_image_data(self, image_data, bbox):
         """Crop one bbox from base64 image data and return base64 JPEG bytes."""
         try:
@@ -234,6 +335,18 @@ class BaseWorker:
         socket_timeout = int(os.getenv('QUEUE_SOCKET_TIMEOUT_SECONDS', '30'))
         connection_attempts = int(os.getenv('QUEUE_CONNECTION_ATTEMPTS', '10'))
         retry_delay = int(os.getenv('QUEUE_CONNECTION_RETRY_DELAY_SECONDS', '5'))
+        tcp_options = {}
+        if os.getenv('QUEUE_TCP_KEEPALIVE', 'true').lower() in ('true', '1', 'yes'):
+            tcp_options[socket.SO_KEEPALIVE] = 1
+            keepidle = int(os.getenv('QUEUE_TCP_KEEPIDLE_SECONDS', '60'))
+            keepintvl = int(os.getenv('QUEUE_TCP_KEEPINTVL_SECONDS', '15'))
+            keepcnt = int(os.getenv('QUEUE_TCP_KEEPCNT', '4'))
+            if hasattr(socket, 'TCP_KEEPIDLE'):
+                tcp_options[socket.TCP_KEEPIDLE] = keepidle
+            if hasattr(socket, 'TCP_KEEPINTVL'):
+                tcp_options[socket.TCP_KEEPINTVL] = keepintvl
+            if hasattr(socket, 'TCP_KEEPCNT'):
+                tcp_options[socket.TCP_KEEPCNT] = keepcnt
         kwargs = dict(
             host=self.queue_host,
             port=self.queue_port,
@@ -246,6 +359,7 @@ class BaseWorker:
             connection_attempts=connection_attempts,
             retry_delay=retry_delay,
             socket_timeout=socket_timeout,
+            tcp_options=tcp_options or None,
         )
         if self.queue_ssl:
             ssl_context = ssl.create_default_context()
@@ -548,6 +662,93 @@ class BaseWorker:
                 f"Channel dead during nack (broker will redeliver unacked message): {e}"
             )
 
+    def _is_dispatch_terminal(self, image_id, service=None, cluster_id=None):
+        """Return True when the newest matching service_dispatch row is not pending."""
+        service = service or self._get_clean_service_name()
+        try:
+            cursor = self.db_conn.cursor()
+            if cluster_id is None:
+                cursor.execute(
+                    """
+                    SELECT status
+                    FROM service_dispatch
+                    WHERE image_id = %s
+                      AND service = %s
+                      AND cluster_id IS NULL
+                    ORDER BY dispatch_id DESC
+                    LIMIT 1
+                    """,
+                    (image_id, service),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT status
+                    FROM service_dispatch
+                    WHERE image_id = %s
+                      AND service = %s
+                      AND cluster_id = %s
+                    ORDER BY dispatch_id DESC
+                    LIMIT 1
+                    """,
+                    (image_id, service, cluster_id),
+                )
+            row = cursor.fetchone()
+            cursor.close()
+            return bool(row and row[0] in ('complete', 'failed', 'dead_lettered'))
+        except Exception as e:
+            self.logger.warning(
+                f"Failed terminal-dispatch check for {service}/{image_id}/{cluster_id}: {e}"
+            )
+            return False
+
+    def _store_terminal_message_failure(
+        self,
+        image_id,
+        reason,
+        trace_id=None,
+        service=None,
+        cluster_id=None,
+        source_stage='message_validation',
+    ):
+        """Persist a terminal failed outcome for a consumed queue message."""
+        service = service or self._get_clean_service_name()
+        payload = {
+            'service': service,
+            'status': 'failed',
+            'predictions': [],
+            'error_message': reason,
+            'metadata': {
+                'terminal_worker_error': True,
+                'terminal_reason': 'image_payload_unavailable',
+            },
+        }
+        self._store_terminal_service_result(
+            image_id=image_id,
+            payload=payload,
+            status='failed',
+            processing_time=0.0,
+            service=service,
+            source_trace_id=trace_id,
+            commit=True,
+        )
+        self._update_service_dispatch(
+            image_id=image_id,
+            service=service,
+            cluster_id=cluster_id,
+            status='failed',
+            reason=reason,
+        )
+        self._record_service_event(
+            image_id=image_id,
+            service=service,
+            event_type='failed',
+            source_service=service,
+            source_stage=source_stage,
+            data={'error_message': reason},
+            commit=True,
+        )
+
     def job_completed_successfully(self):
         """Call this after successfully completing a job"""
         self.jobs_completed += 1
@@ -562,13 +763,10 @@ class BaseWorker:
         """Build the complete service URL for processing"""
         return f"http://{self.service_host}:{self.service_port}{self.service_endpoint}"
     
-    def post_image_data(self, image_data_b64):
-        """POST base64 encoded image data to service"""
+    def post_image_bytes(self, image_bytes):
+        """POST raw image bytes to service."""
         service_url = self.get_service_url()
-        
-        # Decode base64 to bytes for posting
-        image_bytes = base64.b64decode(image_data_b64)
-        
+
         # POST as multipart file upload
         files = {'file': ('image.jpg', io.BytesIO(image_bytes), 'image/jpeg')}
         try:
@@ -583,6 +781,11 @@ class BaseWorker:
                 return self._coerce_terminal_http_response(e.response)
             self.logger.error(f"{self.service_name} request failed before terminal response: {e}")
             return None
+
+    def post_image_data(self, image_data_b64):
+        """POST base64 encoded image data to service."""
+        image_bytes = base64.b64decode(image_data_b64)
+        return self.post_image_bytes(image_bytes)
 
     def _coerce_terminal_http_response(self, response, service=None):
         """Convert an HTTP response into a terminal result payload.
@@ -665,6 +868,19 @@ class BaseWorker:
         """Trigger noun consensus for VLM services (async via background publish thread)"""
         if not self.enable_noun_consensus:
             return
+        tier = message.get('tier', 'free')
+        ready, current_count, expected_count = self._is_vlm_set_complete_for_tier(image_id, tier)
+        if not ready:
+            self.logger.debug(
+                f"Skipping noun_consensus trigger for {self.service_name} image {image_id}: "
+                f"VLM set incomplete ({current_count}/{expected_count})"
+            )
+            return
+        if not self._should_enqueue_final_consensus_service(image_id, 'noun_consensus'):
+            self.logger.debug(
+                f"Skipping duplicate noun_consensus trigger for {self.service_name} image {image_id}"
+            )
+            return
 
         self._record_service_event(
             image_id=image_id,
@@ -676,12 +892,12 @@ class BaseWorker:
         noun_consensus_message = {
             'image_id': image_id,
             'image_filename': message.get('image_filename', f'image_{image_id}'),
-            'image_data': message.get('image_data'),
             'service': self.service_name,
             'worker_id': self.worker_id,
             'processed_at': datetime.now().isoformat(),
-            'tier': message.get('tier', 'free'),
+            'tier': tier,
         }
+        noun_consensus_message.update(self._image_transport_fields(message))
 
         self._enqueue_publish(
             self._get_queue_by_service_type('noun_consensus'),
@@ -693,6 +909,19 @@ class BaseWorker:
     def trigger_verb_consensus(self, image_id, message):
         """Trigger verb consensus for VLM services (async via background publish thread)"""
         if not self.enable_verb_consensus:
+            return
+        tier = message.get('tier', 'free')
+        ready, current_count, expected_count = self._is_vlm_set_complete_for_tier(image_id, tier)
+        if not ready:
+            self.logger.debug(
+                f"Skipping verb_consensus trigger for {self.service_name} image {image_id}: "
+                f"VLM set incomplete ({current_count}/{expected_count})"
+            )
+            return
+        if not self._should_enqueue_final_consensus_service(image_id, 'verb_consensus'):
+            self.logger.debug(
+                f"Skipping duplicate verb_consensus trigger for {self.service_name} image {image_id}"
+            )
             return
 
         self._record_service_event(
@@ -708,7 +937,7 @@ class BaseWorker:
             'service': self.service_name,
             'worker_id': self.worker_id,
             'processed_at': datetime.now().isoformat(),
-            'tier': message.get('tier', 'free'),
+            'tier': tier,
         }
 
         self._enqueue_publish(
@@ -717,6 +946,70 @@ class BaseWorker:
         )
 
         self.logger.debug(f"Enqueued verb_consensus trigger for {self.service_name} image {image_id}")
+
+    def _tier_vlm_service_names(self, tier):
+        """Return clean VLM primary service names configured for the tier."""
+        names = []
+        for full_name in self.config.get_services_by_tier(tier):
+            if not full_name.startswith('primary.'):
+                continue
+            if self.config.is_vlm_service(full_name):
+                names.append(full_name.split('.', 1)[1])
+        return names
+
+    def _is_vlm_set_complete_for_tier(self, image_id, tier):
+        """Return (ready, current_count, expected_count) for tier VLM completion."""
+        try:
+            vlm_services = self._tier_vlm_service_names(tier)
+            expected_count = len(vlm_services)
+            if expected_count == 0:
+                return False, 0, 0
+
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                SELECT COUNT(DISTINCT service)
+                FROM results
+                WHERE image_id = %s
+                  AND service = ANY(%s::text[])
+                  AND status = 'success'
+                """,
+                (image_id, vlm_services),
+            )
+            current_count = cursor.fetchone()[0] or 0
+            cursor.close()
+            return current_count >= expected_count, current_count, expected_count
+        except Exception as e:
+            self.logger.warning(
+                f"Failed VLM completeness check for image {image_id} tier={tier}: {e}"
+            )
+            return False, 0, 0
+
+    def _should_enqueue_final_consensus_service(self, image_id, service):
+        """Return True when noun/verb consensus has not already been enqueued/completed."""
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                SELECT event_type
+                FROM service_events
+                WHERE image_id = %s
+                  AND service = %s
+                ORDER BY event_id DESC
+                LIMIT 1
+                """,
+                (image_id, service),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            if not row:
+                return True
+            return row[0] == 'failed'
+        except Exception as e:
+            self.logger.warning(
+                f"Failed duplicate-consensus trigger check for image {image_id} service={service}: {e}"
+            )
+            return True
 
     def _record_service_dispatch(self, image_id, service, cluster_id=None):
         """Insert a pending service_dispatch record. Best-effort; errors swallowed.
@@ -991,6 +1284,9 @@ class BaseWorker:
                 INSERT INTO results (
                     image_id, service, source_trace_id, data, status, worker_id, processing_time
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (image_id, service, source_trace_id)
+                WHERE source_trace_id IS NOT NULL
+                DO NOTHING
                 """,
                 (
                     image_id,
@@ -1293,13 +1589,34 @@ class BaseWorker:
             image_id = message['image_id']
             trace_id = message.get('trace_id')
 
+            if self._is_dispatch_terminal(image_id, self._get_clean_service_name(), cluster_id=None):
+                self.logger.warning(
+                    f"{self.service_name}: dispatch already terminal for image {image_id}, acking redelivery"
+                )
+                self._safe_ack(ch, method.delivery_tag)
+                return
+
             if trace_id:
                 self.logger.debug(f"[{trace_id}] Processing {self.service_name} request for image {image_id}")
             else:
                 self.logger.debug(f"Processing {self.service_name} request for image {image_id}")
 
             # Call ML service
-            result = self.post_image_data(message['image_data'])
+            image_bytes = self.resolve_image_bytes(message)
+            if image_bytes is None:
+                failure_reason = "image_ref missing, expired, or otherwise unavailable"
+                self._store_terminal_message_failure(
+                    image_id=image_id,
+                    reason=failure_reason,
+                    trace_id=trace_id,
+                    service=self._get_clean_service_name(),
+                    source_stage='image_transport_resolve',
+                )
+                self._safe_ack(ch, method.delivery_tag)
+                self.job_failed(failure_reason)
+                return
+
+            result = self.post_image_bytes(image_bytes)
             if not isinstance(result, dict):
                 self.logger.error(
                     f"{self.service_name} returned no terminal JSON result for image {image_id}"
@@ -1309,7 +1626,7 @@ class BaseWorker:
                 return
 
             result_status = result.get('status', 'success') or 'success'
-            failed_reason = (
+            failed_reason = self._normalize_failed_reason(
                 result.get('error_message')
                 or result.get('error')
                 or result.get('message')
@@ -1401,7 +1718,9 @@ class BaseWorker:
                         f"[{trace_id}] queueing direct postprocessing from {self.service_name} for image {image_id}"
                     )
 
-            if self.enable_noun_consensus:
+            vlm_ready, current_vlm_count, expected_vlm_count = self._is_vlm_set_complete_for_tier(image_id, tier)
+
+            if self.enable_noun_consensus and vlm_ready and self._should_enqueue_final_consensus_service(image_id, 'noun_consensus'):
                 self._record_service_event(
                     image_id=image_id,
                     service='noun_consensus',
@@ -1412,18 +1731,23 @@ class BaseWorker:
                 noun_consensus_message = {
                     'image_id': image_id,
                     'image_filename': message.get('image_filename', f'image_{image_id}'),
-                    'image_data': message.get('image_data'),
                     'service': self.service_name,
                     'worker_id': self.worker_id,
                     'processed_at': datetime.now().isoformat(),
                     'tier': tier,
                 }
+                noun_consensus_message.update(self._image_transport_fields(message))
                 downstream_messages.append((
                     self._get_queue_by_service_type('noun_consensus'),
                     json.dumps(noun_consensus_message)
                 ))
+            elif self.enable_noun_consensus:
+                self.logger.debug(
+                    f"Skipping noun_consensus enqueue for {self.service_name} image {image_id}: "
+                    f"ready={vlm_ready} ({current_vlm_count}/{expected_vlm_count})"
+                )
 
-            if self.enable_verb_consensus:
+            if self.enable_verb_consensus and vlm_ready and self._should_enqueue_final_consensus_service(image_id, 'verb_consensus'):
                 self._record_service_event(
                     image_id=image_id,
                     service='verb_consensus',
@@ -1443,6 +1767,11 @@ class BaseWorker:
                     self._get_queue_by_service_type('verb_consensus'),
                     json.dumps(verb_consensus_message)
                 ))
+            elif self.enable_verb_consensus:
+                self.logger.debug(
+                    f"Skipping verb_consensus enqueue for {self.service_name} image {image_id}: "
+                    f"ready={vlm_ready} ({current_vlm_count}/{expected_vlm_count})"
+                )
 
             if self.enable_consensus_triggers:
                 self._record_service_event(

@@ -8,10 +8,12 @@ import sys
 import json
 import pika
 import psycopg2
-import base64
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from core.image_store import is_valkey_image_store_enabled, put_image
 
 def main():
     load_dotenv()
@@ -100,16 +102,20 @@ def main():
                 print(f"  ⚠️  Failed to fetch {image_filename}: HTTP {response.status_code}")
                 continue
 
-            image_data_b64 = base64.b64encode(response.content).decode('utf-8')
+            if is_valkey_image_store_enabled():
+                image_transport = {'image_ref': put_image(response.content)}
+            else:
+                import base64
+                image_transport = {'image_data': base64.b64encode(response.content).decode('utf-8')}
 
             # Publish to harmony queue
             harmony_message = {
                 'image_id': image_id,
                 'image_filename': image_filename,
-                'image_data': image_data_b64,
                 'service': 'nudenet',
                 'worker_id': 'retrigger_script',
-                'processed_at': datetime.now().isoformat()
+                'processed_at': datetime.now().isoformat(),
+                **image_transport,
             }
 
             channel.basic_publish(
@@ -124,10 +130,10 @@ def main():
             consensus_message = {
                 'image_id': image_id,
                 'image_filename': image_filename,
-                'image_data': image_data_b64,
                 'service': 'nudenet',
                 'worker_id': 'retrigger_script',
-                'processed_at': datetime.now().isoformat()
+                'processed_at': datetime.now().isoformat(),
+                **image_transport,
             }
 
             channel.basic_publish(

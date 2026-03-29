@@ -143,11 +143,27 @@ QUEUE_SSL=true
 QUEUE_USER=your_queue_user
 QUEUE_PASSWORD=...
 
+# Optional: Valkey-backed image transport
+IMAGE_STORE_MODE=inline   # inline | valkey
+VALKEY_HOST=
+VALKEY_PORT=6379
+VALKEY_SSL=true
+VALKEY_USERNAME=
+VALKEY_PASSWORD=
+VALKEY_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+VALKEY_IMAGE_TTL_SECONDS=90
+VALKEY_CROP_TTL_SECONDS=90
+
 # API port (default 9999)
 API_PORT=9997
 ```
 
 All VLM services (haiku, gemini, gpt_nano) communicate through Animal Farm service endpoints — no API keys are configured in windmill.
+
+`IMAGE_STORE_MODE=inline` is the default. Set `IMAGE_STORE_MODE=valkey` to
+store uploaded images and bbox crops in Valkey with a short TTL and pass only
+opaque refs through RabbitMQ. That mode requires a TLS-enabled Valkey server
+with ACL auth. See [docs/valkey-image-store.md](/home/sd/windmill/docs/valkey-image-store.md).
 
 ---
 

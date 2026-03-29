@@ -36,6 +36,7 @@ class Florence2GroundingWorker(BaseWorker):
     def __init__(self):
         super().__init__('system.florence2_grounding')
 
+
     def _declare_additional_queues(self, declare_with_dlq):
         """No additional queues."""
         return
@@ -74,8 +75,8 @@ class Florence2GroundingWorker(BaseWorker):
 
             message = json.loads(body)
             image_id = message['image_id']
-            image_data = message.get('image_data')
             tier = message.get('tier', 'free')
+            image_data = self.resolve_image_data_b64(message, required=True)
 
             if not image_data:
                 self.logger.error(
@@ -118,18 +119,6 @@ class Florence2GroundingWorker(BaseWorker):
                     f"with same {len(nouns)} nouns, skipping model run"
                 )
                 previous_predictions = previous_result['predictions']
-                if previous_predictions:
-                    self._dispatch_colors_post(
-                        image_id,
-                        image_data,
-                        previous_predictions,
-                        tier,
-                        message.get('trace_id'),
-                    )
-                    self.logger.info(
-                        f"florence2_grounding: image {image_id} reused "
-                        f"{len(previous_predictions)} stored grounding prediction(s) for dispatch"
-                    )
                 self._record_service_event(
                     image_id=image_id,
                     service='florence2_grounding',

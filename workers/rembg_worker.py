@@ -50,10 +50,10 @@ class RembgWorker(BaseWorker):
 
             message = json.loads(body)
             image_id = message['image_id']
-            image_data = message.get('image_data')
+            image_bytes = self.resolve_image_bytes(message, required=True)
 
-            if not image_data:
-                self.logger.error(f"rembg: no image_data in message for image {image_id}")
+            if not image_bytes:
+                self.logger.error(f"rembg: no usable image payload in message for image {image_id}")
                 self._safe_nack(ch, method.delivery_tag, requeue=False)
                 self.job_failed("No image data")
                 return
@@ -70,8 +70,6 @@ class RembgWorker(BaseWorker):
                 self.logger.info(f"rembg: image {image_id} already processed, skipping")
                 self._safe_ack(ch, method.delivery_tag)
                 return
-
-            image_bytes = base64.b64decode(image_data)
 
             # Call rembg service — BEN2 handles subject isolation internally
             result = self._call_rembg(image_bytes, image_id)

@@ -24,7 +24,7 @@ class BboxFaceWorker(PostProcessingWorker):
         """Handle both legacy bbox messages and new primary image messages."""
         try:
             message = self._parse_message_body(body)
-            if 'cropped_image_data' in message:
+            if 'cropped_image_data' in message or 'crop_ref' in message:
                 self.current_bbox = message.get('bbox', {})
                 return super().process_message(ch, method, properties, body)
 
@@ -35,14 +35,11 @@ class BboxFaceWorker(PostProcessingWorker):
             self.logger.error(f"Error in face message processing: {e}")
             self._safe_nack(ch, method.delivery_tag, requeue=True)
 
-    def process_service(self, cropped_image_data):
+    def process_service(self, cropped_image_bytes):
         """Process face detection on cropped image"""
         try:
-            # Decode base64 image data
-            image_bytes = base64.b64decode(cropped_image_data.encode('latin-1'))
-            
             # Call face service
-            files = {'file': ('bbox_crop.jpg', io.BytesIO(image_bytes), 'image/jpeg')}
+            files = {'file': ('bbox_crop.jpg', io.BytesIO(cropped_image_bytes), 'image/jpeg')}
             response = requests.post(
                 self.service_url,
                 files=files,

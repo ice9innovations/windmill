@@ -72,6 +72,7 @@ class CaptionSummaryWorker(BaseWorker):
             f"http://{synth_cfg['host']}:{synth_cfg['port']}{synth_cfg['endpoint']}"
         )
 
+
     def process_message(self, ch, method, properties, body):
         """Override base process_message — DB fetch + caption-synthesis service call."""
         start_time = time.time()
@@ -85,7 +86,6 @@ class CaptionSummaryWorker(BaseWorker):
 
             message = json.loads(body)
             image_id = message['image_id']
-            image_data = message.get('image_data')  # base64; may be None for legacy messages
             tier = message.get('tier', 'free')
 
             self.logger.debug(f"caption_summary: processing image {image_id} (tier={tier})")
@@ -294,7 +294,6 @@ class CaptionSummaryWorker(BaseWorker):
                 commit=False,
             )
             self.db_conn.commit()
-
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
 

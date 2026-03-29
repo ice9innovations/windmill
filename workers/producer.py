@@ -19,6 +19,9 @@ from dotenv import load_dotenv
 from PIL import Image
 import io
 
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from core.image_store import is_valkey_image_store_enabled, put_image
+
 class ProducerConfig:
     """Load producer configuration"""
     
@@ -273,7 +276,10 @@ class GenericProducer:
 
                 # Extract dimensions and add image data
                 width, height = self.extract_image_dimensions(image_bytes)
-                image_data["image_data"] = base64.b64encode(image_bytes).decode('utf-8')
+                if is_valkey_image_store_enabled():
+                    image_data["image_ref"] = put_image(image_bytes)
+                else:
+                    image_data["image_data"] = base64.b64encode(image_bytes).decode('utf-8')
                 image_data["image_width"] = width
                 image_data["image_height"] = height
                 return image_data
@@ -289,7 +295,10 @@ class GenericProducer:
 
                     # Extract dimensions and add image data
                     width, height = self.extract_image_dimensions(image_bytes)
-                    image_data["image_data"] = base64.b64encode(image_bytes).decode('utf-8')
+                    if is_valkey_image_store_enabled():
+                        image_data["image_ref"] = put_image(image_bytes)
+                    else:
+                        image_data["image_data"] = base64.b64encode(image_bytes).decode('utf-8')
                     image_data["image_width"] = width
                     image_data["image_height"] = height
                 return image_data

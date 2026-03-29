@@ -62,7 +62,7 @@ class NounConsensusWorker(BaseWorker):
 
             message = json.loads(body)
             image_id = message['image_id']
-            image_data = message.get('image_data')
+            image_transport = self._image_transport_fields(message)
             triggering_service = message.get('service', 'unknown')
             tier = message.get('tier', 'free')
 
@@ -193,7 +193,7 @@ class NounConsensusWorker(BaseWorker):
             # Trigger grounding only once the tier's full VLM set has reported.
             # Progressive partial noun sets are too expensive to ground and were
             # causing obvious wasted tail latency.
-            if image_data:
+            if image_transport:
                 tier_vlm_count = self._expected_tier_vlm_count(tier) or len(service_noun_map)
                 current_vlm_count = len(services_present)
                 if current_vlm_count < tier_vlm_count:
@@ -213,7 +213,13 @@ class NounConsensusWorker(BaseWorker):
                     ]
                     if consensus_nouns:
                         t0 = time.time()
-                        self._trigger_florence2_grounding(image_id, image_data, consensus_nouns, subject_noun, tier)
+                        if self._should_trigger_florence2_grounding(image_id, consensus_nouns):
+                            self._trigger_florence2_grounding(image_id, image_transport, consensus_nouns, subject_noun, tier)
+                        else:
+                            self.logger.debug(
+                                f"noun_consensus: skipping duplicate Florence-2 grounding trigger "
+                                f"for image {image_id} with nouns={sorted(consensus_nouns)}"
+                            )
                         timing['trigger_florence2_grounding'] = timing.get('trigger_florence2_grounding', 0.0) + (time.time() - t0)
                     else:
                         # No consensus reached — promote the top noun if it's a clear
@@ -240,14 +246,20 @@ class NounConsensusWorker(BaseWorker):
                                 category_tally=category_tally,
                             )
                             t0 = time.time()
-                            self._trigger_florence2_grounding(image_id, image_data, [top], subject_noun, tier)
+                            if self._should_trigger_florence2_grounding(image_id, [top]):
+                                self._trigger_florence2_grounding(image_id, image_transport, [top], subject_noun, tier)
+                            else:
+                                self.logger.debug(
+                                    f"noun_consensus: skipping duplicate promoted Florence-2 grounding trigger "
+                                    f"for image {image_id} with noun={top}"
+                                )
                             timing['trigger_florence2_grounding'] = timing.get('trigger_florence2_grounding', 0.0) + (time.time() - t0)
 
             # Trigger caption_summary only once the tier's full VLM set has
             # reported. Progressive partial caption synthesis is currently
             # costing too much tail latency and creating inconsistent
             # downstream visibility when stragglers arrive.
-            if self.config.is_available_for_tier('system.caption_summary', tier) and image_data:
+            if self.config.is_available_for_tier('system.caption_summary', tier):
                 expected_vlm_count = self._expected_tier_vlm_count(tier) or len(services_present)
                 if len(services_present) < expected_vlm_count:
                     self.logger.debug(
@@ -256,13 +268,18 @@ class NounConsensusWorker(BaseWorker):
                     )
                 else:
                     t0 = time.time()
-                    self._maybe_update_caption_summary(image_id, image_data, tier)
+                    if self._should_trigger_caption_summary(image_id, tier):
+                        self._maybe_update_caption_summary(image_id, tier)
+                    else:
+                        self.logger.debug(
+                            f"noun_consensus: skipping duplicate caption_summary trigger for image {image_id}"
+                        )
                     timing['trigger_caption_summary'] = time.time() - t0
 
             # Trigger content_analysis only once the tier's full VLM set has
             # reported. The partial progressive pass was still costing seconds
             # while rarely producing the final answer.
-            if self.config.is_available_for_tier('system.content_analysis', tier) and image_data:
+            if self.config.is_available_for_tier('system.content_analysis', tier):
                 expected_vlm_count = self._expected_tier_vlm_count(tier) or len(services_present)
                 if len(services_present) < expected_vlm_count:
                     self.logger.debug(
@@ -271,7 +288,13 @@ class NounConsensusWorker(BaseWorker):
                     )
                 else:
                     t0 = time.time()
-                    self._maybe_update_content_analysis(image_id, image_data, services_present, tier)
+                    if self._should_trigger_content_analysis(image_id, services_present, tier):
+                        self._maybe_update_content_analysis(image_id, services_present, tier)
+                    else:
+                        self.logger.debug(
+                            f"noun_consensus: skipping duplicate content_analysis trigger for image {image_id} "
+                            f"with services_present={services_present}"
+                        )
                     timing['trigger_content_analysis'] = time.time() - t0
 
             total_duration = time.time() - start_time
@@ -323,7 +346,7 @@ class NounConsensusWorker(BaseWorker):
             and name.split('.', 1)[1] in VLM_SERVICES
         ])
 
-    def _maybe_update_caption_summary(self, image_id: int, image_data: str, tier: str):
+    def _maybe_update_caption_summary(self, image_id: int, tier: str):
         """Trigger caption_summary synthesis once for the final full-tier noun state."""
         try:
             queue_name = self._get_queue_name('system.caption_summary')
@@ -339,7 +362,7 @@ class NounConsensusWorker(BaseWorker):
             )
             self._enqueue_publish(
                 queue_name,
-                json.dumps({'image_id': image_id, 'image_data': image_data, 'tier': tier}),
+                json.dumps({'image_id': image_id, 'tier': tier}),
             )
             self.logger.info(
                 f"noun_consensus: triggered caption_summary update for image {image_id}"
@@ -350,7 +373,7 @@ class NounConsensusWorker(BaseWorker):
             )
             raise
 
-    def _maybe_update_content_analysis(self, image_id: int, image_data: str, services_present: list, tier: str):
+    def _maybe_update_content_analysis(self, image_id: int, services_present: list, tier: str):
         """Trigger content_analysis when noun-consensus inputs materially advance."""
         try:
             normalized_services = sorted(services_present or [])
@@ -368,7 +391,11 @@ class NounConsensusWorker(BaseWorker):
             )
             self._enqueue_publish(
                 queue_name,
-                json.dumps({'image_id': image_id, 'image_data': image_data, 'tier': tier}),
+                json.dumps({
+                    'image_id': image_id,
+                    'tier': tier,
+                    'services_present': normalized_services,
+                }),
             )
             self.logger.info(
                 f"noun_consensus: triggered content_analysis for image {image_id} "
@@ -401,7 +428,7 @@ class NounConsensusWorker(BaseWorker):
                 return True
 
             event_type, data = row
-            if event_type != 'enqueued' or not isinstance(data, dict):
+            if event_type not in ('enqueued', 'completed') or not isinstance(data, dict):
                 return True
 
             previous = sorted(data.get('services_present') or [])
@@ -462,7 +489,7 @@ class NounConsensusWorker(BaseWorker):
             )
             return True
 
-    def _trigger_florence2_grounding(self, image_id: int, image_data: str, nouns: list, subject_noun: str = None, tier: str = 'free'):
+    def _trigger_florence2_grounding(self, image_id: int, image_transport: dict, nouns: list, subject_noun: str = None, tier: str = 'free'):
         """Publish a Florence-2 grounding request for the final noun consensus.
         """
         if not self.config.is_available_for_tier('primary.florence2', tier):
@@ -486,11 +513,11 @@ class NounConsensusWorker(BaseWorker):
                 queue_name,
                 json.dumps({
                     'image_id': image_id,
-                    'image_data': image_data,
                     'nouns': nouns,
                     'subject_noun': subject_noun,
                     'triggered_at': datetime.now().isoformat(),
                     'tier': tier,
+                    **(image_transport or {}),
                 }),
             )
             self.logger.info(

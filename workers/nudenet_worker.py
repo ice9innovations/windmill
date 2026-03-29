@@ -78,7 +78,9 @@ class NudenetWorker(BaseWorker):
             image_width  = message.get('image_width', 0)
             image_height = message.get('image_height', 0)
             if not image_width or not image_height:
-                image_width, image_height = self._image_dimensions(message['image_data'])
+                image_data_b64 = self.resolve_image_data_b64(message, required=False)
+                if image_data_b64:
+                    image_width, image_height = self._image_dimensions(image_data_b64)
 
             # Single non-blocking check for YOLO person bboxes. YOLO (32-62ms) typically
             # completes before nudenet (66ms) so this usually succeeds without waiting.

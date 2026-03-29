@@ -210,11 +210,10 @@ class HarmonyWorker(BaseWorker):
             self.logger.error(f"Failed to crop bbox from decoded image: {e}")
             return None
 
-    def dispatch_bbox_postprocessing(self, image_id, image_filename, merged_data, image_data):
+    def dispatch_bbox_postprocessing(self, image_id, image_filename, merged_data, image_bytes):
         """Dispatch bbox postprocessing jobs for each merged box."""
         try:
             trace_id = getattr(self, 'current_trace_id', None)
-            image_bytes = base64.b64decode(image_data)
             img = Image.open(io.BytesIO(image_bytes))
             face_dispatches = 0
             pose_dispatches = 0
@@ -252,13 +251,15 @@ class HarmonyWorker(BaseWorker):
                             'image_id': image_id,
                             'cluster_id': cluster_id,
                             'bbox': merged_bbox,
-                            'cropped_image_data': cropped_image_data.decode('latin-1'),
                             'trace_id': trace_id,
                             'tier': tier,
                             'source_service': 'harmony',
                             'source_stage': 'merged_boxes_committed',
                             'dispatch_enqueued_at': datetime.now().isoformat(),
                         }
+                        base_message.update(
+                            self.build_crop_transport_fields(cropped_image_data)
+                        )
 
                         if self.config.is_available_for_tier('postprocessing.face', tier):
                             self._record_postprocessing_event(
@@ -536,7 +537,7 @@ class HarmonyWorker(BaseWorker):
             # Extract image info
             image_id = message['image_id']
             image_filename = message.get('image_filename', f'image_{image_id}')
-            image_data = message.get('image_data')  # Base64 encoded image data
+            image_bytes = self.resolve_image_bytes(message, required=False)
             upstream_processed_at = message.get('processed_at')
 
             if self.current_trace_id:
@@ -549,7 +550,7 @@ class HarmonyWorker(BaseWorker):
 
             # Process the harmony merge for this image
             update_started_at = time.time()
-            result = self.update_merged_boxes_for_image(image_id, image_filename, image_data)
+            result = self.update_merged_boxes_for_image(image_id, image_filename, image_bytes)
             update_duration = time.time() - update_started_at
 
             if result['success']:
@@ -1280,7 +1281,7 @@ class HarmonyWorker(BaseWorker):
 
         return True
 
-    def update_merged_boxes_for_image(self, image_id, image_filename, image_data=None):
+    def update_merged_boxes_for_image(self, image_id, image_filename, image_bytes=None):
         """Update merged boxes for a single image using safe DELETE+INSERT pattern"""
         max_retries = 2
         
@@ -1487,10 +1488,10 @@ class HarmonyWorker(BaseWorker):
                     )
 
                 # Dispatch bbox postprocessing jobs for each merged box
-                if merged_box_count > 0 and image_data:
+                if merged_box_count > 0 and image_bytes:
                     dispatch_started_at = time.time()
                     try:
-                        self.dispatch_bbox_postprocessing(image_id, image_filename, merged_data, image_data)
+                        self.dispatch_bbox_postprocessing(image_id, image_filename, merged_data, image_bytes)
                         # Commit service_dispatch records written during dispatch
                         dispatch_commit_started_at = time.time()
                         self.db_conn.commit()

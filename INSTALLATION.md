@@ -84,6 +84,45 @@ Important notes:
 - the API and workers share the same queue and DB connectivity settings
 - `service_config.yaml` is separate from `.env`; it controls service endpoints and tier membership
 - producers must publish `trace_id`; Windmill uses it for primary-result idempotency
+- `IMAGE_STORE_MODE=inline` is the default and requires no extra infrastructure
+
+### Optional: Valkey-backed image transport
+
+Set this only if you want uploads and bbox crops stored out-of-band in Valkey
+instead of being embedded in RabbitMQ messages.
+
+```bash
+IMAGE_STORE_MODE=valkey
+VALKEY_HOST=images.ice9.ai
+VALKEY_PORT=6379
+VALKEY_SSL=true
+VALKEY_USERNAME=windmill
+VALKEY_PASSWORD=...
+VALKEY_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+VALKEY_IMAGE_TTL_SECONDS=90
+VALKEY_CROP_TTL_SECONDS=90
+```
+
+Recommended Valkey server properties for this mode:
+
+- TLS enabled
+- ACL auth enabled
+- persistence disabled: `save ""` and `appendonly no`
+- `maxmemory-policy noeviction`
+
+Quick connectivity check from a Windmill node:
+
+```bash
+export REDISCLI_AUTH='your-secret'
+valkey-cli --tls -h "$VALKEY_HOST" -p "$VALKEY_PORT" \
+  --cacert "$VALKEY_CA_CERTS" \
+  --user "$VALKEY_USERNAME" \
+  ping
+unset REDISCLI_AUTH
+```
+
+See [docs/valkey-image-store.md](/home/sd/windmill/docs/valkey-image-store.md)
+for the dedicated mode guide.
 
 ## 3. Prepare PostgreSQL
 
@@ -130,12 +169,14 @@ Before starting workers, verify:
 
 - PostgreSQL is reachable from the Windmill host
 - RabbitMQ is reachable from the Windmill host
+- Valkey is reachable from the Windmill host when `IMAGE_STORE_MODE=valkey`
 - each configured service endpoint is reachable from the worker host
 
 At minimum:
 
 - `psql` can connect
 - the API can connect to RabbitMQ
+- the API and workers can `PING` Valkey when `IMAGE_STORE_MODE=valkey`
 - workers can hit their configured ML service hosts
 
 ## 7. Start Windmill

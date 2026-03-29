@@ -12,3 +12,4 @@ nltk>=3.8.0           # WordNet synonym collapsing for noun consensus
 spacy>=3.8.0          # Noun extraction from VLM captions (en_core_web_sm model)
 imagehash>=4.3.0      # Perceptual hashing for image deduplication across formats/resolutions
 anthropic>=0.50.0    # Anthropic SDK — used by caption_summary_worker for Claude synthesis
+redis>=5.0.0         # Valkey/Redis client for ephemeral image storage

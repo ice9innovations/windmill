@@ -780,6 +780,8 @@ class ContentAnalysisWorker(BaseWorker):
             message = json.loads(body)
             image_id = message['image_id']
             trace_id = message.get('trace_id')
+            services_present = sorted(message.get('services_present') or [])
+            tier = message.get('tier')
 
             if trace_id:
                 self.logger.debug(f"[{trace_id}] Processing content analysis for image {image_id}")
@@ -809,7 +811,12 @@ class ContentAnalysisWorker(BaseWorker):
                     event_type='completed',
                     source_service=message.get('triggered_by'),
                     source_stage='content_analysis_run',
-                    data={'reason': 'unchanged_input', 'input_fingerprint': input_fingerprint},
+                    data={
+                        'reason': 'unchanged_input',
+                        'input_fingerprint': input_fingerprint,
+                        'services_present': services_present,
+                        'tier': tier,
+                    },
                     commit=True,
                 )
                 self._safe_ack(ch, method.delivery_tag)
@@ -871,7 +878,11 @@ class ContentAnalysisWorker(BaseWorker):
                 event_type='completed',
                 source_service=message.get('triggered_by'),
                 source_stage='content_analysis_run',
-                data={'input_fingerprint': input_fingerprint} if input_fingerprint else None,
+                data={
+                    'input_fingerprint': input_fingerprint,
+                    'services_present': services_present,
+                    'tier': tier,
+                },
                 commit=True,
             )
 

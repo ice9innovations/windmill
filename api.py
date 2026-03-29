@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'workers'))
 sys.path.insert(0, os.path.dirname(__file__))
 from service_config import get_service_config
 from core.image import validate_and_normalize_image
+from core.image_store import is_valkey_image_store_enabled, put_image
 from core.dispatch import resolve_services
 from core.results import fetch_results
 from core.workflow import get_workflow_definition
@@ -285,9 +286,19 @@ def analyze():
         app.logger.error("Submission registration failed: %s", e)
         return jsonify({"error": "Failed to register image in database"}), 500
 
-    # Publish to queues
+    # Store image bytes in the configured transport backend before publishing.
     trace_id = str(uuid.uuid4())
-    b64_data = base64.b64encode(image_bytes).decode('utf-8')
+    try:
+        if is_valkey_image_store_enabled():
+            image_transport = {"image_ref": put_image(image_bytes)}
+        else:
+            image_transport = {"image_data": base64.b64encode(image_bytes).decode('utf-8')}
+    except Exception as e:
+        app.logger.error("Image transport store failed: %s", e)
+        return jsonify({
+            "error": "Failed to store uploaded image for processing",
+            "image_id": image_id,
+        }), 500
 
     def publish_all(channel):
         for service_name in service_names:
@@ -299,7 +310,6 @@ def analyze():
                 body=json.dumps({
                     "image_id":       image_id,
                     "image_filename": image_filename,
-                    "image_data":     b64_data,
                     "image_width":    normalized_width,
                     "image_height":   normalized_height,
                     "original_image_width": original_width,
@@ -309,6 +319,7 @@ def analyze():
                     "service_name":   service_name,
                     "queue_name":     queue_name,
                     "tier":           tier,
+                    **image_transport,
                 }),
                 properties=pika.BasicProperties(delivery_mode=2),
             )

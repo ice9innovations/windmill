@@ -17,14 +17,11 @@ class BboxColorsWorker(PostProcessingWorker):
     def __init__(self):
         super().__init__('postprocessing.colors_post')
     
-    def process_service(self, cropped_image_data):
+    def process_service(self, cropped_image_bytes):
         """Process color analysis on cropped image"""
         try:
-            # Decode base64 image data
-            image_bytes = base64.b64decode(cropped_image_data.encode('latin-1'))
-            
             # Call colors service
-            files = {'file': ('bbox_crop.jpg', io.BytesIO(image_bytes), 'image/jpeg')}
+            files = {'file': ('bbox_crop.jpg', io.BytesIO(cropped_image_bytes), 'image/jpeg')}
             response = requests.post(
                 self.service_url,
                 files=files,
