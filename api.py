@@ -14,7 +14,7 @@ import ssl
 import pika
 import psycopg2
 import psycopg2.extras
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, g
 
@@ -305,6 +305,7 @@ def analyze():
 
     def publish_all(channel):
         for service_name in service_names:
+            submitted_at = datetime.now(timezone.utc)
             queue_name = config.get_queue_name(f'primary.{service_name}')
             declare_queue(channel, queue_name)
             channel.basic_publish(
@@ -317,7 +318,8 @@ def analyze():
                     "image_height":   normalized_height,
                     "original_image_width": original_width,
                     "original_image_height": original_height,
-                    "submitted_at":   datetime.now().isoformat(),
+                    "submitted_at":   submitted_at.isoformat(),
+                    "submitted_at_epoch": submitted_at.timestamp(),
                     "trace_id":       trace_id,
                     "service_name":   service_name,
                     "queue_name":     queue_name,
