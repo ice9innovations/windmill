@@ -255,6 +255,14 @@ services:
         - premium
         - batch
 
+    postprocessing_orchestrator:
+      queue_name: postprocessing_orchestrator
+      service_type: postprocessing_orchestrator
+      tier:
+        - basic
+        - premium
+        - batch
+
     florence2_grounding:
       queue_name: florence2_grounding
       host: localhost

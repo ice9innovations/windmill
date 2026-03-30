@@ -871,15 +871,13 @@ class BaseWorker:
             return
         duplicate_check_duration = time.time() - t0
 
-        t0 = time.time()
-        self._record_service_event(
-            image_id=image_id,
-            service='noun_consensus',
-            event_type='enqueued',
-            source_service=self._get_clean_service_name(),
-            source_stage='noun_consensus_trigger',
-        )
-        record_event_duration = time.time() - t0
+        pending_events = [{
+            'image_id': image_id,
+            'service': 'noun_consensus',
+            'event_type': 'enqueued',
+            'source_service': self._get_clean_service_name(),
+            'source_stage': 'noun_consensus_trigger',
+        }]
         noun_consensus_message = {
             'image_id': image_id,
             'image_filename': message.get('image_filename', f'image_{image_id}'),
@@ -892,11 +890,38 @@ class BaseWorker:
         }
         noun_consensus_message.update(self._image_transport_fields(message))
 
+        orchestrator_message = None
+        if self.config.is_available_for_tier('system.postprocessing_orchestrator', tier):
+            pending_events.append({
+                'image_id': image_id,
+                'service': 'postprocessing_orchestrator',
+                'event_type': 'enqueued',
+                'source_service': self._get_clean_service_name(),
+                'source_stage': 'primary_complete_trigger',
+            })
+            orchestrator_message = {
+                'image_id': image_id,
+                'tier': tier,
+                'task_type': 'primary_complete',
+                'services_present': sorted(self._tier_vlm_service_names(tier)),
+                'source_service': self._get_clean_service_name(),
+                'submitted_at_epoch': message.get('submitted_at_epoch'),
+            }
+
+        t0 = time.time()
+        event_timings = self._record_service_events_batch(pending_events, commit=True)
+        record_event_duration = event_timings['insert'] + event_timings['commit']
+
         t0 = time.time()
         self._enqueue_publish(
             self._get_queue_by_service_type('noun_consensus'),
             json.dumps(noun_consensus_message)
         )
+        if orchestrator_message is not None:
+            self._enqueue_publish(
+                self._get_queue_by_service_type('postprocessing_orchestrator'),
+                json.dumps(orchestrator_message)
+            )
         publish_duration = time.time() - t0
 
         self.logger.info(
@@ -912,76 +937,8 @@ class BaseWorker:
         self.logger.debug(f"Enqueued noun_consensus trigger for {self.service_name} image {image_id}")
 
     def trigger_verb_consensus(self, image_id, message):
-        """Trigger verb consensus for VLM services (async via background publish thread)"""
-        if not self.enable_verb_consensus:
-            return
-        trigger_started_at = time.time()
-        tier = message.get('tier', 'free')
-        t0 = time.time()
-        is_latest, current_count, expected_count, latest_service = (
-            self._is_latest_vlm_success_for_tier(
-                image_id, tier, self._get_clean_service_name()
-            )
-        )
-        latest_check_duration = time.time() - t0
-        if not is_latest:
-            self.logger.debug(
-                f"Skipping verb_consensus trigger for {self.service_name} image {image_id}: "
-                f"latest={latest_service!r} ({current_count}/{expected_count})"
-            )
-            return
-        t0 = time.time()
-        if not self._should_enqueue_final_consensus_service(image_id, 'verb_consensus'):
-            duplicate_check_duration = time.time() - t0
-            self.logger.debug(
-                f"Skipping duplicate verb_consensus trigger for {self.service_name} image {image_id}"
-            )
-            self.logger.info(
-                f"consensus_handoff service=verb_consensus image={image_id} "
-                f"publisher={self._get_clean_service_name()} "
-                f"latest_check={latest_check_duration:.3f}s "
-                f"duplicate_check={duplicate_check_duration:.3f}s "
-                f"total={time.time() - trigger_started_at:.3f}s skipped=duplicate"
-            )
-            return
-        duplicate_check_duration = time.time() - t0
-
-        verb_consensus_message = {
-            'image_id': image_id,
-            'image_filename': message.get('image_filename', f'image_{image_id}'),
-            'service': self.service_name,
-            'worker_id': self.worker_id,
-            'processed_at': datetime.now().isoformat(),
-            'tier': tier,
-            'submitted_at_epoch': message.get('submitted_at_epoch'),
-            'consensus_enqueued_at_epoch': time.time(),
-        }
-
-        t0 = time.time()
-        self._record_service_event(
-            image_id=image_id,
-            service='verb_consensus',
-            event_type='enqueued',
-            source_service=self._get_clean_service_name(),
-            source_stage='verb_consensus_trigger',
-        )
-        record_event_duration = time.time() - t0
-        t0 = time.time()
-        self._enqueue_publish(
-            self._get_queue_by_service_type('verb_consensus'),
-            json.dumps(verb_consensus_message)
-        )
-        publish_duration = time.time() - t0
-
-        self.logger.info(
-            f"consensus_handoff service=verb_consensus image={image_id} "
-            f"publisher={self._get_clean_service_name()} "
-            f"latest_check={latest_check_duration:.3f}s "
-            f"duplicate_check={duplicate_check_duration:.3f}s "
-            f"record_event={record_event_duration:.3f}s "
-            f"publish={publish_duration:.3f}s "
-            f"total={time.time() - trigger_started_at:.3f}s"
-        )
+        """Compatibility no-op: noun_consensus now produces verb consensus too."""
+        return
 
     def _tier_vlm_service_names(self, tier):
         """Return clean VLM primary service names configured for the tier."""
@@ -1955,39 +1912,35 @@ class BaseWorker:
                     f"latest={latest_vlm_service!r} ({current_vlm_count}/{expected_vlm_count})"
                 )
 
-            verb_duplicate_check_duration = 0.0
-            enqueued_verb_consensus = False
-            should_enqueue_verb_consensus = False
-            if self.enable_verb_consensus and vlm_tail_ready:
-                t0 = time.time()
-                should_enqueue_verb_consensus = self._should_enqueue_final_consensus_service(image_id, 'verb_consensus')
-                verb_duplicate_check_duration = time.time() - t0
-            if self.enable_verb_consensus and should_enqueue_verb_consensus:
+            orchestrator_duplicate_check_duration = 0.0
+            enqueued_postprocessing_orchestrator = False
+            should_enqueue_postprocessing_orchestrator = False
+            if self.config.is_available_for_tier('system.postprocessing_orchestrator', tier) and vlm_tail_ready:
+                should_enqueue_postprocessing_orchestrator = True
+            if should_enqueue_postprocessing_orchestrator:
                 pending_consensus_events.append({
                     'image_id': image_id,
-                    'service': 'verb_consensus',
+                    'service': 'postprocessing_orchestrator',
                     'event_type': 'enqueued',
                     'source_service': self._get_clean_service_name(),
-                    'source_stage': 'verb_consensus_trigger',
+                    'source_stage': 'primary_complete_trigger',
                 })
-                verb_consensus_message = {
+                postprocessing_message = {
                     'image_id': image_id,
-                    'image_filename': message.get('image_filename', f'image_{image_id}'),
-                    'service': self.service_name,
-                    'worker_id': self.worker_id,
-                    'processed_at': datetime.now().isoformat(),
                     'tier': tier,
+                    'task_type': 'primary_complete',
+                    'services_present': sorted(self._tier_vlm_service_names(tier)),
+                    'source_service': self._get_clean_service_name(),
                     'submitted_at_epoch': message.get('submitted_at_epoch'),
-                    'consensus_enqueued_at_epoch': time.time(),
                 }
                 downstream_messages.append((
-                    self._get_queue_by_service_type('verb_consensus'),
-                    json.dumps(verb_consensus_message)
+                    self._get_queue_by_service_type('postprocessing_orchestrator'),
+                    json.dumps(postprocessing_message)
                 ))
-                enqueued_verb_consensus = True
-            elif self.enable_verb_consensus:
+                enqueued_postprocessing_orchestrator = True
+            elif self.config.is_available_for_tier('system.postprocessing_orchestrator', tier):
                 self.logger.debug(
-                    f"Skipping verb_consensus enqueue for {self.service_name} image {image_id}: "
+                    f"Skipping postprocessing_orchestrator enqueue for {self.service_name} image {image_id}: "
                     f"latest={latest_vlm_service!r} ({current_vlm_count}/{expected_vlm_count})"
                 )
             if pending_consensus_events:
@@ -2012,12 +1965,12 @@ class BaseWorker:
                     f"record_event={consensus_event_insert_duration + consensus_event_commit_duration:.3f}s "
                     f"publish={publish_duration:.3f}s"
                 )
-            if enqueued_verb_consensus:
+            if enqueued_postprocessing_orchestrator:
                 self.logger.info(
-                    f"consensus_handoff service=verb_consensus image={image_id} "
+                    f"consensus_handoff service=postprocessing_orchestrator image={image_id} "
                     f"publisher={self._get_clean_service_name()} "
                     f"latest_check={latest_check_duration:.3f}s "
-                    f"duplicate_check={verb_duplicate_check_duration:.3f}s "
+                    f"duplicate_check={orchestrator_duplicate_check_duration:.3f}s "
                     f"record_event={consensus_event_insert_duration + consensus_event_commit_duration:.3f}s "
                     f"publish={publish_duration:.3f}s"
                 )
