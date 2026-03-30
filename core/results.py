@@ -18,9 +18,9 @@ not imported by ice9-api.
 def fetch_results(cur, image_id):
     """Fetch all pipeline results for an image.
 
-    Returns a dict with keys: service_results, merged_boxes, consensus,
-    content_analysis, postprocessing, noun_consensus, sam3, verb_consensus,
-    caption_summary, service_dispatch.
+    Returns a dict with keys: service_results, merged_boxes, content_analysis,
+    postprocessing, noun_consensus, sam3, verb_consensus, caption_summary,
+    service_dispatch.
 
     See module docstring for ice9-api ownership-filtering caveat.
     """
@@ -51,22 +51,6 @@ def fetch_results(cur, image_id):
         if row_dict.get('created'):
             row_dict['created'] = row_dict['created'].isoformat()
         merged_boxes.append(row_dict)
-
-    # Consensus
-    cur.execute(
-        """SELECT consensus_data, processing_time, consensus_created
-           FROM consensus WHERE image_id = %s
-           ORDER BY consensus_created DESC LIMIT 1""",
-        (image_id,),
-    )
-    consensus_row = cur.fetchone()
-    consensus = None
-    if consensus_row:
-        consensus = {
-            "metadata":          {"processing_time": consensus_row['processing_time']},
-            "consensus_data":    consensus_row['consensus_data'],
-            "consensus_created": consensus_row['consensus_created'].isoformat() if consensus_row['consensus_created'] else None,
-        }
 
     # Content analysis
     cur.execute(
@@ -267,8 +251,6 @@ def fetch_results(cur, image_id):
         service_results["noun_consensus"] = noun_consensus
     if verb_consensus is not None:
         service_results["verb_consensus"] = verb_consensus
-    if consensus is not None:
-        service_results["consensus"] = consensus
     if caption_summary is not None:
         service_results["caption_summary"] = caption_summary
     if content_analysis is not None:

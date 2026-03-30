@@ -607,11 +607,6 @@ class HarmonyWorker(BaseWorker):
                         f"in {time.time() - receipt_started_at:.3f}s"
                     )
                 
-                # Trigger consensus after harmony completes
-                consensus_trigger_started_at = time.time()
-                self.trigger_consensus(image_id, message)
-                consensus_trigger_duration = time.time() - consensus_trigger_started_at
-                
                 # Acknowledge the message
                 ack_started_at = time.time()
                 self._safe_ack(ch, method.delivery_tag)
@@ -626,7 +621,6 @@ class HarmonyWorker(BaseWorker):
                         f"store_result={result_store_duration:.3f}s "
                         f"service_event={service_event_duration:.3f}s "
                         f"dispatch_complete={dispatch_complete_duration:.3f}s "
-                        f"trigger_consensus={consensus_trigger_duration:.3f}s "
                         f"ack={ack_duration:.3f}s "
                         f"outer_total={time.time() - receipt_started_at:.3f}s"
                     )

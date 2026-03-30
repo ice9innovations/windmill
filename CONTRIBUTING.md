@@ -56,7 +56,7 @@ Current important types:
   - image metadata services
 - `grounding`
   - noun-triggered grounding stage
-- internal system types such as `consensus`, `harmonization`, `caption_summary`, `content_analysis`, `rembg`
+- internal system types such as `harmonization`, `caption_summary`, `content_analysis`, `rembg`
 
 `consensus: true` is opt-in. A primary service only contributes to consensus if that flag is explicitly set.
 
@@ -73,7 +73,7 @@ Every service must be declared in [service_config.yaml](/home/sd/windmill/servic
 - `endpoint`
 - `service_type`
 - `tier`
-- `consensus` where appropriate
+- noun/verb consensus-derived downstream stages where appropriate
 
 Choose the category based on input shape:
 
@@ -122,7 +122,6 @@ Examples already in the repo:
 
 - [workers/harmony_worker.py](/home/sd/windmill/workers/harmony_worker.py)
 - [workers/noun_consensus_worker.py](/home/sd/windmill/workers/noun_consensus_worker.py)
-- [workers/consensus_worker.py](/home/sd/windmill/workers/consensus_worker.py)
 
 ## Dispatch Lifecycle Rules
 
@@ -167,10 +166,9 @@ Current high-level rules:
 
 - spatial primary services may trigger `harmony`
 - VLM primary services trigger `noun_consensus` and `verb_consensus`
-- consensus-eligible primary services trigger `consensus`
-- `harmony` triggers bbox-level postprocessing and then `consensus`
+- `harmony` triggers bbox-level postprocessing
 - `noun_consensus` can trigger `florence2_grounding` and `caption_summary`
-- `consensus` triggers `content_analysis`
+- `noun_consensus` can also trigger `content_analysis`
 
 If you add a new downstream stage, update both:
 
@@ -204,7 +202,7 @@ Ask these questions:
 - Is it an aggregate or synthesis stage driven by Windmill itself?
   - use `system`
 
-If a service should not affect consensus, set `consensus: false`.
+If a primary service should not feed noun/verb consensus-derived stages, set `consensus: false`.
 
 ## Testing Expectations
 

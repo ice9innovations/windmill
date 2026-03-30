@@ -16,7 +16,9 @@ import psycopg2
 import psycopg2.extras
 from datetime import datetime
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
+
+load_dotenv()
 
 # Add workers and core directories to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'workers'))
@@ -27,8 +29,6 @@ from core.image_store import is_valkey_image_store_enabled, put_image
 from core.dispatch import resolve_services
 from core.results import fetch_results
 from core.workflow import get_workflow_definition
-
-load_dotenv()
 
 app = Flask(__name__)
 app.logger.setLevel(logging.INFO)
@@ -91,7 +91,6 @@ def add_security_headers(response):
 # Connection helpers
 # ---------------------------------------------------------------------------
 
-_db_conn       = None
 _rabbit_conn   = None
 _rabbit_channel = None
 
@@ -103,28 +102,32 @@ def _db_connect_kwargs():
     return kwargs
 
 
+def _new_db_connection():
+    """Create a fresh PostgreSQL connection for one request context."""
+    conn = psycopg2.connect(**_db_connect_kwargs())
+    conn.autocommit = True
+    return conn
+
+
 def get_db():
-    """Get or create a database connection."""
-    global _db_conn
-    try:
-        if _db_conn is None or _db_conn.closed:
-            _db_conn = psycopg2.connect(**_db_connect_kwargs())
-            _db_conn.autocommit = True
-            app.logger.info("Connected to PostgreSQL at %s", DB_HOST)
-        # Verify connection is alive
-        _db_conn.cursor().execute("SELECT 1")
-        return _db_conn
-    except Exception:
-        # Connection stale, reconnect
+    """Get or create a request-scoped database connection."""
+    db = getattr(g, '_db_conn', None)
+    if db is None or db.closed:
+        db = _new_db_connection()
+        g._db_conn = db
+        app.logger.info("Connected to PostgreSQL at %s", DB_HOST)
+    return db
+
+
+@app.teardown_appcontext
+def close_db(error=None):
+    """Close the request-scoped database connection after each request."""
+    db = g.pop('_db_conn', None)
+    if db is not None and not db.closed:
         try:
-            if _db_conn:
-                _db_conn.close()
+            db.close()
         except Exception:
             pass
-        _db_conn = psycopg2.connect(**_db_connect_kwargs())
-        _db_conn.autocommit = True
-        app.logger.info("Reconnected to PostgreSQL at %s", DB_HOST)
-        return _db_conn
 
 
 def _new_rabbit_channel():
@@ -592,7 +595,8 @@ if __name__ == '__main__':
     # point starting if the DB or queue are unreachable. Mid-operation drops are
     # still handled by the reconnect logic in get_db() / get_channel().
     try:
-        get_db()
+        db = _new_db_connection()
+        db.close()
     except Exception as e:
         app.logger.error("Cannot connect to database at startup: %s", e)
         sys.exit(1)

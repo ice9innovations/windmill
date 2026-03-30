@@ -7,7 +7,6 @@ Receives image data + consensus nouns, calls the SAM3 REST service, and
 stores bounding boxes and masks in the sam3_results table.
 """
 
-import base64
 import io
 import json
 import os
@@ -55,15 +54,15 @@ class Sam3Worker(BaseWorker):
 
             message = json.loads(body)
             image_id = message['image_id']
-            image_data = self.resolve_image_data_b64(message, required=True)
+            image_bytes = self.resolve_image_bytes(message, required=True)
             nouns = message.get('nouns', [])
             subject_noun = message.get('subject_noun')
             tier = message.get('tier', 'free')
 
-            if not image_data:
-                self.logger.error(f"sam3: no image_data in message for image {image_id}")
+            if not image_bytes:
+                self.logger.error(f"sam3: no image bytes in message for image {image_id}")
                 self._safe_nack(ch, method.delivery_tag, requeue=False)
-                self.job_failed("No image data")
+                self.job_failed("No image bytes")
                 return
 
             if not nouns:
@@ -118,7 +117,7 @@ class Sam3Worker(BaseWorker):
             )
 
             # Call SAM3 only for the new nouns
-            sam3_response = self._call_sam3(image_data, new_nouns)
+            sam3_response = self._call_sam3(image_bytes, new_nouns)
             if sam3_response is None:
                 self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("SAM3 REST call failed")
@@ -167,7 +166,7 @@ class Sam3Worker(BaseWorker):
                 elif subject_noun not in results:
                     # Subject noun wasn't queried in the main call — try a focused call.
                     # (e.g. "person" voted when only "woman" was in noun consensus)
-                    subject_response = self._call_sam3(image_data, [subject_noun])
+                    subject_response = self._call_sam3(image_bytes, [subject_noun])
                     subject_result = (
                         subject_response.get('results', {})
                         if isinstance(subject_response, dict) and subject_response.get('status', 'success') == 'success'
@@ -235,7 +234,7 @@ class Sam3Worker(BaseWorker):
             # removal with the subject mask applied, improving on any blind first pass.
             # Disabled: rembg is now triggered at upload time in api.py instead.
             # if '_subject' in results:
-            #     self._trigger_rembg(image_id, image_data)
+            #     self._trigger_rembg(image_id, image_bytes)
 
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
@@ -254,10 +253,9 @@ class Sam3Worker(BaseWorker):
             self._safe_nack(ch, method.delivery_tag, requeue=True)
             self.job_failed(str(e))
 
-    def _call_sam3(self, image_data_b64: str, nouns: list):
+    def _call_sam3(self, image_bytes: bytes, nouns: list):
         """POST image + nouns to SAM3 REST service, return a terminal payload."""
         try:
-            image_bytes = base64.b64decode(image_data_b64)
             prepared_bytes, scale, orig_w, orig_h = self._prepare_image(image_bytes)
 
             files = {'file': ('image.jpg', io.BytesIO(prepared_bytes), 'image/jpeg')}

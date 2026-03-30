@@ -21,7 +21,6 @@ sys.path.append(os.path.dirname(__file__))
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 import json
-import base64
 import io
 import time
 from PIL import Image
@@ -78,9 +77,9 @@ class NudenetWorker(BaseWorker):
             image_width  = message.get('image_width', 0)
             image_height = message.get('image_height', 0)
             if not image_width or not image_height:
-                image_data_b64 = self.resolve_image_data_b64(message, required=False)
-                if image_data_b64:
-                    image_width, image_height = self._image_dimensions(image_data_b64)
+                image_bytes = self.resolve_image_bytes(message, required=False)
+                if image_bytes:
+                    image_width, image_height = self._image_dimensions(image_bytes)
 
             # Single non-blocking check for YOLO person bboxes. YOLO (32-62ms) typically
             # completes before nudenet (66ms) so this usually succeeds without waiting.
@@ -268,10 +267,9 @@ class NudenetWorker(BaseWorker):
             'reasoning': 'agreement' if spatial_nsfw == nsfw2_says_nsfw else 'spatial_nsfw2_disagreement',
         }
 
-    def _image_dimensions(self, image_data_b64):
-        """Derive width/height from the base64 image already in memory."""
-        img_bytes = base64.b64decode(image_data_b64)
-        with Image.open(io.BytesIO(img_bytes)) as img:
+    def _image_dimensions(self, image_bytes):
+        """Derive width/height from raw image bytes already in memory."""
+        with Image.open(io.BytesIO(image_bytes)) as img:
             return img.size  # (width, height)
 
     def _store_spatial_analysis_dict(self, analysis, processing_time=None):

@@ -8,7 +8,7 @@
 # Rules:
 # Spatial services may trigger direct bbox postprocessing
 # Semantic services trigger caption scores
-# All services trigger consesus building unless tagged with consensus: false
+# Primary services marked `consensus: true` feed noun/verb consensus-derived stages
 
 services:
   # Primary ML Services - Run on full images
@@ -229,15 +229,6 @@ services:
     # Derived/result-producing services. The category name is historical.
     # These entries participate in real user-facing tier behavior; there is no
     # separate "system" tier.
-    # Consensus does not trigger consensus.
-
-    consensus:
-      queue_name: consensus
-      service_type: consensus
-      tier:
-        - basic
-        - premium
-        - batch
 
     content_analysis:
       queue_name: content_analysis

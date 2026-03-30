@@ -25,12 +25,15 @@ class BboxPoseWorker(PostProcessingWorker):
         try:
             message = self._parse_message_body(body)
             if 'cropped_image_data' in message or 'crop_ref' in message:
+                self._set_db_autocommit_mode(False)
                 self.current_bbox = message.get('bbox', {})
                 return super().process_message(ch, method, properties, body)
             self.current_bbox = None
+            self._set_db_autocommit_mode(True)
             return BaseWorker.process_message(self, ch, method, properties, body)
         except Exception:
             self.current_bbox = {}
+            self._set_db_autocommit_mode(False)
             return super().process_message(ch, method, properties, body)
 
     def process_service(self, cropped_image_bytes):

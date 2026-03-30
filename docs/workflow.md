@@ -11,7 +11,6 @@ The runtime sources of truth remain:
 - [core/dispatch.py](/home/sd/windmill/core/dispatch.py) for expected downstream computation
 - [workers/base_worker.py](/home/sd/windmill/workers/base_worker.py) for primary downstream triggers
 - [workers/noun_consensus_worker.py](/home/sd/windmill/workers/noun_consensus_worker.py) for grounding and caption-summary triggers
-- [workers/consensus_worker.py](/home/sd/windmill/workers/consensus_worker.py) for content-analysis trigger
 
 ## Primary Submission Contract
 
@@ -58,7 +57,6 @@ These conditions document what `compute_expected_downstream()` currently models.
 
 | Downstream stage | Expected when |
 |---|---|
-| `consensus` | at least one submitted primary has `consensus: true` |
 | `noun_consensus` | at least one submitted primary is a VLM |
 | `verb_consensus` | at least one submitted primary is a VLM |
 | `sam3` | at least one submitted primary is a VLM and the tier includes the `system.sam3` service |
@@ -70,8 +68,9 @@ These conditions document what `compute_expected_downstream()` currently models.
 ## Important Nuances
 
 - `system.caption_summary`, etc. are full service identifiers, not names of a separate `system` tier.
-- `noun_consensus` triggers `florence2_grounding` progressively and may do so more than once as VLM results arrive.
-- `caption_summary` is progressive and can retrigger as additional captions arrive.
+- `noun_consensus` now delays `florence2_grounding` until the full tier VLM set has reported.
+- `caption_summary` is also delayed until the full tier VLM set has reported.
+- `content_analysis` is likewise delayed until the full tier VLM set has reported.
 - `rembg` is producer-triggered rather than worker-triggered in the current deployment model, but it is still part of the expected downstream product set.
 - `colors_post` is declared in the postprocessing area of the config, but it is not currently dispatched in the active harmony code path.
 

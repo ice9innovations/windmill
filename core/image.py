@@ -11,8 +11,6 @@ from pillow_heif import register_heif_opener
 
 register_heif_opener()  # adds HEIC/HEIF support to PIL globally
 
-_DEFAULT_MAX_DIMENSION = int(os.getenv('MAX_IMAGE_DIMENSION', 2048))
-
 # Formats that downstream workers (VLMs, SAM3, etc.) cannot handle.
 _WEB_SAFE = {'JPEG', 'PNG', 'WEBP'}
 
@@ -35,7 +33,7 @@ def validate_and_normalize_image(image_bytes, max_dimension=None):
     Raises ValueError with a safe message if the bytes are not a valid image.
     """
     if max_dimension is None:
-        max_dimension = _DEFAULT_MAX_DIMENSION
+        max_dimension = int(os.getenv('MAX_IMAGE_DIMENSION', '2048'))
 
     try:
         Image.open(io.BytesIO(image_bytes)).verify()

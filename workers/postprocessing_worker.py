@@ -57,6 +57,24 @@ class PostProcessingWorker(BaseWorker):
             return False
         self.db_conn.autocommit = False
         return True
+
+    def _set_db_autocommit_mode(self, autocommit: bool):
+        """Switch the shared worker connection between primary and postprocessing modes.
+
+        face/pose workers can process both normal primary image messages and cropped
+        postprocessing messages on the same connection. When switching modes, clear
+        any idle transaction first so a prior callback's transaction scope cannot
+        leak into the next one.
+        """
+        if not self.db_conn or self.db_conn.closed != 0:
+            return
+        if self.db_conn.autocommit == autocommit:
+            return
+        try:
+            self.db_conn.rollback()
+        except Exception:
+            pass
+        self.db_conn.autocommit = autocommit
     
     def process_service(self, cropped_image_bytes):
         """Process the cropped image with the specific service - override in subclasses"""

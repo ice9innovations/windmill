@@ -122,9 +122,6 @@ class BaseWorker:
         self.is_spatial = self.config.is_spatial_service(self.service_name)
         self.is_semantic = self.config.is_semantic_service(self.service_name)
         self.is_vlm = self.config.is_vlm_service(self.service_name)
-        # Consensus is no longer part of the live hot path.
-        self.enable_consensus_triggers = False
-
         # Enable direct bbox postprocessing triggers for spatial services
         self.enable_triggers = self.is_spatial
         # Enable noun and verb consensus for VLM services
@@ -223,11 +220,19 @@ class BaseWorker:
     def resolve_image_bytes(self, message, required=True):
         image_ref = message.get('image_ref')
         if image_ref:
+            fetch_started_at = time.time()
             image_bytes = get_image(image_ref, config=self.image_store_config)
+            fetch_duration = time.time() - fetch_started_at
             if image_bytes is not None:
+                if self.service_name == 'system.florence2_grounding':
+                    self.logger.info(
+                        f"{self.service_name}: image_ref fetch image={message.get('image_id')} "
+                        f"duration={fetch_duration:.3f}s bytes={len(image_bytes)}"
+                    )
                 return image_bytes
             self.logger.error(
-                f"{self.service_name}: image_ref missing or expired for image {message.get('image_id')}: {image_ref}"
+                f"{self.service_name}: image_ref missing or expired for image {message.get('image_id')}: "
+                f"{image_ref} (fetch_duration={fetch_duration:.3f}s)"
             )
             if not required:
                 return None
@@ -383,8 +388,6 @@ class BaseWorker:
                 args['x-message-ttl'] = int(ttl_env)
             declarations.append((queue_name, args))
 
-        if self.enable_consensus_triggers:
-            add_queue(self._get_queue_by_service_type('consensus'))
         if self.enable_noun_consensus:
             add_queue(self._get_queue_by_service_type('noun_consensus'))
         if self.enable_verb_consensus:
@@ -417,8 +420,6 @@ class BaseWorker:
                 args['x-message-ttl'] = int(ttl_env)
             channel.queue_declare(queue=queue_name, durable=True, arguments=args)
 
-        if self.enable_consensus_triggers:
-            declare_with_dlq(self._sync_publish_channel, self._get_queue_by_service_type('consensus'))
         if self.enable_noun_consensus:
             declare_with_dlq(self._sync_publish_channel, self._get_queue_by_service_type('noun_consensus'))
         if self.enable_verb_consensus:
@@ -835,34 +836,6 @@ class BaseWorker:
         if not response.ok:
             payload['metadata'].setdefault('terminal_http_error', True)
         return payload
-    
-    def trigger_consensus(self, image_id, message):
-        """Trigger consensus processing (async via background publish thread)"""
-        if not self.enable_consensus_triggers:
-            return
-
-        self._record_service_event(
-            image_id=image_id,
-            service='consensus',
-            event_type='enqueued',
-            source_service=self._get_clean_service_name(),
-            source_stage='consensus_trigger',
-        )
-        consensus_message = {
-            'image_id': image_id,
-            'image_filename': message.get('image_filename', f'image_{image_id}'),
-            'service': self.service_name,
-            'worker_id': self.worker_id,
-            'processed_at': datetime.now().isoformat(),
-            'tier': message.get('tier', 'free'),
-        }
-
-        self._enqueue_publish(
-            self._get_queue_by_service_type('consensus'),
-            json.dumps(consensus_message)
-        )
-
-        self.logger.debug(f"Enqueued consensus trigger for {self.service_name} image {image_id}")
     
     def trigger_noun_consensus(self, image_id, message):
         """Trigger noun consensus for VLM services (async via background publish thread)"""
@@ -1772,27 +1745,6 @@ class BaseWorker:
                     f"Skipping verb_consensus enqueue for {self.service_name} image {image_id}: "
                     f"ready={vlm_ready} ({current_vlm_count}/{expected_vlm_count})"
                 )
-
-            if self.enable_consensus_triggers:
-                self._record_service_event(
-                    image_id=image_id,
-                    service='consensus',
-                    event_type='enqueued',
-                    source_service=self._get_clean_service_name(),
-                    source_stage='consensus_trigger',
-                )
-                consensus_message = {
-                    'image_id': image_id,
-                    'image_filename': message.get('image_filename', f'image_{image_id}'),
-                    'service': self.service_name,
-                    'worker_id': self.worker_id,
-                    'processed_at': datetime.now().isoformat(),
-                    'tier': tier,
-                }
-                downstream_messages.append((
-                    self._get_queue_by_service_type('consensus'),
-                    json.dumps(consensus_message)
-                ))
 
             publish_started_at = time.time()
             for routing_key, body in downstream_messages:

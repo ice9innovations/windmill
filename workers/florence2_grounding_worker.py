@@ -13,7 +13,6 @@ call for this image (noun_consensus triggers progressively as VLMs complete).
 Pattern mirrors sam3_worker: triggered internally, not by the producer.
 """
 
-import base64
 import io
 import json
 import os
@@ -26,6 +25,7 @@ from PIL import Image
 sys.path.append(os.path.dirname(__file__))
 
 from base_worker import BaseWorker
+from core.image_store import is_valkey_image_store_enabled
 
 MIN_COLORS_SIZE = (8, 8)
 
@@ -41,9 +41,8 @@ class Florence2GroundingWorker(BaseWorker):
         """No additional queues."""
         return
 
-    def _crop_bbox_from_image_data(self, image_data_b64: str, bbox: dict):
+    def _crop_bbox_from_image_data(self, image_bytes: bytes, bbox: dict):
         try:
-            image_bytes = base64.b64decode(image_data_b64)
             img = Image.open(io.BytesIO(image_bytes))
             with img:
                 crop_box = (
@@ -58,7 +57,7 @@ class Florence2GroundingWorker(BaseWorker):
                 img_buffer = io.BytesIO()
                 cropped_img.save(img_buffer, format='JPEG', quality=90)
                 img_buffer.seek(0)
-                return base64.b64encode(img_buffer.getvalue()).decode('latin-1')
+                return img_buffer.getvalue()
         except Exception as e:
             self.logger.error(f"florence2_grounding: crop failed: {e}")
             return None
@@ -66,6 +65,7 @@ class Florence2GroundingWorker(BaseWorker):
     def process_message(self, ch, method, properties, body):
         start_time = time.time()
         previous_autocommit = None
+        stage_timings = {}
 
         try:
             if not self.ensure_database_connection():
@@ -76,14 +76,31 @@ class Florence2GroundingWorker(BaseWorker):
             message = json.loads(body)
             image_id = message['image_id']
             tier = message.get('tier', 'free')
-            image_data = self.resolve_image_data_b64(message, required=True)
+            has_image_ref = bool(message.get('image_ref'))
+            has_image_data = bool(message.get('image_data'))
 
-            if not image_data:
+            if is_valkey_image_store_enabled():
+                if has_image_data and not has_image_ref:
+                    self.logger.warning(
+                        f"florence2_grounding: image {image_id} arrived with inline image_data "
+                        f"while IMAGE_STORE_MODE=valkey"
+                    )
+                else:
+                    self.logger.info(
+                        f"florence2_grounding: image {image_id} transport "
+                        f"image_ref={has_image_ref} image_data={has_image_data}"
+                    )
+
+            t0 = time.time()
+            image_bytes = self.resolve_image_bytes(message, required=True)
+            stage_timings['resolve_image'] = time.time() - t0
+
+            if not image_bytes:
                 self.logger.error(
-                    f"florence2_grounding: no image_data in message for image {image_id}"
+                    f"florence2_grounding: no image bytes in message for image {image_id}"
                 )
                 self._safe_nack(ch, method.delivery_tag, requeue=False)
-                self.job_failed("No image data")
+                self.job_failed("No image bytes")
                 return
 
             # Read nouns from noun_consensus at processing time, not from the
@@ -92,7 +109,9 @@ class Florence2GroundingWorker(BaseWorker):
             # fresher (and usually complete) noun set. This also means we never
             # run with more nouns than we need to — the threshold is re-applied
             # against the tier's expected VLM count at this moment.
+            t0 = time.time()
             nouns = self._fetch_consensus_nouns(image_id, tier)
+            stage_timings['fetch_nouns'] = time.time() - t0
 
             if not nouns:
                 self.logger.info(
@@ -140,7 +159,9 @@ class Florence2GroundingWorker(BaseWorker):
                 f"{len(nouns)} nouns, prompt: \"{prompt}\""
             )
 
-            result = self._call_florence2_grounding(image_data, prompt)
+            t0 = time.time()
+            result = self._call_florence2_grounding(image_bytes, prompt)
+            stage_timings['call_florence'] = time.time() - t0
             if result is None:
                 self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Florence-2 grounding call failed")
@@ -153,7 +174,10 @@ class Florence2GroundingWorker(BaseWorker):
             if result_status != 'success':
                 previous_autocommit = self.db_conn.autocommit
                 self.db_conn.autocommit = False
+                t0 = time.time()
                 self._store_result(image_id, result, processing_time, commit=False)
+                stage_timings['store_result'] = time.time() - t0
+                t0 = time.time()
                 self._record_service_event(
                     image_id=image_id,
                     service='florence2_grounding',
@@ -165,7 +189,10 @@ class Florence2GroundingWorker(BaseWorker):
                     },
                     commit=False,
                 )
+                stage_timings['record_failure_event'] = time.time() - t0
+                t0 = time.time()
                 self.db_conn.commit()
+                stage_timings['db_commit'] = time.time() - t0
                 self._safe_ack(ch, method.delivery_tag)
                 self.job_completed_successfully()
                 self.logger.warning(
@@ -198,7 +225,9 @@ class Florence2GroundingWorker(BaseWorker):
 
             previous_autocommit = self.db_conn.autocommit
             self.db_conn.autocommit = False
+            t0 = time.time()
             self._store_result(image_id, result, processing_time, commit=False)
+            stage_timings['store_result'] = time.time() - t0
 
             # Mark nouns that were successfully grounded back in noun_consensus.
             # Must happen before ACK so the grounding_validated backfill is
@@ -209,8 +238,11 @@ class Florence2GroundingWorker(BaseWorker):
                 if p.get('label')
             ]
             if grounded_labels:
+                t0 = time.time()
                 self._validate_noun_consensus(image_id, nouns, grounded_labels, commit=False)
+                stage_timings['validate_nouns'] = time.time() - t0
 
+            t0 = time.time()
             self._record_service_event(
                 image_id=image_id,
                 service='florence2_grounding',
@@ -223,10 +255,19 @@ class Florence2GroundingWorker(BaseWorker):
                 },
                 commit=False,
             )
+            stage_timings['record_completed_event'] = time.time() - t0
+            t0 = time.time()
             self.db_conn.commit()
+            stage_timings['db_commit'] = time.time() - t0
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
 
+            timing_bits = " ".join(
+                f"{name}={duration:.3f}s" for name, duration in stage_timings.items()
+            )
+            self.logger.info(
+                f"florence2_grounding: image {image_id} stage timings {timing_bits}"
+            )
             self.logger.info(
                 f"florence2_grounding: image {image_id} — "
                 f"{len(result.get('predictions', []))} regions grounded "
@@ -332,10 +373,9 @@ class Florence2GroundingWorker(BaseWorker):
             )
             return {'nouns': set(), 'predictions': []}
 
-    def _call_florence2_grounding(self, image_data_b64: str, prompt: str):
+    def _call_florence2_grounding(self, image_bytes: bytes, prompt: str):
         """POST image + prompt to Florence-2 CAPTION_TO_PHRASE_GROUNDING."""
         try:
-            image_bytes = base64.b64decode(image_data_b64)
             files = {'file': ('image.jpg', io.BytesIO(image_bytes), 'image/jpeg')}
             url = f"http://{self.service_host}:{self.service_port}/v3/analyze"
             resp = requests.post(

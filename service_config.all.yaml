@@ -5,7 +5,7 @@
 # Rules: 
 # Spatial services trigger box harmonization
 # Semantic services trigger caption scores
-# All services trigger consesus building unless tagged with consensus: false
+# Primary services marked `consensus: true` feed noun/verb consensus-derived stages
 
 services:
   # Primary ML Services - Run on full images
@@ -204,13 +204,7 @@ services:
 
     # Infrastructure Services - Queue processing and harmonization
     # Handled differently to avoid recursion
-    # Consensus does not trigger consensus
     # Harmony does not trigger harmony
-
-    consensus:
-      queue_name: consensus
-      category: infrastructure
-      service_type: consensus
 
     harmony:
       queue_name: harmony

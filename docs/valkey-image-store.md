@@ -21,6 +21,10 @@ VALKEY_PASSWORD=...
 VALKEY_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 VALKEY_IMAGE_TTL_SECONDS=90
 VALKEY_CROP_TTL_SECONDS=90
+VALKEY_SOCKET_CONNECT_TIMEOUT_SECONDS=3
+VALKEY_SOCKET_TIMEOUT_SECONDS=3
+VALKEY_HEALTH_CHECK_INTERVAL_SECONDS=30
+VALKEY_KEEPALIVE_PING_SECONDS=15
 ```
 
 ## Expected Valkey server properties
@@ -70,6 +74,15 @@ When `IMAGE_STORE_MODE=inline`:
 - Restart the API and all workers after changing `IMAGE_STORE_MODE`
 - Keep `VALKEY_IMAGE_TTL_SECONDS` and `VALKEY_CROP_TTL_SECONDS` at `90` unless
   you have measured queue latency comfortably below that
+- Keep Valkey socket timeouts enabled so a stale image-store connection fails
+  fast instead of wedging a worker on `get_image()`
+- Remote idle TLS connections can still go stale. Windmill retries one fetch
+  after dropping the client pool on Valkey timeout/connection errors so cold
+  reconnects are bounded by the configured socket timeouts instead of the
+  previous longer stall
+- Windmill now also sends periodic Valkey `PING`s from each process when
+  `VALKEY_KEEPALIVE_PING_SECONDS` is set, so infrequently used workers do not
+  pay the first-request reconnect penalty as often
 - A Valkey miss should be treated as an infrastructure problem, not a normal
   model failure
 

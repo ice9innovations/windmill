@@ -10,9 +10,14 @@ import os
 import uuid
 from dataclasses import dataclass
 from threading import Lock
+from threading import Thread
+from threading import Event
 from typing import Optional
+import time
 
 import redis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 _DEFAULT_CA_CERTS = "/etc/ssl/certs/ca-certificates.crt"
 _DEFAULT_IMAGE_TTL_SECONDS = 90
@@ -21,6 +26,8 @@ _DEFAULT_KEY_PREFIX = "wm"
 
 _client = None
 _client_lock = Lock()
+_keepalive_thread = None
+_keepalive_stop = Event()
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -48,6 +55,10 @@ class ImageStoreConfig:
     ca_certs: Optional[str]
     image_ttl_seconds: int
     crop_ttl_seconds: int
+    socket_connect_timeout_seconds: float
+    socket_timeout_seconds: float
+    health_check_interval_seconds: int
+    keepalive_ping_seconds: int
     key_prefix: str = _DEFAULT_KEY_PREFIX
 
     @property
@@ -67,6 +78,10 @@ class ImageStoreConfig:
             ca_certs=os.getenv("VALKEY_CA_CERTS", _DEFAULT_CA_CERTS) or None,
             image_ttl_seconds=_env_int("VALKEY_IMAGE_TTL_SECONDS", _DEFAULT_IMAGE_TTL_SECONDS),
             crop_ttl_seconds=_env_int("VALKEY_CROP_TTL_SECONDS", _DEFAULT_CROP_TTL_SECONDS),
+            socket_connect_timeout_seconds=float(os.getenv("VALKEY_SOCKET_CONNECT_TIMEOUT_SECONDS", "3")),
+            socket_timeout_seconds=float(os.getenv("VALKEY_SOCKET_TIMEOUT_SECONDS", "3")),
+            health_check_interval_seconds=_env_int("VALKEY_HEALTH_CHECK_INTERVAL_SECONDS", 30),
+            keepalive_ping_seconds=_env_int("VALKEY_KEEPALIVE_PING_SECONDS", 15),
         )
 
     def validate(self) -> None:
@@ -95,7 +110,7 @@ def is_valkey_image_store_enabled() -> bool:
 
 
 def get_client(config: Optional[ImageStoreConfig] = None):
-    global _client
+    global _client, _keepalive_thread
     config = config or get_image_store_config()
     if not config.enabled:
         raise RuntimeError("Valkey image store requested while IMAGE_STORE_MODE is not 'valkey'")
@@ -113,11 +128,39 @@ def get_client(config: Optional[ImageStoreConfig] = None):
             "password": config.password,
             "ssl": config.use_ssl,
             "decode_responses": False,
+            "socket_connect_timeout": config.socket_connect_timeout_seconds,
+            "socket_timeout": config.socket_timeout_seconds,
+            "health_check_interval": config.health_check_interval_seconds,
+            "socket_keepalive": True,
         }
         if config.use_ssl and config.ca_certs:
             kwargs["ssl_ca_certs"] = config.ca_certs
         _client = redis.Redis(**kwargs)
+        if config.keepalive_ping_seconds > 0 and (_keepalive_thread is None or not _keepalive_thread.is_alive()):
+            _keepalive_stop.clear()
+            _keepalive_thread = Thread(
+                target=_keepalive_loop,
+                args=(config.keepalive_ping_seconds,),
+                daemon=True,
+                name="image_store_keepalive",
+            )
+            _keepalive_thread.start()
         return _client
+
+
+def _keepalive_loop(interval_seconds: int) -> None:
+    """Keep remote TLS Valkey connections warm between sporadic worker fetches."""
+    while not _keepalive_stop.wait(interval_seconds):
+        client = _client
+        if client is None:
+            continue
+        try:
+            client.ping()
+        except (RedisTimeoutError, RedisConnectionError):
+            try:
+                client.connection_pool.disconnect()
+            except Exception:
+                pass
 
 
 def ping(config: Optional[ImageStoreConfig] = None) -> bool:
@@ -149,9 +192,15 @@ def put_crop(crop_bytes: bytes, ttl_s: Optional[int] = None, config: Optional[Im
 
 def get_bytes(ref: str, refresh_ttl_s: Optional[int] = None, config: Optional[ImageStoreConfig] = None) -> Optional[bytes]:
     client = get_client(config)
-    if refresh_ttl_s:
-        return client.getex(ref, ex=refresh_ttl_s)
-    return client.get(ref)
+    try:
+        if refresh_ttl_s:
+            return client.getex(ref, ex=refresh_ttl_s)
+        return client.get(ref)
+    except (RedisTimeoutError, RedisConnectionError):
+        client.connection_pool.disconnect()
+        if refresh_ttl_s:
+            return client.getex(ref, ex=refresh_ttl_s)
+        return client.get(ref)
 
 
 def get_image(ref: str, refresh_ttl_s: Optional[int] = None, config: Optional[ImageStoreConfig] = None) -> Optional[bytes]:

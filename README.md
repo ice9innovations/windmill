@@ -28,13 +28,12 @@ Submit image
             ├─→ harmony_worker → merged_boxes
             │       └─→ [colors_post] [face] [pose]   ← postprocessing on each bbox
             │
-            └─→ consensus_worker → consensus
-                    └─→ noun_consensus_worker → noun_consensus
-                            ├─→ florence2_grounding_worker → florence2_grounding
-                            ├─→ sam3_worker → sam3_results
-                            ├─→ verb_consensus_worker → verb_consensus
-                            └─→ caption_summary_worker → caption_summary
-                                                            └─→ content_analysis_worker → content_analysis
+            └─→ noun_consensus_worker → noun_consensus
+                    ├─→ florence2_grounding_worker → florence2_grounding
+                    ├─→ sam3_worker → sam3_results
+                    ├─→ verb_consensus_worker → verb_consensus
+                    └─→ caption_summary_worker → caption_summary
+                                                    └─→ content_analysis_worker → content_analysis
 ```
 
 ---
@@ -76,13 +75,12 @@ Submit image
 | Service | Role |
 |---------|------|
 | harmony | IoU clustering across spatial results → merged_boxes |
-| consensus | V3 voting across all ML results → consensus |
 | florence2_grounding | progressive noun grounding requests driven by noun_consensus |
 | noun_consensus | Noun extraction + synonym collapse → noun_consensus |
 | verb_consensus | Verb/SVO extraction → verb_consensus |
 | sam3 | SAM3 segmentation for detected nouns → sam3_results |
 | caption_summary | LLM synthesis of all VLM captions → caption_summary |
-| content_analysis | safety/scene synthesis over consensus, captions, and nudenet |
+| content_analysis | safety/scene synthesis over noun/verb consensus, captions, and nudenet |
 | rembg | Background removal → used by downstream consumers |
 
 ---
@@ -153,6 +151,10 @@ VALKEY_PASSWORD=
 VALKEY_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 VALKEY_IMAGE_TTL_SECONDS=90
 VALKEY_CROP_TTL_SECONDS=90
+VALKEY_SOCKET_CONNECT_TIMEOUT_SECONDS=3
+VALKEY_SOCKET_TIMEOUT_SECONDS=3
+VALKEY_HEALTH_CHECK_INTERVAL_SECONDS=30
+VALKEY_KEEPALIVE_PING_SECONDS=15
 
 # API port (default 9999)
 API_PORT=9997
@@ -221,7 +223,6 @@ curl http://localhost:9997/status/517
   "services_submitted": ["blip", "colors", "moondream", "yolo_v8"],
   "services_completed": {"blip": {...}, "colors": {...}},
   "services_pending": ["moondream", "yolo_v8"],
-  "consensus_complete": true,
   "noun_consensus_complete": false,
   "verb_consensus_complete": false,
   "sam3_complete": false,
@@ -229,7 +230,6 @@ curl http://localhost:9997/status/517
   "content_analysis_complete": false,
   "service_results": {...},
   "merged_boxes": [...],
-  "consensus": {...},
   "postprocessing": [...],
   "service_dispatch": [
     {"service": "blip", "status": "complete", "dispatched_at": "..."},
@@ -381,7 +381,6 @@ Full schema in `db/db.sql`. Key tables:
 | service_dispatch | UPDATE | Job lifecycle per service (pending → complete/failed/dead-lettered) |
 | merged_boxes | DELETE+INSERT | Harmonized bounding boxes |
 | postprocessing | INSERT | Per-bbox service results |
-| consensus | DELETE+INSERT | V3 voting consensus |
 | noun_consensus | UPSERT | Extracted nouns, categories, confidence |
 | verb_consensus | UPSERT | Extracted verbs, SVO triples |
 | sam3_results | UPSERT | SAM3 segmentation per noun |
@@ -405,7 +404,7 @@ Workers are stateless — any machine with `.env` credentials and a `*_worker.py
 ./windmill.sh start yolo_v8_worker harmony_worker face_worker pose_worker
 
 # Machine C: system workers
-./windmill.sh start consensus_worker noun_consensus_worker caption_summary_worker
+./windmill.sh start noun_consensus_worker verb_consensus_worker caption_summary_worker
 ```
 
 ---
@@ -422,7 +421,6 @@ workers/
   base_worker.py          BaseWorker — shared queue/DB/HTTP plumbing
   service_config.py       ServiceConfig class, get_service_config()
   harmony_worker.py       IoU clustering and postprocessing dispatch
-  consensus_worker.py     V3 voting
   noun_consensus_worker.py Noun extraction, category tally
   verb_consensus_worker.py Verb/SVO extraction
   noun_extractor.py       spaCy-based noun/verb extraction
