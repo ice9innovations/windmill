@@ -55,24 +55,6 @@ flowchart TD
     qBboxFace --> wBboxFace[bbox_face_worker.py] --> PostprocessingDB
     qBboxPose --> wBboxPose[bbox_pose_worker.py] --> PostprocessingDB
     
-    %% Consensus Triggers (enable_consensus_triggers=true - nearly all services except colors/metadata/postprocessing)
-    wBlip -.->|enable_consensus_triggers: true| qConsensus[queue_consensus<br/>5 consumers]
-    wClip -.-> qConsensus
-    wDetectron2 -.-> qConsensus
-    wXception -.-> qConsensus
-    wOCR -.-> qConsensus
-    wNSFW2 -.-> qConsensus
-    wOllama -.-> qConsensus
-    wRTDETR -.-> qConsensus
-    wYolov8 -.-> qConsensus
-    wYolo365 -.-> qConsensus
-    wYoloOI7 -.-> qConsensus
-    
-    %% Consensus Processing (reads merged_boxes for spatial evidence)
-    qConsensus --> wConsensus[consensus_worker.py<br/>V3 voting algorithm<br/>DELETE+INSERT pattern]
-    MergedBoxesDB -.-> wConsensus
-    wConsensus --> ConsensusDB[(consensus table)]
-    
     %% Caption Scoring (enable_caption_scoring=true)
     wBlip -.->|enable_caption_scoring: true| qCaptionScore[queue_caption_score<br/>1 consumer]
     wOllama -.-> qCaptionScore
@@ -84,6 +66,6 @@ flowchart TD
     classDef dbStyle fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
     classDef triggerStyle stroke-dasharray: 5 5,stroke:#ff6f00,stroke-width:2px
     
-    class qBlip,qClip,qColors,qDetectron2,qXception,qMetadata,qOCR,qNSFW2,qOllama,qRTDETR,qYolov8,qYolo365,qYoloOI7,qBboxMerge,qBboxColors,qBboxFace,qBboxPose,qConsensus,qCaptionScore queueStyle
-    class wBlip,wClip,wColors,wDetectron2,wXception,wMetadata,wOCR,wNSFW2,wOllama,wRTDETR,wYolov8,wYolo365,wYoloOI7,wBboxMerger,wBboxColors,wBboxFace,wBboxPose,wConsensus,wCaptionScore workerStyle
-    class ResultsDB,MergedBoxesDB,PostprocessingDB,ConsensusDB dbStyle
+    class qBlip,qClip,qColors,qDetectron2,qXception,qMetadata,qOCR,qNSFW2,qOllama,qRTDETR,qYolov8,qYolo365,qYoloOI7,qBboxMerge,qBboxColors,qBboxFace,qBboxPose,qCaptionScore queueStyle
+    class wBlip,wClip,wColors,wDetectron2,wXception,wMetadata,wOCR,wNSFW2,wOllama,wRTDETR,wYolov8,wYolo365,wYoloOI7,wBboxMerger,wBboxColors,wBboxFace,wBboxPose,wCaptionScore workerStyle
+    class ResultsDB,MergedBoxesDB,PostprocessingDB dbStyle

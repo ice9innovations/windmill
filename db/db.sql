@@ -21,7 +21,6 @@ DROP TABLE IF EXISTS noun_consensus CASCADE;
 DROP TABLE IF EXISTS verb_consensus CASCADE;
 DROP TABLE IF EXISTS caption_summary CASCADE;
 DROP TABLE IF EXISTS service_dispatch CASCADE;
-DROP TABLE IF EXISTS consensus CASCADE;
 DROP TABLE IF EXISTS merged_boxes CASCADE;
 DROP TABLE IF EXISTS results CASCADE;
 DROP TABLE IF EXISTS images CASCADE;
@@ -106,20 +105,6 @@ CREATE TABLE merged_boxes (
 CREATE INDEX idx_merged_boxes_image ON merged_boxes(image_id);
 CREATE INDEX idx_merged_boxes_status ON merged_boxes(status);
 CREATE INDEX idx_merged_boxes_worker ON merged_boxes(worker_id);
-
-
--- Consensus table: V3 voting consensus across all ML results (DELETE+INSERT per image)
-CREATE TABLE consensus (
-    consensus_id       BIGSERIAL PRIMARY KEY,
-    image_id           BIGINT NOT NULL REFERENCES images(image_id),
-    consensus_data     JSONB NOT NULL,
-    consensus_created  TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
-    processing_time    DOUBLE PRECISION
-);
-
-CREATE INDEX idx_consensus_created ON consensus(consensus_created);
-CREATE INDEX idx_consensus_image ON consensus(image_id);
-
 
 -- Postprocessing table: Per-bbox and image-level postprocessing results (INSERT-only)
 -- merged_box_id is NULL for image-level postprocessing (e.g. caption scoring).

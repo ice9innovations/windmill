@@ -106,7 +106,7 @@ ansible all -m ping
 ## Architecture Integration
 
 This setup integrates with your existing Pi cluster architecture:
-- **k1.local** (192.168.0.121): PostgreSQL + consensus_worker
+- **k1.local** (192.168.0.121): PostgreSQL + primary orchestration workers
 - **k2.local** (192.168.0.122): RabbitMQ only
 - **k3.local** (192.168.0.123): GPU services (blip, clip, yolov8)
 

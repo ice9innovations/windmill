@@ -57,7 +57,6 @@ all:
             - caption_score_worker
             - caption_summary_worker
             - colors_worker
-            - consensus_worker
             - content_analysis_worker
             - dlq_worker
             - gemini_worker

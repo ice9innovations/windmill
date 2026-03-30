@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Clear Database Script - Clears all derived data tables while preserving images
+# Clear Database Script - Clears all active derived data tables while preserving images
 # This script safely clears all ML processing results and derived data while keeping the base images table intact.
 #
 
@@ -69,7 +69,6 @@ clear_tables() {
     # postprocessing -> merged_boxes -> everything else
     PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -c "
         DELETE FROM postprocessing;
-        DELETE FROM consensus;
         DELETE FROM merged_boxes;  
         DELETE FROM results;
     " > /dev/null 2>&1
@@ -106,12 +105,6 @@ verify_cleanup() {
             CASE WHEN COUNT(*) = 0 THEN '✅ Cleared' ELSE '❌ Has Data' END as status
         FROM merged_boxes
         UNION ALL
-        SELECT 
-            'consensus' as table_name, 
-            COUNT(*) as count,
-            CASE WHEN COUNT(*) = 0 THEN '✅ Cleared' ELSE '❌ Has Data' END as status
-        FROM consensus
-        UNION ALL  
         SELECT 
             'postprocessing' as table_name, 
             COUNT(*) as count,

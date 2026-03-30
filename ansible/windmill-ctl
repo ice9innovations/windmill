@@ -25,7 +25,7 @@ show_usage() {
     echo "  deploy    - Full deployment: stop → update → start"
     echo ""
     echo "Options:"
-    echo "  worker    - Name of specific worker (e.g., blip, yolo, consensus)"
+    echo "  worker    - Name of specific worker (e.g., blip, yolo, noun_consensus)"
     echo "  --host    - Target specific host (e.g., k3.local)"
     echo "  --group   - Target node group (gpu_nodes, light_processing, ollama_nodes, specialized_nodes)"
     echo "  --branch  - Git branch to update to (default: main)"
@@ -42,7 +42,7 @@ show_usage() {
     echo "  $0 start ollama                   # Start ollama worker on all nodes that support it"
     echo "  $0 start --group ollama_nodes     # Start all workers on ollama-capable nodes"
     echo "  $0 start colors_post --group light_processing  # Start colors_post on light processing nodes"
-    echo "  $0 restart consensus --host k1.local           # Restart consensus worker on k1.local only"
+    echo "  $0 restart noun_consensus --host k1.local      # Restart noun_consensus worker on k1.local only"
     echo "  $0 stop --group gpu_nodes         # Stop all workers on GPU nodes"
 }
 

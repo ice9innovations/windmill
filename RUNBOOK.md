@@ -26,10 +26,10 @@
 
 ### 4) Reprocessing
 - Harmony changes (merged boxes):
-  - Re-run harmony over affected images, then rerun consensus
+  - Re-run harmony over affected images
   - Optionally script selective requeue to `queue_harmony`
-- Consensus changes:
-  - Re-run consensus by publishing to the consensus queue for affected images
+- Noun/verb consensus or downstream semantic changes:
+  - Re-run the appropriate active downstream stage (`noun_consensus`, `verb_consensus`, `caption_summary`, `content_analysis`) for affected images
 
 ### 5) Observability Quick Tips
 - Logs in `logs/`
@@ -40,5 +40,4 @@
 - Use DLQ instead of infinite requeues
 - Requeue in small batches; monitor error rates
 - Prefer URL-based datasets to avoid container file mounts
-
 

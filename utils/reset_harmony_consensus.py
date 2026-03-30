@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Reset Harmony and Consensus Data
+Reset Harmony Data
 
-This script clears harmony (merged_boxes) and consensus data from the database
-and retriggers processing by sending messages to the harmony queue.
+This script clears harmony-related derived data from the database and
+retriggers processing by sending messages to the harmony queue.
 
-DANGER: This will delete ALL harmony and consensus data!
+DANGER: This will delete ALL harmony-related derived data!
 """
 import os
 import sys
@@ -27,7 +27,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logging.getLogger('pika').setLevel(logging.WARNING)  # Suppress Pika connection chatter
 logger = logging.getLogger(__name__)
 
-class HarmonyConsensusReset:
+class HarmonyReset:
     def __init__(self):
         # Database configuration
         self.db_host = os.getenv('DB_HOST')
@@ -109,8 +109,8 @@ class HarmonyConsensusReset:
             logger.error(f"Error getting images: {e}")
             return []
 
-    def clear_harmony_consensus_data(self, image_ids=None):
-        """Clear harmony and consensus data, optionally for specific image IDs"""
+    def clear_harmony_data(self, image_ids=None):
+        """Clear harmony-related derived data, optionally for specific image IDs."""
         try:
             cursor = self.db_conn.cursor()
             
@@ -128,27 +128,19 @@ class HarmonyConsensusReset:
                 """, (image_id_list,))
                 postprocessing_deleted = cursor.rowcount
                 
-                # Step 2: Delete consensus data
-                cursor.execute("DELETE FROM consensus WHERE image_id IN %s", (image_id_list,))
-                consensus_deleted = cursor.rowcount
-                
-                # Step 3: Delete merged_boxes data
+                # Step 2: Delete merged_boxes data
                 cursor.execute("DELETE FROM merged_boxes WHERE image_id IN %s", (image_id_list,))
                 merged_boxes_deleted = cursor.rowcount
                 
             else:
                 # Clear ALL data
-                logger.warning("Clearing ALL harmony and consensus data!")
+                logger.warning("Clearing ALL harmony-related derived data!")
                 
                 # Step 1: Delete all postprocessing
                 cursor.execute("DELETE FROM postprocessing")
                 postprocessing_deleted = cursor.rowcount
                 
-                # Step 2: Delete all consensus
-                cursor.execute("DELETE FROM consensus")
-                consensus_deleted = cursor.rowcount
-                
-                # Step 3: Delete all merged_boxes
+                # Step 2: Delete all merged_boxes
                 cursor.execute("DELETE FROM merged_boxes")
                 merged_boxes_deleted = cursor.rowcount
             
@@ -156,7 +148,7 @@ class HarmonyConsensusReset:
             self.db_conn.commit()
             cursor.close()
             
-            logger.info(f"Deleted: {postprocessing_deleted} postprocessing, {consensus_deleted} consensus, {merged_boxes_deleted} merged_boxes records")
+            logger.info(f"Deleted: {postprocessing_deleted} postprocessing, {merged_boxes_deleted} merged_boxes records")
             return True
             
         except Exception as e:
@@ -242,7 +234,7 @@ class HarmonyConsensusReset:
 
     def run_reset(self, image_ids=None, dry_run=False):
         """Main reset workflow"""
-        logger.info("Starting harmony and consensus reset...")
+        logger.info("Starting harmony reset...")
         
         # Connect to services
         if not self.connect_to_database():
@@ -267,7 +259,7 @@ class HarmonyConsensusReset:
                 return True
             
             # Clear existing data
-            if not self.clear_harmony_consensus_data([img[0] for img in images]):
+            if not self.clear_harmony_data([img[0] for img in images]):
                 logger.error("Failed to clear data")
                 return False
             
@@ -291,7 +283,7 @@ def main():
     """Main entry point"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='Reset harmony and consensus data')
+    parser = argparse.ArgumentParser(description='Reset harmony-derived data')
     parser.add_argument('--dry-run', action='store_true', help='Show what would be done without making changes')
     parser.add_argument('--image-ids', type=str, help='Comma-separated list of image IDs to reset (default: all)')
     parser.add_argument('--confirm', action='store_true', help='Required to actually run the reset')
@@ -299,7 +291,7 @@ def main():
     args = parser.parse_args()
     
     if not args.dry_run and not args.confirm:
-        print("ERROR: This script will delete harmony and consensus data!")
+        print("ERROR: This script will delete harmony-derived data!")
         print("Use --dry-run to see what would happen, or --confirm to actually run it")
         return 1
     
@@ -314,7 +306,7 @@ def main():
             return 1
     
     # Run the reset
-    reset_tool = HarmonyConsensusReset()
+    reset_tool = HarmonyReset()
     success = reset_tool.run_reset(image_ids=image_ids, dry_run=args.dry_run)
     
     return 0 if success else 1

@@ -16,7 +16,7 @@ from datetime import datetime
 load_dotenv('../.env')
 
 def get_images_to_process(image_group=None, limit=10):
-    """Get images that have consensus but no content_analysis yet"""
+    """Get images that have noun consensus, NudeNet, and no content_analysis yet."""
     try:
         conn = psycopg2.connect(
             host=os.getenv('DB_HOST'),
@@ -27,11 +27,14 @@ def get_images_to_process(image_group=None, limit=10):
         cursor = conn.cursor()
 
         query = """
-            SELECT DISTINCT c.image_id, i.image_filename
-            FROM consensus c
-            JOIN images i ON c.image_id = i.image_id
-            LEFT JOIN content_analysis ca ON c.image_id = ca.image_id
+            SELECT DISTINCT nc.image_id, i.image_filename
+            FROM noun_consensus nc
+            JOIN images i ON nc.image_id = i.image_id
+            JOIN results r ON nc.image_id = r.image_id
+            LEFT JOIN content_analysis ca ON nc.image_id = ca.image_id
             WHERE ca.image_id IS NULL
+              AND r.service = 'nudenet'
+              AND r.status = 'success'
         """
 
         params = []
@@ -39,7 +42,7 @@ def get_images_to_process(image_group=None, limit=10):
             query += " AND i.image_group = %s"
             params.append(image_group)
 
-        query += " ORDER BY c.image_id LIMIT %s"
+        query += " ORDER BY nc.image_id LIMIT %s"
         params.append(limit)
 
         cursor.execute(query, params)
@@ -102,7 +105,7 @@ def trigger_content_analysis(images):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Trigger content analysis for images with consensus'
+        description='Trigger content analysis for images with noun consensus and NudeNet'
     )
     parser.add_argument(
         '--group', '-g',

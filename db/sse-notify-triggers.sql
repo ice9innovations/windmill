@@ -26,12 +26,6 @@ CREATE TRIGGER content_analysis_notify
     AFTER INSERT OR UPDATE ON content_analysis
     FOR EACH ROW EXECUTE FUNCTION notify_result_change();
 
--- consensus (DELETE + INSERT — INSERT trigger is sufficient)
-DROP TRIGGER IF EXISTS consensus_notify ON consensus;
-CREATE TRIGGER consensus_notify
-    AFTER INSERT ON consensus
-    FOR EACH ROW EXECUTE FUNCTION notify_result_change();
-
 -- noun_consensus (ON CONFLICT DO UPDATE)
 DROP TRIGGER IF EXISTS noun_consensus_notify ON noun_consensus;
 CREATE TRIGGER noun_consensus_notify

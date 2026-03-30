@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Retrigger harmony and consensus for images that have results but missing harmonization.
+Retrigger harmony for images that have results but missing harmonization.
 This is useful when workers weren't running during initial processing.
 """
 import os
@@ -60,7 +60,7 @@ def main():
     cursor.execute(query, params)
     images = cursor.fetchall()
 
-    print(f"Found {len(images)} images to reprocess for harmony/consensus")
+    print(f"Found {len(images)} images to reprocess for harmony")
 
     if len(images) == 0:
         print("No images found. Exiting.")
@@ -85,14 +85,12 @@ def main():
     # (They were created by workers with DLQ configuration)
     try:
         channel.queue_declare(queue='harmony', durable=True, passive=True)
-        channel.queue_declare(queue='consensus', durable=True, passive=True)
     except Exception as e:
         print(f"Warning: Could not verify queues exist: {e}")
         print("Continuing anyway - queues should exist from workers")
 
     # Process each image
     harmony_published = 0
-    consensus_published = 0
 
     for image_id, image_filename, image_url in images:
         try:
@@ -126,24 +124,6 @@ def main():
             )
             harmony_published += 1
 
-            # Publish to consensus queue
-            consensus_message = {
-                'image_id': image_id,
-                'image_filename': image_filename,
-                'service': 'nudenet',
-                'worker_id': 'retrigger_script',
-                'processed_at': datetime.now().isoformat(),
-                **image_transport,
-            }
-
-            channel.basic_publish(
-                exchange='',
-                routing_key='consensus',
-                body=json.dumps(consensus_message),
-                properties=pika.BasicProperties(delivery_mode=2)
-            )
-            consensus_published += 1
-
             if (harmony_published % 100) == 0:
                 print(f"  Published {harmony_published} messages...")
 
@@ -152,7 +132,6 @@ def main():
             continue
 
     print(f"\n✅ Published {harmony_published} harmony messages")
-    print(f"✅ Published {consensus_published} consensus messages")
 
     # Cleanup
     connection.close()

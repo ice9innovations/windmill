@@ -2,7 +2,8 @@
 """
 Re-run Content Analysis
 
-Triggers content analysis re-processing for all images with consensus data.
+Triggers content analysis re-processing for all images with noun consensus
+and successful NudeNet output.
 Use this after updating spatial_analysis.py or content_analysis_worker.py.
 
 Usage:
@@ -47,12 +48,15 @@ def get_queue_connection():
 
 
 def get_images_to_process(cursor, limit=None):
-    """Get all images with consensus data"""
+    """Get all images with noun consensus and successful NudeNet output."""
     query = """
-        SELECT DISTINCT c.image_id, i.image_filename
-        FROM consensus c
-        JOIN images i ON c.image_id = i.image_id
-        ORDER BY c.image_id
+        SELECT DISTINCT nc.image_id, i.image_filename
+        FROM noun_consensus nc
+        JOIN images i ON nc.image_id = i.image_id
+        JOIN results r ON nc.image_id = r.image_id
+        WHERE r.service = 'nudenet'
+          AND r.status = 'success'
+        ORDER BY nc.image_id
     """
     if limit:
         query += f" LIMIT {limit}"
@@ -89,7 +93,7 @@ def main():
     db_conn = get_db_connection()
     cursor = db_conn.cursor()
 
-    print("Fetching images with consensus data...")
+    print("Fetching images with noun consensus and NudeNet data...")
     images = get_images_to_process(cursor, args.limit)
     cursor.close()
     db_conn.close()
