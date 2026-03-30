@@ -78,7 +78,6 @@ class VerbConsensusWorker(BaseWorker):
             message = json.loads(body)
             image_id = message['image_id']
             triggering_service = message.get('service', 'unknown')
-
             self.logger.debug(
                 f"verb_consensus: processing image {image_id} "
                 f"(triggered by {triggering_service})"
@@ -90,9 +89,9 @@ class VerbConsensusWorker(BaseWorker):
 
             if not service_verb_map:
                 processing_time = round(time.time() - start_time, 3)
-                self._store_terminal_service_result(
-                    image_id,
-                    {
+                self._persist_terminal_verb_consensus_result(
+                    image_id=image_id,
+                    payload={
                         'service': 'verb_consensus',
                         'status': 'success',
                         'verbs': [],
@@ -105,21 +104,12 @@ class VerbConsensusWorker(BaseWorker):
                         },
                     },
                     processing_time=processing_time,
-                    commit=False,
+                    source_service=triggering_service,
+                    event_data={'reason': 'No VLM verb data yet'},
                 )
                 self.logger.debug(
                     f"verb_consensus: no VLM verb data yet for image {image_id}, skipping"
                 )
-                self._record_service_event(
-                    image_id=image_id,
-                    service='verb_consensus',
-                    event_type='completed',
-                    source_service=triggering_service,
-                    source_stage='verb_consensus_run',
-                    data={'reason': 'No VLM verb data yet'},
-                    commit=False,
-                )
-                self.db_conn.commit()
                 self._safe_ack(ch, method.delivery_tag)
                 self.job_completed_successfully()
                 return
@@ -138,9 +128,9 @@ class VerbConsensusWorker(BaseWorker):
             timing['upsert_verb_consensus'] = time.time() - t0
 
             t0 = time.time()
-            self._store_terminal_service_result(
-                image_id,
-                {
+            self._persist_terminal_verb_consensus_result(
+                image_id=image_id,
+                payload={
                     'service': 'verb_consensus',
                     'status': 'success',
                     'verbs': collapsed,
@@ -152,23 +142,10 @@ class VerbConsensusWorker(BaseWorker):
                     },
                 },
                 processing_time=round(time.time() - start_time, 3),
-                commit=False,
-            )
-            timing['store_terminal_result'] = time.time() - t0
-            t0 = time.time()
-            self._record_service_event(
-                image_id=image_id,
-                service='verb_consensus',
-                event_type='completed',
                 source_service=triggering_service,
-                source_stage='verb_consensus_run',
-                data={'services_present': services_present},
-                commit=False,
+                event_data={'services_present': services_present},
             )
-            timing['record_completed_event'] = time.time() - t0
-            t0 = time.time()
-            self.db_conn.commit()
-            timing['commit_writes'] = time.time() - t0
+            timing['persist_completion'] = time.time() - t0
 
             total_duration = time.time() - start_time
             slow_bits = " ".join(
@@ -287,6 +264,54 @@ class VerbConsensusWorker(BaseWorker):
         except Exception as e:
             self.logger.error(
                 f"verb_consensus: upsert failed for image {image_id}: {e}"
+            )
+            raise
+
+    def _persist_terminal_verb_consensus_result(
+        self,
+        image_id: int,
+        payload: dict,
+        processing_time: float,
+        source_service: str,
+        event_data: dict,
+    ):
+        """Persist terminal verb_consensus result and completed event in one DB round trip."""
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                WITH inserted_result AS (
+                    INSERT INTO results (
+                        image_id, service, data, status, worker_id, processing_time
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING 1
+                )
+                INSERT INTO service_events (
+                    image_id, service, event_type, source_service, source_stage, data
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    image_id,
+                    'verb_consensus',
+                    json.dumps(payload),
+                    payload.get('status', 'success') or 'success',
+                    self.worker_id,
+                    processing_time,
+                    image_id,
+                    'verb_consensus',
+                    'completed',
+                    source_service,
+                    'verb_consensus_run',
+                    json.dumps(event_data),
+                ),
+            )
+            self.db_conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.logger.error(
+                f"verb_consensus: failed to persist terminal result for image {image_id}: {e}"
             )
             raise
 

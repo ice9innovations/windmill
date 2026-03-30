@@ -77,6 +77,7 @@ class CaptionSummaryWorker(BaseWorker):
         """Override base process_message — DB fetch + caption-synthesis service call."""
         start_time = time.time()
         previous_autocommit = None
+        timing = {}
 
         try:
             if not self.ensure_database_connection():
@@ -105,14 +106,16 @@ class CaptionSummaryWorker(BaseWorker):
             existing_count = row[0] if row else 0
 
             # Fetch VLM captions — tier-scoped
+            t0 = time.time()
             captions = self._fetch_captions(image_id, tier_vlm_services)
+            timing['fetch_captions'] = time.time() - t0
 
             if len(captions) <= existing_count:
                 previous_autocommit = self.db_conn.autocommit
                 self.db_conn.autocommit = False
-                self._store_terminal_service_result(
-                    image_id,
-                    {
+                self._persist_terminal_result(
+                    image_id=image_id,
+                    payload={
                         'service': 'caption_summary',
                         'status': 'success',
                         'summary_caption': None,
@@ -125,31 +128,22 @@ class CaptionSummaryWorker(BaseWorker):
                         },
                     },
                     processing_time=round(time.time() - start_time, 3),
-                    commit=False,
+                    event_type='completed',
+                    event_data={'reason': 'Already synthesized with current caption count'},
                 )
                 self.logger.info(
                     f"caption_summary: image {image_id} already synthesized with "
                     f"{existing_count} caption(s), still {len(captions)} available — skipping"
                 )
-                self._record_service_event(
-                    image_id=image_id,
-                    service='caption_summary',
-                    event_type='completed',
-                    source_service='noun_consensus',
-                    source_stage='caption_summary_run',
-                    data={'reason': 'Already synthesized with current caption count'},
-                    commit=False,
-                )
-                self.db_conn.commit()
                 self._safe_ack(ch, method.delivery_tag)
                 return
 
             if len(captions) < MIN_CAPTIONS:
                 previous_autocommit = self.db_conn.autocommit
                 self.db_conn.autocommit = False
-                self._store_terminal_service_result(
-                    image_id,
-                    {
+                self._persist_terminal_result(
+                    image_id=image_id,
+                    payload={
                         'service': 'caption_summary',
                         'status': 'success',
                         'summary_caption': None,
@@ -161,31 +155,28 @@ class CaptionSummaryWorker(BaseWorker):
                         },
                     },
                     processing_time=round(time.time() - start_time, 3),
-                    commit=False,
+                    event_type='completed',
+                    event_data={'reason': f'Need at least {MIN_CAPTIONS} captions'},
                 )
                 self.logger.info(
                     f"caption_summary: image {image_id} has {len(captions)} caption(s), "
                     f"need {MIN_CAPTIONS} — skipping"
                 )
-                self._record_service_event(
-                    image_id=image_id,
-                    service='caption_summary',
-                    event_type='completed',
-                    source_service='noun_consensus',
-                    source_stage='caption_summary_run',
-                    data={'reason': f'Need at least {MIN_CAPTIONS} captions'},
-                    commit=False,
-                )
-                self.db_conn.commit()
                 self._safe_ack(ch, method.delivery_tag)
                 return
 
             # Fetch supporting consensus data (both optional — prompt degrades gracefully)
+            t0 = time.time()
             nouns = self._fetch_noun_consensus(image_id)
+            timing['fetch_noun_consensus'] = time.time() - t0
+            t0 = time.time()
             verbs = self._fetch_verb_consensus(image_id)
+            timing['fetch_verb_consensus'] = time.time() - t0
 
             # Call caption-synthesis service
+            t0 = time.time()
             synthesis_result = self._call_synthesis_service(captions, nouns, verbs, image_id)
+            timing['call_synthesis_service'] = time.time() - t0
             if synthesis_result is None:
                 self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Caption synthesis transport failure")
@@ -194,28 +185,18 @@ class CaptionSummaryWorker(BaseWorker):
             if synthesis_result.get('status', 'success') != 'success':
                 previous_autocommit = self.db_conn.autocommit
                 self.db_conn.autocommit = False
-                self._store_terminal_service_result(
-                    image_id,
-                    synthesis_result,
-                    status=synthesis_result.get('status', 'failed') or 'failed',
-                    processing_time=round(time.time() - start_time, 3),
-                    service='caption_summary',
-                    commit=False,
-                )
-                self._record_service_event(
+                self._persist_terminal_result(
                     image_id=image_id,
-                    service='caption_summary',
+                    payload=synthesis_result,
+                    processing_time=round(time.time() - start_time, 3),
+                    status=synthesis_result.get('status', 'failed') or 'failed',
                     event_type='failed',
-                    source_service='noun_consensus',
-                    source_stage='caption_summary_run',
-                    data={
+                    event_data={
                         'error_message': synthesis_result.get('error_message')
                         or synthesis_result.get('error')
                         or synthesis_result.get('message')
                     },
-                    commit=False,
                 )
-                self.db_conn.commit()
                 self._safe_ack(ch, method.delivery_tag)
                 self.job_completed_successfully()
                 self.logger.warning(
@@ -239,24 +220,14 @@ class CaptionSummaryWorker(BaseWorker):
                         'processed_at': datetime.now().isoformat(),
                     },
                 }
-                self._store_terminal_service_result(
-                    image_id,
-                    synthesis_result,
-                    status='failed',
-                    processing_time=round(time.time() - start_time, 3),
-                    service='caption_summary',
-                    commit=False,
-                )
-                self._record_service_event(
+                self._persist_terminal_result(
                     image_id=image_id,
-                    service='caption_summary',
+                    payload=synthesis_result,
+                    processing_time=round(time.time() - start_time, 3),
+                    status='failed',
                     event_type='failed',
-                    source_service='noun_consensus',
-                    source_stage='caption_summary_run',
-                    data={'error_message': 'Caption synthesis returned empty summary'},
-                    commit=False,
+                    event_data={'error_message': 'Caption synthesis returned empty summary'},
                 )
-                self.db_conn.commit()
                 self._safe_ack(ch, method.delivery_tag)
                 self.job_completed_successfully()
                 self.logger.warning(
@@ -267,39 +238,31 @@ class CaptionSummaryWorker(BaseWorker):
             services_present = sorted(captions.keys())
             previous_autocommit = self.db_conn.autocommit
             self.db_conn.autocommit = False
-            self._upsert(image_id, summary, synthesis_model, services_present,
-                         processing_time=round(time.time() - start_time, 3), commit=False)
-            self._store_terminal_service_result(
-                image_id,
-                {
-                    'service': 'caption_summary',
-                    'status': 'success',
-                    'summary_caption': summary,
-                    'model': synthesis_model,
-                    'services_present': services_present,
-                    'metadata': {
-                        'processed_at': datetime.now().isoformat(),
-                    },
-                },
-                processing_time=round(time.time() - start_time, 3),
-                commit=False,
-            )
-            self._record_service_event(
+            t0 = time.time()
+            self._persist_successful_summary_result(
                 image_id=image_id,
-                service='caption_summary',
-                event_type='completed',
-                source_service='noun_consensus',
-                source_stage='caption_summary_run',
-                data={'services_present': services_present},
-                commit=False,
+                summary=summary,
+                model=synthesis_model,
+                services_present=services_present,
+                processing_time=round(time.time() - start_time, 3),
             )
-            self.db_conn.commit()
+            timing['persist_success'] = time.time() - t0
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
 
+            total_duration = time.time() - start_time
+            slow_bits = " ".join(
+                f"{name}={duration:.3f}s"
+                for name, duration in timing.items()
+                if duration >= 0.05
+            )
+            self.logger.info(
+                f"caption_summary timing image={image_id} total={total_duration:.3f}s "
+                f"{slow_bits}".rstrip()
+            )
             self.logger.info(
                 f"caption_summary: image {image_id} — "
-                f"{len(services_present)} VLMs, {round(time.time() - start_time, 3)}s — "
+                f"{len(services_present)} VLMs, {round(total_duration, 3)}s — "
                 f'"{summary[:80]}{"..." if len(summary) > 80 else ""}"'
             )
 
@@ -428,32 +391,130 @@ class CaptionSummaryWorker(BaseWorker):
     # DB write
     # ------------------------------------------------------------------
 
-    def _upsert(self, image_id: int, summary: str, model: str, services_present: list,
-                processing_time: float = None, commit: bool = True):
-        """Insert or update the caption_summary row for this image."""
+    def _persist_terminal_result(
+        self,
+        image_id: int,
+        payload: dict,
+        processing_time: float,
+        event_type: str,
+        event_data: dict,
+        status: str = 'success',
+    ):
+        """Persist terminal result and event in one DB round trip."""
         try:
             cursor = self.db_conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO caption_summary
-                    (image_id, summary_caption, model, services_present, service_count,
-                     processing_time, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
-                ON CONFLICT (image_id) DO UPDATE SET
-                    summary_caption  = EXCLUDED.summary_caption,
-                    model            = EXCLUDED.model,
-                    services_present = EXCLUDED.services_present,
-                    service_count    = EXCLUDED.service_count,
-                    processing_time  = EXCLUDED.processing_time,
-                    updated_at       = NOW()
+                WITH inserted_result AS (
+                    INSERT INTO results (
+                        image_id, service, data, status, worker_id, processing_time
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING 1
+                )
+                INSERT INTO service_events (
+                    image_id, service, event_type, source_service, source_stage, data
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
-                (image_id, summary, model, services_present, len(services_present), processing_time)
+                (
+                    image_id,
+                    'caption_summary',
+                    json.dumps(payload),
+                    status,
+                    self.worker_id,
+                    processing_time,
+                    image_id,
+                    'caption_summary',
+                    event_type,
+                    'noun_consensus',
+                    'caption_summary_run',
+                    json.dumps(event_data),
+                ),
             )
-            if commit:
-                self.db_conn.commit()
+            self.db_conn.commit()
             cursor.close()
         except Exception as e:
-            self.logger.error(f"caption_summary: upsert failed for image {image_id}: {e}")
+            self.logger.error(
+                f"caption_summary: failed to persist terminal result for image {image_id}: {e}"
+            )
+            raise
+
+    def _persist_successful_summary_result(
+        self,
+        image_id: int,
+        summary: str,
+        model: str,
+        services_present: list,
+        processing_time: float,
+    ):
+        """Persist caption_summary row, terminal result, and event in one DB round trip."""
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                WITH upserted_summary AS (
+                    INSERT INTO caption_summary
+                        (image_id, summary_caption, model, services_present, service_count,
+                         processing_time, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (image_id) DO UPDATE SET
+                        summary_caption  = EXCLUDED.summary_caption,
+                        model            = EXCLUDED.model,
+                        services_present = EXCLUDED.services_present,
+                        service_count    = EXCLUDED.service_count,
+                        processing_time  = EXCLUDED.processing_time,
+                        updated_at       = NOW()
+                    RETURNING 1
+                ),
+                inserted_result AS (
+                    INSERT INTO results (
+                        image_id, service, data, status, worker_id, processing_time
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING 1
+                )
+                INSERT INTO service_events (
+                    image_id, service, event_type, source_service, source_stage, data
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    image_id,
+                    summary,
+                    model,
+                    services_present,
+                    len(services_present),
+                    processing_time,
+                    image_id,
+                    'caption_summary',
+                    json.dumps({
+                        'service': 'caption_summary',
+                        'status': 'success',
+                        'summary_caption': summary,
+                        'model': model,
+                        'services_present': services_present,
+                        'metadata': {
+                            'processed_at': datetime.now().isoformat(),
+                        },
+                    }),
+                    'success',
+                    self.worker_id,
+                    processing_time,
+                    image_id,
+                    'caption_summary',
+                    'completed',
+                    'noun_consensus',
+                    'caption_summary_run',
+                    json.dumps({'services_present': services_present}),
+                ),
+            )
+            self.db_conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.logger.error(
+                f"caption_summary: failed to persist successful summary for image {image_id}: {e}"
+            )
             raise
 
 

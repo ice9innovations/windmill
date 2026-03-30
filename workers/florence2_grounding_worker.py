@@ -175,24 +175,12 @@ class Florence2GroundingWorker(BaseWorker):
                 previous_autocommit = self.db_conn.autocommit
                 self.db_conn.autocommit = False
                 t0 = time.time()
-                self._store_result(image_id, result, processing_time, commit=False)
-                stage_timings['store_result'] = time.time() - t0
-                t0 = time.time()
-                self._record_service_event(
+                self._persist_failed_grounding_result(
                     image_id=image_id,
-                    service='florence2_grounding',
-                    event_type='failed',
-                    source_service='noun_consensus',
-                    source_stage='grounding_run',
-                    data={
-                        'error_message': result.get('error') or result.get('message'),
-                    },
-                    commit=False,
+                    result=result,
+                    processing_time=processing_time,
                 )
-                stage_timings['record_failure_event'] = time.time() - t0
-                t0 = time.time()
-                self.db_conn.commit()
-                stage_timings['db_commit'] = time.time() - t0
+                stage_timings['persist_failure'] = time.time() - t0
                 self._safe_ack(ch, method.delivery_tag)
                 self.job_completed_successfully()
                 self.logger.warning(
@@ -225,40 +213,21 @@ class Florence2GroundingWorker(BaseWorker):
 
             previous_autocommit = self.db_conn.autocommit
             self.db_conn.autocommit = False
-            t0 = time.time()
-            self._store_result(image_id, result, processing_time, commit=False)
-            stage_timings['store_result'] = time.time() - t0
-
-            # Mark nouns that were successfully grounded back in noun_consensus.
-            # Must happen before ACK so the grounding_validated backfill is
-            # committed before the NOTIFY fires and the SSE reads results.
             grounded_labels = [
                 p['label'].lower().strip()
                 for p in result.get('predictions', [])
                 if p.get('label')
             ]
-            if grounded_labels:
-                t0 = time.time()
-                self._validate_noun_consensus(image_id, nouns, grounded_labels, commit=False)
-                stage_timings['validate_nouns'] = time.time() - t0
-
             t0 = time.time()
-            self._record_service_event(
+            validated_nouns = self._matching_grounded_nouns(nouns, grounded_labels)
+            self._persist_successful_grounding_result(
                 image_id=image_id,
-                service='florence2_grounding',
-                event_type='completed',
-                source_service='noun_consensus',
-                source_stage='grounding_run',
-                data={
-                    'prediction_count': len(result.get('predictions', [])),
-                    'nouns_queried': nouns,
-                },
-                commit=False,
+                result=result,
+                processing_time=processing_time,
+                validated_nouns=validated_nouns,
+                nouns_queried=nouns,
             )
-            stage_timings['record_completed_event'] = time.time() - t0
-            t0 = time.time()
-            self.db_conn.commit()
-            stage_timings['db_commit'] = time.time() - t0
+            stage_timings['persist_success'] = time.time() - t0
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
 
@@ -391,86 +360,134 @@ class Florence2GroundingWorker(BaseWorker):
             self.logger.error(f"florence2_grounding: REST call failed before terminal response: {e}")
             return None
 
-    def _store_result(self, image_id: int, data: dict, processing_time: float, commit: bool = True):
-        """Insert Florence-2 grounding result into the results table."""
+    def _matching_grounded_nouns(self, queried_nouns: list, grounded_labels: list) -> list:
+        """Return the subset of queried nouns that Florence-2 actually grounded."""
+        grounded_set = set(grounded_labels)
+        validated = [n for n in queried_nouns if n.lower() in grounded_set]
+        if not validated:
+            self.logger.info(
+                f"florence2_grounding: no noun matches found "
+                f"(queried: {queried_nouns}, grounded: {list(grounded_set)})"
+            )
+            return []
+        return validated
+
+    def _persist_failed_grounding_result(self, image_id: int, result: dict, processing_time: float):
+        """Persist failed grounding result and terminal failed event in one DB round trip."""
         try:
             cursor = self.db_conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO results
-                    (image_id, service, data, status, worker_id, processing_time)
+                WITH inserted_result AS (
+                    INSERT INTO results
+                        (image_id, service, data, status, worker_id, processing_time)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING 1
+                )
+                INSERT INTO service_events (
+                    image_id, service, event_type, source_service, source_stage, data
+                )
                 VALUES (%s, %s, %s, %s, %s, %s)
                 """,
                 (
                     image_id,
                     self._get_clean_service_name(),
-                    json.dumps(data),
-                    data.get('status', 'success') or 'success',
+                    json.dumps(result),
+                    result.get('status', 'failed') or 'failed',
                     self.worker_id,
                     processing_time,
+                    image_id,
+                    'florence2_grounding',
+                    'failed',
+                    'noun_consensus',
+                    'grounding_run',
+                    json.dumps({
+                        'error_message': result.get('error') or result.get('message'),
+                    }),
                 ),
             )
-            if commit:
-                self.db_conn.commit()
+            self.db_conn.commit()
             cursor.close()
         except Exception as e:
             self.logger.error(
-                f"florence2_grounding: failed to store result for image {image_id}: {e}"
+                f"florence2_grounding: failed to persist failed result for image {image_id}: {e}"
             )
             raise
 
-    def _validate_noun_consensus(
-        self, image_id: int, queried_nouns: list, grounded_labels: list, commit: bool = True
+    def _persist_successful_grounding_result(
+        self,
+        image_id: int,
+        result: dict,
+        processing_time: float,
+        validated_nouns: list,
+        nouns_queried: list,
     ):
-        """Set grounding_validated=true on noun_consensus nouns that Florence-2 grounded.
-
-        A noun is validated if its canonical form appears (case-insensitive) in
-        the grounded label set returned by Florence-2. Nouns not found are left
-        untagged — no invalidation.
-        """
-        grounded_set = set(grounded_labels)
-
-        # Match each queried noun against grounded labels
-        validated = [n for n in queried_nouns if n.lower() in grounded_set]
-        if not validated:
-            self.logger.info(
-                f"florence2_grounding: no noun matches found for image {image_id} "
-                f"(queried: {queried_nouns}, grounded: {list(grounded_set)})"
-            )
-            return
-
+        """Persist result, noun validation, and completed event in one DB round trip."""
         try:
             cursor = self.db_conn.cursor()
             cursor.execute(
                 """
-                UPDATE noun_consensus
-                SET nouns = (
-                    SELECT jsonb_agg(
-                        CASE
-                            WHEN n->>'canonical' = ANY(%s)
-                            THEN n || '{"grounding_validated": true}'::jsonb
-                            ELSE n
-                        END
-                    )
-                    FROM jsonb_array_elements(nouns) n
+                WITH inserted_result AS (
+                    INSERT INTO results
+                        (image_id, service, data, status, worker_id, processing_time)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING 1
                 ),
-                updated_at = NOW()
-                WHERE image_id = %s
+                updated_nouns AS (
+                    UPDATE noun_consensus
+                    SET nouns = (
+                        SELECT jsonb_agg(
+                            CASE
+                                WHEN cardinality(%s::text[]) > 0
+                                     AND n->>'canonical' = ANY(%s::text[])
+                                THEN n || '{"grounding_validated": true}'::jsonb
+                                ELSE n
+                            END
+                        )
+                        FROM jsonb_array_elements(noun_consensus.nouns) n
+                    ),
+                    updated_at = NOW()
+                    WHERE image_id = %s
+                    RETURNING 1
+                )
+                INSERT INTO service_events (
+                    image_id, service, event_type, source_service, source_stage, data
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
-                (validated, image_id),
+                (
+                    image_id,
+                    self._get_clean_service_name(),
+                    json.dumps(result),
+                    result.get('status', 'success') or 'success',
+                    self.worker_id,
+                    processing_time,
+                    validated_nouns,
+                    validated_nouns,
+                    image_id,
+                    image_id,
+                    'florence2_grounding',
+                    'completed',
+                    'noun_consensus',
+                    'grounding_run',
+                    json.dumps({
+                        'prediction_count': len(result.get('predictions', [])),
+                        'nouns_queried': nouns_queried,
+                    }),
+                ),
             )
-            if commit:
-                self.db_conn.commit()
+            self.db_conn.commit()
             cursor.close()
-            self.logger.info(
-                f"florence2_grounding: validated {len(validated)} nouns "
-                f"for image {image_id}: {validated}"
-            )
+            if validated_nouns:
+                self.logger.info(
+                    f"florence2_grounding: validated {len(validated_nouns)} nouns "
+                    f"for image {image_id}: {validated_nouns}"
+                )
         except Exception as e:
             self.logger.error(
-                f"florence2_grounding: failed to write validation "
-                f"for image {image_id}: {e}"
+                f"florence2_grounding: failed to persist successful result for image {image_id}: {e}"
             )
+            raise
 
 
 if __name__ == '__main__':

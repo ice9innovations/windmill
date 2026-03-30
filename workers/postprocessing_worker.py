@@ -8,25 +8,23 @@ import os
 sys.path.append(os.path.dirname(__file__))
 
 import json
-import base64
-import io
 import time
-import requests
 from datetime import datetime
+
+import requests
+
 from base_worker import BaseWorker
+
 
 class PostProcessingWorker(BaseWorker):
     """Base class for postprocessing workers that handle cropped images"""
-    
+
     def __init__(self, service_name):
         super().__init__(service_name)
-        
-        # Queue name is handled by base_worker via config now
-        # Service URL is built from config
+
         if self.service_host and self.service_port and self.service_endpoint:
             self.service_url = f"http://{self.service_host}:{self.service_port}{self.service_endpoint}"
         else:
-            # For postprocessing services that might not have HTTP endpoints
             self.service_url = None
 
     def _parse_message_body(self, body):
@@ -50,7 +48,7 @@ class PostProcessingWorker(BaseWorker):
         required_keys = ('merged_box_id', 'image_id', 'cluster_id', 'bbox')
         has_crop_payload = 'cropped_image_data' in message or 'crop_ref' in message
         return all(key in message for key in required_keys) and has_crop_payload
-    
+
     def connect_to_database(self):
         """Connect to DB and set autocommit=False for FK-safe transaction handling."""
         if not super().connect_to_database():
@@ -59,13 +57,7 @@ class PostProcessingWorker(BaseWorker):
         return True
 
     def _set_db_autocommit_mode(self, autocommit: bool):
-        """Switch the shared worker connection between primary and postprocessing modes.
-
-        face/pose workers can process both normal primary image messages and cropped
-        postprocessing messages on the same connection. When switching modes, clear
-        any idle transaction first so a prior callback's transaction scope cannot
-        leak into the next one.
-        """
+        """Switch the shared worker connection between primary and postprocessing modes."""
         if not self.db_conn or self.db_conn.closed != 0:
             return
         if self.db_conn.autocommit == autocommit:
@@ -75,11 +67,10 @@ class PostProcessingWorker(BaseWorker):
         except Exception:
             pass
         self.db_conn.autocommit = autocommit
-    
+
     def process_service(self, cropped_image_bytes):
-        """Process the cropped image with the specific service - override in subclasses"""
         raise NotImplementedError("Subclasses must implement process_service")
-    
+
     def save_postprocessing_result(
         self,
         merged_box_id,
@@ -94,7 +85,6 @@ class PostProcessingWorker(BaseWorker):
         try:
             cursor = self.db_conn.cursor()
 
-            # Store cluster_id in data so the API can look up the source bbox
             stored = dict(result_data) if result_data else {}
             if cluster_id:
                 stored['cluster_id'] = cluster_id
@@ -109,22 +99,24 @@ class PostProcessingWorker(BaseWorker):
                     or result_data.get('message')
                 )
 
-            # Insert postprocessing result
             insert_started_at = time.time()
-            cursor.execute("""
+            cursor.execute(
+                """
                 INSERT INTO postprocessing (merged_box_id, image_id, service, data, status, error_message, processing_time)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (
-                merged_box_id,
-                image_id,
-                self._get_clean_service_name(),
-                json.dumps(stored),
-                result_status,
-                error_message,
-                processing_time,
-            ))
+                """,
+                (
+                    merged_box_id,
+                    image_id,
+                    self._get_clean_service_name(),
+                    json.dumps(stored),
+                    result_status,
+                    error_message,
+                    processing_time,
+                ),
+            )
             insert_duration = time.time() - insert_started_at
-            
+
             commit_duration = 0.0
             if commit:
                 commit_started_at = time.time()
@@ -132,23 +124,23 @@ class PostProcessingWorker(BaseWorker):
                 commit_duration = time.time() - commit_started_at
             cursor.close()
             return True, {'insert': insert_duration, 'commit': commit_duration}
-            
+
         except Exception as e:
             error_str = str(e)
             if 'postprocessing_merged_box_id_fkey' in error_str:
-                # FK violation means merged_box was superseded by reharmonization - silently skip
-                self.logger.info(f"Merged_box_id {merged_box_id} no longer exists (superseded by reharmonization) - skipping")
+                self.logger.info(
+                    f"Merged_box_id {merged_box_id} no longer exists (superseded by reharmonization) - skipping"
+                )
                 if self.db_conn:
                     self.db_conn.rollback()
-                return True, {'insert': 0.0, 'commit': 0.0}  # Return success to acknowledge the message
-            else:
-                self.logger.error(f"Error saving postprocessing result: {e}")
-                if self.db_conn:
-                    try:
-                        self.db_conn.rollback()
-                    except Exception:
-                        pass
-                return False, {'insert': 0.0, 'commit': 0.0}
+                return True, {'insert': 0.0, 'commit': 0.0}
+            self.logger.error(f"Error saving postprocessing result: {e}")
+            if self.db_conn:
+                try:
+                    self.db_conn.rollback()
+                except Exception:
+                    pass
+            return False, {'insert': 0.0, 'commit': 0.0}
 
     def _store_terminal_postprocessing_failure(
         self,
@@ -193,31 +185,24 @@ class PostProcessingWorker(BaseWorker):
             commit=True,
         )
         return True
-    
 
     def process_message(self, ch, method, properties, body):
         """Process a postprocessing message - standard pattern for all postprocessing workers"""
         try:
             callback_started_at = time.time()
-            # Ensure DB connection is healthy before doing any work — mirrors base_worker pattern.
-            # Without this, an idle-dropped connection spins in a requeue loop instead of reconnecting.
             db_health_started_at = time.time()
             if not self.ensure_database_connection():
-                self.logger.error(
-                    "Database connection unavailable, rejecting message without requeue."
-                )
+                self.logger.error("Database connection unavailable, rejecting message without requeue.")
                 self._safe_nack(ch, method.delivery_tag, requeue=False)
                 return
             db_health_duration = time.time() - db_health_started_at
 
-            # Parse message
             parse_started_at = time.time()
             message = self._parse_message_body(body)
             parse_duration = time.time() - parse_started_at
             if not self._is_valid_postprocessing_message(message):
                 self.logger.error(
-                    f"Malformed {self.service_name} message, dropping without requeue: "
-                    f"keys={sorted(message.keys())}"
+                    f"Malformed {self.service_name} message, dropping without requeue: keys={sorted(message.keys())}"
                 )
                 self._safe_ack(ch, method.delivery_tag)
                 return
@@ -228,8 +213,7 @@ class PostProcessingWorker(BaseWorker):
             bbox = message['bbox']
             if self._is_dispatch_terminal(image_id, self._get_clean_service_name(), cluster_id=cluster_id):
                 self.logger.warning(
-                    f"{self.service_name}: dispatch already terminal for image {image_id} "
-                    f"cluster={cluster_id}, acking redelivery"
+                    f"{self.service_name}: dispatch already terminal for image {image_id} cluster={cluster_id}, acking redelivery"
                 )
                 self._safe_ack(ch, method.delivery_tag)
                 return True
@@ -259,6 +243,7 @@ class PostProcessingWorker(BaseWorker):
                     return True
                 self._safe_nack(ch, method.delivery_tag, requeue=True)
                 return False
+
             dispatch_enqueued_at = message.get('dispatch_enqueued_at')
             dispatch_received_at = message.get('dispatch_received_at')
             downstream_enqueued_at = message.get('downstream_enqueued_at')
@@ -293,14 +278,10 @@ class PostProcessingWorker(BaseWorker):
 
             self.logger.info(f"Processing {self.service_name} for {cluster_id} (merged_box_id: {merged_box_id})")
 
-            # Process with specific service. Contract:
-            # - dict => terminal service response, must be stored even if empty/no-findings/failed
-            # - None => infrastructure/transport problem, retry
             start_time = time.time()
             result_data = self.process_service(cropped_image_bytes)
             processing_time = round(time.time() - start_time, 3)
 
-            # Save terminal result
             if result_data is not None:
                 save_started_at = time.time()
                 success, save_timings = self.save_postprocessing_result(
@@ -366,25 +347,23 @@ class PostProcessingWorker(BaseWorker):
                     prefix = f"[{trace_id}] " if trace_id else ""
                     self.logger.info(prefix + "processed " + " ".join(timing))
                     return True
-                else:
-                    self._safe_nack(ch, method.delivery_tag, requeue=True)
-                    return False
-            else:
-                self.logger.warning(
-                    f"{self.service_name} produced no terminal response for image {image_id} "
-                    f"cluster={cluster_id}; requeueing"
-                )
                 self._safe_nack(ch, method.delivery_tag, requeue=True)
                 return False
+
+            self.logger.warning(
+                f"{self.service_name} produced no terminal response for image {image_id} cluster={cluster_id}; requeueing"
+            )
+            self._safe_nack(ch, method.delivery_tag, requeue=True)
+            return False
 
         except Exception as e:
             error_str = str(e)
             if 'postprocessing_merged_box_id_fkey' in error_str:
-                # FK violation means merged_box was superseded by reharmonization - silently skip
-                self.logger.info(f"Merged_box_id {merged_box_id} no longer exists (superseded by reharmonization) - skipping")
-                self._safe_ack(ch, method.delivery_tag)  # Acknowledge to remove from queue
+                self.logger.info(
+                    f"Merged_box_id {merged_box_id} no longer exists (superseded by reharmonization) - skipping"
+                )
+                self._safe_ack(ch, method.delivery_tag)
                 return True
-            else:
-                self.logger.error(f"Error processing {self.service_name} message: {e}")
-                self._safe_nack(ch, method.delivery_tag, requeue=True)
-                return False
+            self.logger.error(f"Error processing {self.service_name} message: {e}")
+            self._safe_nack(ch, method.delivery_tag, requeue=True)
+            return False

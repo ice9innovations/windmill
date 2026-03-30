@@ -82,16 +82,31 @@ class NounConsensusWorker(BaseWorker):
             image_transport = self._image_transport_fields(message)
             triggering_service = message.get('service', 'unknown')
             tier = message.get('tier', 'free')
+            submitted_at_epoch = message.get('submitted_at_epoch')
+            consensus_enqueued_at_epoch = message.get('consensus_enqueued_at_epoch')
+            queue_wait = None
+            if consensus_enqueued_at_epoch is not None:
+                try:
+                    queue_wait = max(0.0, time.time() - float(consensus_enqueued_at_epoch))
+                except (TypeError, ValueError):
+                    queue_wait = None
+            submit_age = None
+            if submitted_at_epoch is not None:
+                try:
+                    submit_age = max(0.0, time.time() - float(submitted_at_epoch))
+                except (TypeError, ValueError):
+                    submit_age = None
 
             self.logger.debug(
                 f"noun_consensus: processing image {image_id} "
                 f"(triggered by {triggering_service})"
             )
 
-            # Fetch noun lists, categories, and subject guesses from all VLM results
+            # Fetch noun lists, categories, and subject guesses from all VLM results.
             t0 = time.time()
             service_noun_map, service_category_map, service_subject_map = self._fetch_vlm_nouns(image_id)
             timing['fetch_vlm_nouns'] = time.time() - t0
+            raw_noun_count = sum(len(nouns) for nouns in service_noun_map.values())
 
             # Strip adjective modifiers from non-MWE compound nouns
             # e.g. 'dirt path' -> 'path', 'dirt road' -> 'road'
@@ -104,9 +119,9 @@ class NounConsensusWorker(BaseWorker):
 
             if not service_noun_map:
                 processing_time = round(time.time() - start_time, 3)
-                self._store_terminal_service_result(
-                    image_id,
-                    {
+                self._persist_terminal_noun_consensus_result(
+                    image_id=image_id,
+                    payload={
                         'service': 'noun_consensus',
                         'status': 'success',
                         'nouns': [],
@@ -118,18 +133,11 @@ class NounConsensusWorker(BaseWorker):
                         },
                     },
                     processing_time=processing_time,
+                    source_service=triggering_service,
+                    event_data={'reason': 'No VLM noun data yet'},
                 )
                 self.logger.debug(
                     f"noun_consensus: no VLM noun data yet for image {image_id}, skipping"
-                )
-                self._record_service_event(
-                    image_id=image_id,
-                    service='noun_consensus',
-                    event_type='completed',
-                    source_service=triggering_service,
-                    source_stage='noun_consensus_run',
-                    data={'reason': 'No VLM noun data yet'},
-                    commit=True,
                 )
                 self._safe_ack(ch, method.delivery_tag)
                 self.job_completed_successfully()
@@ -150,7 +158,6 @@ class NounConsensusWorker(BaseWorker):
             category_tally = self._compute_category_tally(collapsed)
             timing['compute_category_tally'] = time.time() - t0
 
-            # Upsert into noun_consensus table
             services_present = sorted(service_noun_map.keys())
             t0 = time.time()
             self._upsert_noun_consensus(
@@ -184,6 +191,7 @@ class NounConsensusWorker(BaseWorker):
                 )
 
             downstream_actions = []
+            grounding_noun_count = 0
 
             # Trigger grounding only once the tier's full VLM set has reported.
             # Progressive partial noun sets are too expensive to ground and were
@@ -206,6 +214,7 @@ class NounConsensusWorker(BaseWorker):
                         n['canonical'] for n in collapsed
                         if n.get('vote_count', 0) >= min_votes
                     ]
+                    grounding_noun_count = len(consensus_nouns)
                     if consensus_nouns:
                         t0 = time.time()
                         should_trigger_grounding = self._should_trigger_florence2_grounding(image_id, consensus_nouns)
@@ -239,6 +248,7 @@ class NounConsensusWorker(BaseWorker):
                                 and sorted_nouns[0].get('confidence', 0)
                                 > sorted_nouns[1].get('confidence', 0)):
                             top = sorted_nouns[0]['canonical']
+                            grounding_noun_count = 1
                             self.logger.info(
                                 f"noun_consensus: no consensus for image {image_id} — "
                                 f"promoting clear leader '{top}' to grounding"
@@ -346,9 +356,9 @@ class NounConsensusWorker(BaseWorker):
             timing['commit_post_fanout_reads'] = time.time() - t0
 
             t0 = time.time()
-            self._store_terminal_service_result(
-                image_id,
-                {
+            self._persist_terminal_noun_consensus_result(
+                image_id=image_id,
+                payload={
                     'service': 'noun_consensus',
                     'status': 'success',
                     'nouns': collapsed,
@@ -360,28 +370,13 @@ class NounConsensusWorker(BaseWorker):
                     },
                 },
                 processing_time=round(time.time() - start_time, 3),
-                commit=False,
-            )
-            timing['store_terminal_result'] = time.time() - t0
-
-            t0 = time.time()
-            self._record_service_event(
-                image_id=image_id,
-                service='noun_consensus',
-                event_type='completed',
                 source_service=triggering_service,
-                source_stage='noun_consensus_run',
-                data={
+                event_data={
                     'services_present': services_present,
                     'downstream_services': [a['service'] for a in downstream_actions if a],
                 },
-                commit=False,
             )
-            timing['record_completed_event'] = time.time() - t0
-
-            t0 = time.time()
-            self.db_conn.commit()
-            timing['commit_completion_writes'] = time.time() - t0
+            timing['persist_completion'] = time.time() - t0
 
             total_duration = time.time() - start_time
             slow_bits = " ".join(
@@ -390,8 +385,21 @@ class NounConsensusWorker(BaseWorker):
                 if duration >= 0.05
             )
             self.logger.info(
-                f"noun_consensus timing image={image_id} total={total_duration:.3f}s "
-                f"{slow_bits}".rstrip()
+                (
+                    f"noun_consensus input image={image_id} "
+                    f"vlms={len(services_present)} "
+                    f"raw_nouns={raw_noun_count} "
+                    f"canonical_nouns={len(collapsed)} "
+                    f"grounding_nouns={grounding_noun_count}"
+                )
+            )
+            self.logger.info(
+                (
+                    f"noun_consensus timing image={image_id} "
+                    f"{f'queue_wait={queue_wait:.3f}s ' if queue_wait is not None else ''}"
+                    f"{f'submit_age={submit_age:.3f}s ' if submit_age is not None else ''}"
+                    f"total={total_duration:.3f}s {slow_bits}"
+                ).rstrip()
             )
 
             self._safe_ack(ch, method.delivery_tag)
@@ -472,34 +480,28 @@ class NounConsensusWorker(BaseWorker):
         }
 
     def _should_trigger_content_analysis(self, image_id: int, services_present: list, tier: str) -> bool:
-        """Return True only when content_analysis needs a new noun-consensus input set."""
+        """Return True unless content_analysis already completed successfully.
+
+        This worker now emits a single downstream fanout from the final noun-consensus
+        pass, so tracking in-flight `enqueued` state per service is no longer part
+        of the hot path.
+        """
         try:
             cursor = self.db_conn.cursor()
             cursor.execute(
                 """
-                SELECT event_type, data
-                FROM service_events
+                SELECT 1
+                FROM results
                 WHERE image_id = %s
                   AND service = 'content_analysis'
-                ORDER BY event_id DESC
+                  AND status = 'success'
                 LIMIT 1
                 """,
                 (image_id,),
             )
-            row = cursor.fetchone()
+            exists = cursor.fetchone() is not None
             cursor.close()
-            if not row:
-                return True
-
-            event_type, data = row
-            if event_type not in ('enqueued', 'completed') or not isinstance(data, dict):
-                return True
-
-            previous = sorted(data.get('services_present') or [])
-            return not (
-                previous == sorted(services_present)
-                and data.get('tier') == tier
-            )
+            return not exists
         except Exception as e:
             self.logger.warning(
                 f"noun_consensus: failed content_analysis dedupe check for image {image_id}: {e}"
@@ -507,7 +509,7 @@ class NounConsensusWorker(BaseWorker):
             return True
 
     def _should_trigger_caption_summary(self, image_id: int, tier: str) -> bool:
-        """Return True only when caption_summary needs a run for this image/tier."""
+        """Return True unless caption_summary already completed successfully."""
         try:
             cursor = self.db_conn.cursor()
             cursor.execute(
@@ -522,31 +524,9 @@ class NounConsensusWorker(BaseWorker):
                 """,
                 (image_id,),
             )
-            if cursor.fetchone():
-                cursor.close()
-                return False
-
-            cursor.execute(
-                """
-                SELECT event_type, data
-                FROM service_events
-                WHERE image_id = %s
-                  AND service = 'caption_summary'
-                ORDER BY event_id DESC
-                LIMIT 1
-                """,
-                (image_id,),
-            )
-            row = cursor.fetchone()
+            exists = cursor.fetchone() is not None
             cursor.close()
-            if not row:
-                return True
-
-            event_type, data = row
-            if event_type != 'enqueued' or not isinstance(data, dict):
-                return True
-
-            return data.get('tier') != tier
+            return not exists
         except Exception as e:
             self.logger.warning(
                 f"noun_consensus: failed caption_summary dedupe check for image {image_id}: {e}"
@@ -610,9 +590,9 @@ class NounConsensusWorker(BaseWorker):
     def _should_trigger_florence2_grounding(self, image_id: int, nouns: list) -> bool:
         """Return True only when Florence-2 needs a new run for this noun set.
 
-        Suppress duplicate enqueue churn when:
-        - the latest stored Florence-2 result already used the same noun set, or
-        - the latest Florence-2 event is an identical unresolved enqueue.
+        The current hot path emits a single final noun-consensus fanout and no
+        longer records downstream `enqueued` service-events, so dedupe is based
+        only on the latest stored Florence-2 result.
         """
         normalized = sorted({n.lower().strip() for n in nouns if n})
         if not normalized:
@@ -643,34 +623,8 @@ class NounConsensusWorker(BaseWorker):
                         return False
                 except Exception:
                     pass
-
-            # If the latest Florence-2 event is an unresolved enqueue for the same
-            # noun set, do not stack another copy behind it. The upstream primary
-            # dedupe now ensures we only have one tail VLM trying to trigger this
-            # path, so scanning the full event history is unnecessary hot-path cost.
-            cursor.execute(
-                """
-                SELECT event_type, data
-                FROM service_events
-                WHERE image_id = %s
-                  AND service = 'florence2_grounding'
-                ORDER BY event_id DESC
-                LIMIT 1
-                """,
-                (image_id,),
-            )
-            row = cursor.fetchone()
             cursor.close()
-            if not row:
-                return True
-
-            event_type, data = row
-            if event_type != 'enqueued' or not isinstance(data, dict):
-                return True
-
-            event_nouns = data.get('nouns') or []
-            event_normalized = sorted({n.lower().strip() for n in event_nouns if n})
-            return event_normalized != normalized
+            return True
         except Exception as e:
             self.logger.warning(
                 f"noun_consensus: failed Florence-2 dedupe check for image {image_id}: {e}"
@@ -724,7 +678,6 @@ class NounConsensusWorker(BaseWorker):
                     service_noun_map[service] = nouns
                     service_category_map[service] = categories
                 service_subject_map[service] = subject
-
         except Exception as e:
             self.logger.error(f"noun_consensus: DB fetch error for image {image_id}: {e}")
 
@@ -873,6 +826,54 @@ class NounConsensusWorker(BaseWorker):
         except Exception as e:
             self.logger.error(
                 f"noun_consensus: upsert failed for image {image_id}: {e}"
+            )
+            raise
+
+    def _persist_terminal_noun_consensus_result(
+        self,
+        image_id: int,
+        payload: dict,
+        processing_time: float,
+        source_service: str,
+        event_data: dict,
+    ):
+        """Persist terminal noun_consensus result and completed event in one DB round trip."""
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                WITH inserted_result AS (
+                    INSERT INTO results (
+                        image_id, service, data, status, worker_id, processing_time
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING 1
+                )
+                INSERT INTO service_events (
+                    image_id, service, event_type, source_service, source_stage, data
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    image_id,
+                    'noun_consensus',
+                    json.dumps(payload),
+                    payload.get('status', 'success') or 'success',
+                    self.worker_id,
+                    processing_time,
+                    image_id,
+                    'noun_consensus',
+                    'completed',
+                    source_service,
+                    'noun_consensus_run',
+                    json.dumps(event_data),
+                ),
+            )
+            self.db_conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.logger.error(
+                f"noun_consensus: failed to persist terminal result for image {image_id}: {e}"
             )
             raise
 

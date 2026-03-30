@@ -711,7 +711,7 @@ class ContentAnalysisWorker(BaseWorker):
             return None
 
     def store_analysis(self, analysis, processing_time=None, commit=True):
-        """Store content analysis in database"""
+        """Store content analysis in database."""
         try:
             cursor = self.db_conn.cursor()
 
@@ -764,9 +764,137 @@ class ContentAnalysisWorker(BaseWorker):
             self.logger.error(traceback.format_exc())
             return False
 
+    def _persist_terminal_result(self, image_id, payload, processing_time, event_type, source_service, event_data, status):
+        """Persist terminal content_analysis result and service event in one DB round trip."""
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                WITH inserted_result AS (
+                    INSERT INTO results (
+                        image_id, service, data, status, worker_id, processing_time
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING 1
+                )
+                INSERT INTO service_events (
+                    image_id, service, event_type, source_service, source_stage, data
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    image_id,
+                    'content_analysis',
+                    json.dumps(payload),
+                    status,
+                    self.worker_id,
+                    processing_time,
+                    image_id,
+                    'content_analysis',
+                    event_type,
+                    source_service,
+                    'content_analysis_run',
+                    json.dumps(event_data),
+                ),
+            )
+            self.db_conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.logger.error(
+                f"content_analysis: failed to persist terminal result for image {image_id}: {e}"
+            )
+            raise
+
+    def _persist_successful_analysis(self, analysis, processing_time, input_fingerprint, source_service, services_present, tier):
+        """Persist canonical analysis row, terminal result, and completed event in one DB round trip."""
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                WITH upserted_analysis AS (
+                    INSERT INTO content_analysis (
+                        image_id, full_analysis, analysis_version, processing_time
+                    ) VALUES (
+                        %s, %s, %s, %s
+                    )
+                    ON CONFLICT (image_id) DO UPDATE SET
+                        full_analysis = EXCLUDED.full_analysis,
+                        analysis_version = EXCLUDED.analysis_version,
+                        processing_time = EXCLUDED.processing_time
+                    RETURNING 1
+                ),
+                inserted_result AS (
+                    INSERT INTO results (
+                        image_id, service, data, status, worker_id, processing_time
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING 1
+                )
+                INSERT INTO service_events (
+                    image_id, service, event_type, source_service, source_stage, data
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    analysis['image_id'],
+                    json.dumps(analysis['full_analysis']),
+                    analysis['analysis_version'],
+                    processing_time,
+                    analysis['image_id'],
+                    'content_analysis',
+                    json.dumps({
+                        'service': 'content_analysis',
+                        'status': 'success',
+                        'full_analysis': analysis['full_analysis'],
+                        'analysis_version': analysis['analysis_version'],
+                        'metadata': {
+                            'input_fingerprint': input_fingerprint,
+                        },
+                    }),
+                    'success',
+                    self.worker_id,
+                    processing_time,
+                    analysis['image_id'],
+                    'content_analysis',
+                    'completed',
+                    source_service,
+                    'content_analysis_run',
+                    json.dumps({
+                        'input_fingerprint': input_fingerprint,
+                        'services_present': services_present,
+                        'tier': tier,
+                    }),
+                ),
+            )
+            self.db_conn.commit()
+            cursor.close()
+
+            full = analysis['full_analysis']
+            scene_type = full['activity_analysis']['scene_type']
+            activities_count = len(full['activity_analysis']['activities'])
+            people_count = full['person_deduplication']['deduplicated_count']
+
+            nsfw2_info = ""
+            nsfw2_corr = full.get('nsfw2_correlation', {})
+            if nsfw2_corr.get('override_scene_type'):
+                nsfw2_info = f", nsfw2_override={nsfw2_corr.get('reasoning', 'unknown')}"
+            elif nsfw2_corr.get('reasoning') == 'nsfw2_low_confidence_disagreement':
+                nsfw2_info = ", nsfw2_disagrees_low_conf"
+
+            self.logger.info(
+                f"Stored content analysis for image {analysis['image_id']}: "
+                f"scene={scene_type}, activities={activities_count}, people={people_count}{nsfw2_info}"
+            )
+        except Exception as e:
+            self.logger.error(
+                f"content_analysis: failed to persist successful analysis for image {analysis['image_id']}: {e}"
+            )
+            raise
+
     def process_message(self, ch, method, properties, body):
         """Process content analysis message"""
         try:
+            timing = {}
             # Ensure database connection is healthy before processing
             if not self.ensure_database_connection():
                 self.logger.error(
@@ -792,15 +920,21 @@ class ContentAnalysisWorker(BaseWorker):
             start_time = time.time()
 
             # Fetch all image data
+            t0 = time.time()
             image_data = self.get_image_data(image_id)
+            timing['get_image_data'] = time.time() - t0
             if not image_data:
                 self.logger.error(f"Failed to fetch image data for {image_id}")
                 self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Failed to fetch image data")
                 return
 
+            t0 = time.time()
             input_fingerprint = self._build_input_fingerprint(image_data)
+            timing['build_input_fingerprint'] = time.time() - t0
+            t0 = time.time()
             previous_fingerprint = self._latest_input_fingerprint(image_id)
+            timing['fetch_previous_fingerprint'] = time.time() - t0
             if input_fingerprint and previous_fingerprint == input_fingerprint:
                 self.logger.info(
                     f"Skipping unchanged content analysis for image {image_id} "
@@ -825,80 +959,55 @@ class ContentAnalysisWorker(BaseWorker):
                 return
 
             # Run content analysis
+            t0 = time.time()
             analysis = self.analyze_content(image_id, image_data)
+            timing['analyze_content'] = time.time() - t0
             if not analysis:
-                self._store_terminal_service_result(
-                    image_id,
-                    {
+                self._persist_terminal_result(
+                    image_id=image_id,
+                    payload={
                         'service': 'content_analysis',
                         'status': 'failed',
                         'full_analysis': None,
                         'error_message': 'Content analysis returned no terminal analysis payload',
                     },
                     processing_time=round(time.time() - start_time, 3),
-                    service='content_analysis',
-                    commit=False,
-                )
-                self._record_service_event(
-                    image_id=image_id,
-                    service='content_analysis',
                     event_type='failed',
                     source_service=message.get('triggered_by'),
-                    source_stage='content_analysis_run',
-                    data={'error_message': 'Content analysis returned no terminal analysis payload'},
-                    commit=False,
+                    event_data={'error_message': 'Content analysis returned no terminal analysis payload'},
+                    status='failed',
                 )
-                self.db_conn.commit()
                 self.logger.error(f"Failed to analyze content for {image_id}")
                 self._safe_ack(ch, method.delivery_tag)
                 self.job_completed_successfully()
                 return
 
             # Store analysis
-            if not self.store_analysis(
-                analysis,
+            t0 = time.time()
+            self._persist_successful_analysis(
+                analysis=analysis,
                 processing_time=round(time.time() - start_time, 3),
-                commit=False,
-            ):
-                self.logger.error(f"Failed to store analysis for {image_id}")
-                self._safe_nack(ch, method.delivery_tag, requeue=True)
-                self.job_failed("Storage failed")
-                return
-
-            self._store_terminal_service_result(
-                image_id,
-                {
-                    'service': 'content_analysis',
-                    'status': 'success',
-                    'full_analysis': analysis['full_analysis'],
-                    'analysis_version': analysis['analysis_version'],
-                    'metadata': {
-                        'input_fingerprint': input_fingerprint,
-                    },
-                },
-                processing_time=round(time.time() - start_time, 3),
-                service='content_analysis',
-                commit=False,
-            )
-            self._record_service_event(
-                image_id=image_id,
-                service='content_analysis',
-                event_type='completed',
+                input_fingerprint=input_fingerprint,
                 source_service=message.get('triggered_by'),
-                source_stage='content_analysis_run',
-                data={
-                    'input_fingerprint': input_fingerprint,
-                    'services_present': services_present,
-                    'tier': tier,
-                },
-                commit=False,
+                services_present=services_present,
+                tier=tier,
             )
-            self.db_conn.commit()
+            timing['persist_success'] = time.time() - t0
 
             # Acknowledge message
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
 
+            total_duration = time.time() - start_time
+            slow_bits = " ".join(
+                f"{name}={duration:.3f}s"
+                for name, duration in timing.items()
+                if duration >= 0.05
+            )
+            self.logger.info(
+                f"content_analysis timing image={image_id} total={total_duration:.3f}s "
+                f"{slow_bits}".rstrip()
+            )
             self.logger.info(f"Successfully completed content analysis for image {image_id}")
 
         except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
