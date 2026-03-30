@@ -47,6 +47,23 @@ class VerbConsensusWorker(BaseWorker):
         warmup_wordnet()         # Load WordNet corpus
         warmup_verb_extractor()  # Load spaCy en_core_web_lg
 
+    def connect_to_database(self):
+        """Connect with autocommit disabled so this worker can batch writes."""
+        try:
+            if self.db_conn:
+                try:
+                    self.db_conn.close()
+                except Exception:
+                    pass
+            self.db_conn = self._new_db_connection(autocommit=False)
+            self.logger.info(f"Connected to PostgreSQL at {self.db_host}")
+            self.consecutive_db_failures = 0
+            self.db_backoff_delay = 1
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to connect to database: {e}")
+            return False
+
     def process_message(self, ch, method, properties, body):
         """Override base process_message - no ML service call, DB-only logic."""
         start_time = time.time()
@@ -88,6 +105,7 @@ class VerbConsensusWorker(BaseWorker):
                         },
                     },
                     processing_time=processing_time,
+                    commit=False,
                 )
                 self.logger.debug(
                     f"verb_consensus: no VLM verb data yet for image {image_id}, skipping"
@@ -99,8 +117,9 @@ class VerbConsensusWorker(BaseWorker):
                     source_service=triggering_service,
                     source_stage='verb_consensus_run',
                     data={'reason': 'No VLM verb data yet'},
-                    commit=True,
+                    commit=False,
                 )
+                self.db_conn.commit()
                 self._safe_ack(ch, method.delivery_tag)
                 self.job_completed_successfully()
                 return
@@ -114,6 +133,7 @@ class VerbConsensusWorker(BaseWorker):
             self._upsert_verb_consensus(
                 image_id, collapsed, service_svo_map, services_present,
                 processing_time=round(time.time() - start_time, 3),
+                commit=False,
             )
             timing['upsert_verb_consensus'] = time.time() - t0
 
@@ -132,6 +152,7 @@ class VerbConsensusWorker(BaseWorker):
                     },
                 },
                 processing_time=round(time.time() - start_time, 3),
+                commit=False,
             )
             timing['store_terminal_result'] = time.time() - t0
             t0 = time.time()
@@ -142,9 +163,12 @@ class VerbConsensusWorker(BaseWorker):
                 source_service=triggering_service,
                 source_stage='verb_consensus_run',
                 data={'services_present': services_present},
-                commit=True,
+                commit=False,
             )
             timing['record_completed_event'] = time.time() - t0
+            t0 = time.time()
+            self.db_conn.commit()
+            timing['commit_writes'] = time.time() - t0
 
             total_duration = time.time() - start_time
             slow_bits = " ".join(
@@ -167,6 +191,10 @@ class VerbConsensusWorker(BaseWorker):
             )
 
         except Exception as e:
+            try:
+                self.db_conn.rollback()
+            except Exception:
+                pass
             self.logger.error(f"verb_consensus: error processing message: {e}")
             self._safe_nack(ch, method.delivery_tag, requeue=True)
             self.job_failed(str(e))
@@ -225,6 +253,7 @@ class VerbConsensusWorker(BaseWorker):
         self, image_id: int, verbs: list,
         service_svo_map: dict, services_present: list,
         processing_time: float,
+        commit: bool = True,
     ):
         """Insert or update the verb_consensus row for this image."""
         try:
@@ -252,7 +281,8 @@ class VerbConsensusWorker(BaseWorker):
                     processing_time,
                 )
             )
-            self.db_conn.commit()
+            if commit:
+                self.db_conn.commit()
             cursor.close()
         except Exception as e:
             self.logger.error(

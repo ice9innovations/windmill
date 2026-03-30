@@ -31,6 +31,7 @@ from core.image_store import (
     get_image,
     get_image_store_config,
     is_valkey_image_store_enabled,
+    ping as ping_image_store,
     put_crop,
 )
 
@@ -221,7 +222,7 @@ class BaseWorker:
         image_ref = message.get('image_ref')
         if image_ref:
             fetch_started_at = time.time()
-            image_bytes = get_image(image_ref, config=self.image_store_config)
+            image_bytes = get_image(image_ref, config=self.image_store_config, log=self.logger)
             fetch_duration = time.time() - fetch_started_at
             if image_bytes is not None:
                 if self.service_name == 'system.florence2_grounding':
@@ -262,7 +263,7 @@ class BaseWorker:
     def resolve_crop_bytes(self, message, required=True):
         crop_ref = message.get('crop_ref')
         if crop_ref:
-            crop_bytes = get_crop(crop_ref, config=self.image_store_config)
+            crop_bytes = get_crop(crop_ref, config=self.image_store_config, log=self.logger)
             if crop_bytes is not None:
                 return crop_bytes
             self.logger.error(
@@ -842,11 +843,15 @@ class BaseWorker:
         if not self.enable_noun_consensus:
             return
         tier = message.get('tier', 'free')
-        ready, current_count, expected_count = self._is_vlm_set_complete_for_tier(image_id, tier)
-        if not ready:
+        is_latest, current_count, expected_count, latest_service = (
+            self._is_latest_vlm_success_for_tier(
+                image_id, tier, self._get_clean_service_name()
+            )
+        )
+        if not is_latest:
             self.logger.debug(
                 f"Skipping noun_consensus trigger for {self.service_name} image {image_id}: "
-                f"VLM set incomplete ({current_count}/{expected_count})"
+                f"latest={latest_service!r} ({current_count}/{expected_count})"
             )
             return
         if not self._should_enqueue_final_consensus_service(image_id, 'noun_consensus'):
@@ -884,11 +889,15 @@ class BaseWorker:
         if not self.enable_verb_consensus:
             return
         tier = message.get('tier', 'free')
-        ready, current_count, expected_count = self._is_vlm_set_complete_for_tier(image_id, tier)
-        if not ready:
+        is_latest, current_count, expected_count, latest_service = (
+            self._is_latest_vlm_success_for_tier(
+                image_id, tier, self._get_clean_service_name()
+            )
+        )
+        if not is_latest:
             self.logger.debug(
                 f"Skipping verb_consensus trigger for {self.service_name} image {image_id}: "
-                f"VLM set incomplete ({current_count}/{expected_count})"
+                f"latest={latest_service!r} ({current_count}/{expected_count})"
             )
             return
         if not self._should_enqueue_final_consensus_service(image_id, 'verb_consensus'):
@@ -957,6 +966,51 @@ class BaseWorker:
                 f"Failed VLM completeness check for image {image_id} tier={tier}: {e}"
             )
             return False, 0, 0
+
+    def _is_latest_vlm_success_for_tier(self, image_id, tier, current_service):
+        """Return whether the current service is the latest successful VLM result.
+
+        This is stricter than mere completeness. It prevents multiple late VLMs
+        from all triggering the same final consensus work after they each observe
+        a complete set.
+        """
+        try:
+            vlm_services = self._tier_vlm_service_names(tier)
+            expected_count = len(vlm_services)
+            if expected_count == 0:
+                return False, 0, 0, None
+
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                WITH scoped AS (
+                    SELECT service, result_id
+                    FROM results
+                    WHERE image_id = %s
+                      AND service = ANY(%s::text[])
+                      AND status = 'success'
+                )
+                SELECT
+                    (SELECT COUNT(DISTINCT service) FROM scoped) AS current_count,
+                    (SELECT service FROM scoped ORDER BY result_id DESC LIMIT 1) AS latest_service
+                """,
+                (image_id, vlm_services),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+
+            current_count = row[0] or 0
+            latest_service = row[1]
+            is_latest = (
+                current_count >= expected_count and
+                latest_service == current_service
+            )
+            return is_latest, current_count, expected_count, latest_service
+        except Exception as e:
+            self.logger.warning(
+                f"Failed latest-VLM check for image {image_id} tier={tier}: {e}"
+            )
+            return False, 0, 0, None
 
     def _should_enqueue_final_consensus_service(self, image_id, service):
         """Return True when noun/verb consensus has not already been enqueued/completed."""
@@ -1540,11 +1594,28 @@ class BaseWorker:
         except Exception as e:
             self.logger.error(f"Failed to connect to queue: {e}")
             return False
+
+    def warm_image_store_connection(self):
+        """Eagerly establish the worker's Valkey/TLS client before first live message."""
+        if not is_valkey_image_store_enabled():
+            return True
+        started_at = time.time()
+        try:
+            ping_image_store(config=self.image_store_config)
+            self.logger.info(
+                f"Connected to image store at {self.image_store_config.host}:{self.image_store_config.port} "
+                f"in {time.time() - started_at:.3f}s"
+            )
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to connect to image store: {e}")
+            return False
     
     def process_message(self, ch, method, properties, body):
         """Process a queue message - common logic for all workers"""
         image_id = None  # initialised here so the failure except blocks can reference it
         try:
+            callback_started_at = time.time()
             # Ensure database connection is healthy before processing
             if not self.ensure_database_connection():
                 self.logger.error(
@@ -1558,9 +1629,31 @@ class BaseWorker:
                 return
 
             # Parse message
+            parse_started_at = time.time()
             message = json.loads(body)
+            parse_duration = time.time() - parse_started_at
             image_id = message['image_id']
             trace_id = message.get('trace_id')
+            submitted_at = message.get('submitted_at')
+            submitted_at_epoch = message.get('submitted_at_epoch')
+            worker_received_at = time.time()
+
+            def _latency_from_iso(value):
+                if not value:
+                    return None
+                try:
+                    return worker_received_at - datetime.fromisoformat(value).timestamp()
+                except Exception:
+                    return None
+
+            upstream_queue_wait = None
+            if submitted_at_epoch is not None:
+                try:
+                    upstream_queue_wait = worker_received_at - float(submitted_at_epoch)
+                except Exception:
+                    upstream_queue_wait = None
+            if upstream_queue_wait is None:
+                upstream_queue_wait = _latency_from_iso(submitted_at)
 
             if self._is_dispatch_terminal(image_id, self._get_clean_service_name(), cluster_id=None):
                 self.logger.warning(
@@ -1575,7 +1668,9 @@ class BaseWorker:
                 self.logger.debug(f"Processing {self.service_name} request for image {image_id}")
 
             # Call ML service
+            fetch_started_at = time.time()
             image_bytes = self.resolve_image_bytes(message)
+            image_fetch_duration = time.time() - fetch_started_at
             if image_bytes is None:
                 failure_reason = "image_ref missing, expired, or otherwise unavailable"
                 self._store_terminal_message_failure(
@@ -1589,7 +1684,9 @@ class BaseWorker:
                 self.job_failed(failure_reason)
                 return
 
+            request_started_at = time.time()
             result = self.post_image_bytes(image_bytes)
+            request_duration = time.time() - request_started_at
             if not isinstance(result, dict):
                 self.logger.error(
                     f"{self.service_name} returned no terminal JSON result for image {image_id}"
@@ -1612,6 +1709,7 @@ class BaseWorker:
                 result.get('metadata') or {}
             ).get('processing_time')
             source_trace_id = trace_id if trace_id else None
+            persist_started_at = time.time()
             cursor = self.db_conn.cursor()
             cursor.execute("""
                 WITH upserted AS (
@@ -1653,6 +1751,7 @@ class BaseWorker:
                 self._get_clean_service_name(),
             ))
             self.db_conn.commit()  # CRITICAL: Commit the transaction!
+            persist_duration = time.time() - persist_started_at
             cursor.close()
 
             if trace_id:
@@ -1668,10 +1767,28 @@ class BaseWorker:
                     f"{self.service_name} returned terminal non-success for image {image_id}: "
                     f"{failed_reason or 'no reason provided'}"
                 )
+                timing = [
+                    f"{self.service_name} image={image_id}",
+                    f"parse={parse_duration:.3f}s",
+                    f"fetch={image_fetch_duration:.3f}s",
+                    f"request={request_duration:.3f}s",
+                    f"persist={persist_duration:.3f}s",
+                    (
+                        f"service_processing_time={processing_time:.3f}s"
+                        if processing_time is not None else
+                        "service_processing_time=None"
+                    ),
+                    f"total={time.time() - callback_started_at:.3f}s",
+                    "status=failed",
+                ]
+                if upstream_queue_wait is not None:
+                    timing.insert(1, f"from_submit={upstream_queue_wait:.3f}s")
+                self.logger.info(" ".join(timing))
                 return
 
             # In-place extrapolation hook: subclasses derive additional data
             # from the same result without a separate queue/worker
+            poststore_started_at = time.time()
             self.after_result_stored(image_id, result, message)
 
             tier = message.get('tier', 'free')
@@ -1691,9 +1808,13 @@ class BaseWorker:
                         f"[{trace_id}] queueing direct postprocessing from {self.service_name} for image {image_id}"
                     )
 
-            vlm_ready, current_vlm_count, expected_vlm_count = self._is_vlm_set_complete_for_tier(image_id, tier)
+            vlm_tail_ready, current_vlm_count, expected_vlm_count, latest_vlm_service = (
+                self._is_latest_vlm_success_for_tier(
+                    image_id, tier, self._get_clean_service_name()
+                )
+            )
 
-            if self.enable_noun_consensus and vlm_ready and self._should_enqueue_final_consensus_service(image_id, 'noun_consensus'):
+            if self.enable_noun_consensus and vlm_tail_ready and self._should_enqueue_final_consensus_service(image_id, 'noun_consensus'):
                 self._record_service_event(
                     image_id=image_id,
                     service='noun_consensus',
@@ -1717,10 +1838,10 @@ class BaseWorker:
             elif self.enable_noun_consensus:
                 self.logger.debug(
                     f"Skipping noun_consensus enqueue for {self.service_name} image {image_id}: "
-                    f"ready={vlm_ready} ({current_vlm_count}/{expected_vlm_count})"
+                    f"latest={latest_vlm_service!r} ({current_vlm_count}/{expected_vlm_count})"
                 )
 
-            if self.enable_verb_consensus and vlm_ready and self._should_enqueue_final_consensus_service(image_id, 'verb_consensus'):
+            if self.enable_verb_consensus and vlm_tail_ready and self._should_enqueue_final_consensus_service(image_id, 'verb_consensus'):
                 self._record_service_event(
                     image_id=image_id,
                     service='verb_consensus',
@@ -1743,12 +1864,14 @@ class BaseWorker:
             elif self.enable_verb_consensus:
                 self.logger.debug(
                     f"Skipping verb_consensus enqueue for {self.service_name} image {image_id}: "
-                    f"ready={vlm_ready} ({current_vlm_count}/{expected_vlm_count})"
+                    f"latest={latest_vlm_service!r} ({current_vlm_count}/{expected_vlm_count})"
                 )
+            poststore_duration = time.time() - poststore_started_at
 
             publish_started_at = time.time()
             for routing_key, body in downstream_messages:
                 self._enqueue_publish(routing_key, body)
+            publish_duration = time.time() - publish_started_at
             if trace_id and downstream_messages:
                 self.logger.info(
                     f"[{trace_id}] queued {len(downstream_messages)} downstream message(s) "
@@ -1758,6 +1881,26 @@ class BaseWorker:
             # Acknowledge message
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
+
+            timing = [
+                f"{self.service_name} image={image_id}",
+                f"parse={parse_duration:.3f}s",
+                f"fetch={image_fetch_duration:.3f}s",
+                f"request={request_duration:.3f}s",
+                f"persist={persist_duration:.3f}s",
+                f"post_store={poststore_duration:.3f}s",
+                f"publish={publish_duration:.3f}s",
+                (
+                    f"service_processing_time={processing_time:.3f}s"
+                    if processing_time is not None else
+                    "service_processing_time=None"
+                ),
+                f"total={time.time() - callback_started_at:.3f}s",
+                "status=success",
+            ]
+            if upstream_queue_wait is not None:
+                timing.insert(1, f"from_submit={upstream_queue_wait:.3f}s")
+            self.logger.info(" ".join(timing))
 
             self.logger.info(f"Successfully processed {self.service_name} request for image {image_id}")
 
@@ -1791,6 +1934,18 @@ class BaseWorker:
                 self.logger.info("Interrupted during startup, exiting")
                 sys.exit(0)
             self.logger.warning(f"Database connection failed at startup, retrying in {startup_delay}s...")
+            time.sleep(startup_delay)
+            startup_delay = min(startup_delay * 2, self.max_db_backoff_delay)
+
+        startup_delay = 5
+        while True:
+            try:
+                if self.warm_image_store_connection():
+                    break
+            except KeyboardInterrupt:
+                self.logger.info("Interrupted during startup, exiting")
+                sys.exit(0)
+            self.logger.warning(f"Image store connection failed at startup, retrying in {startup_delay}s...")
             time.sleep(startup_delay)
             startup_delay = min(startup_delay * 2, self.max_db_backoff_delay)
 

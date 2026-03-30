@@ -49,6 +49,23 @@ class NounConsensusWorker(BaseWorker):
         if self.connect_to_database():
             load_conceptnet(self.db_conn)
 
+    def connect_to_database(self):
+        """Connect with autocommit disabled so this worker can batch writes."""
+        try:
+            if self.db_conn:
+                try:
+                    self.db_conn.close()
+                except Exception:
+                    pass
+            self.db_conn = self._new_db_connection(autocommit=False)
+            self.logger.info(f"Connected to PostgreSQL at {self.db_host}")
+            self.consecutive_db_failures = 0
+            self.db_backoff_delay = 1
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to connect to database: {e}")
+            return False
+
     def process_message(self, ch, method, properties, body):
         """Override base process_message - no ML service call, DB-only logic."""
         start_time = time.time()
@@ -140,37 +157,13 @@ class NounConsensusWorker(BaseWorker):
                 image_id, collapsed, services_present,
                 processing_time=round(time.time() - start_time, 3),
                 category_tally=category_tally,
+                commit=False,
             )
             timing['upsert_noun_consensus'] = time.time() - t0
 
             t0 = time.time()
-            self._store_terminal_service_result(
-                image_id,
-                {
-                    'service': 'noun_consensus',
-                    'status': 'success',
-                    'nouns': collapsed,
-                    'category_tally': category_tally,
-                    'services_present': services_present,
-                    'metadata': {
-                        'processed_at': datetime.now().isoformat(),
-                        'services_present': services_present,
-                    },
-                },
-                processing_time=round(time.time() - start_time, 3),
-            )
-            timing['store_terminal_result'] = time.time() - t0
-            t0 = time.time()
-            self._record_service_event(
-                image_id=image_id,
-                service='noun_consensus',
-                event_type='completed',
-                source_service=triggering_service,
-                source_stage='noun_consensus_run',
-                data={'services_present': services_present},
-                commit=True,
-            )
-            timing['record_completed_event'] = time.time() - t0
+            self.db_conn.commit()
+            timing['commit_consensus_artifact'] = time.time() - t0
 
             self.logger.info(
                 f"noun_consensus: image {image_id} - "
@@ -189,6 +182,8 @@ class NounConsensusWorker(BaseWorker):
                     f"noun_consensus: subject vote for image {image_id}: "
                     f"{dict(subject_votes)} → '{subject_noun}'"
                 )
+
+            downstream_actions = []
 
             # Trigger grounding only once the tier's full VLM set has reported.
             # Progressive partial noun sets are too expensive to ground and were
@@ -213,14 +208,25 @@ class NounConsensusWorker(BaseWorker):
                     ]
                     if consensus_nouns:
                         t0 = time.time()
-                        if self._should_trigger_florence2_grounding(image_id, consensus_nouns):
-                            self._trigger_florence2_grounding(image_id, image_transport, consensus_nouns, subject_noun, tier)
+                        should_trigger_grounding = self._should_trigger_florence2_grounding(image_id, consensus_nouns)
+                        timing['check_florence2_grounding'] = timing.get('check_florence2_grounding', 0.0) + (time.time() - t0)
+                        t0 = time.time()
+                        if should_trigger_grounding:
+                            downstream_actions.append(
+                                self._build_florence2_grounding_action(
+                                    image_id=image_id,
+                                    image_transport=image_transport,
+                                    nouns=consensus_nouns,
+                                    subject_noun=subject_noun,
+                                    tier=tier,
+                                )
+                            )
                         else:
                             self.logger.debug(
                                 f"noun_consensus: skipping duplicate Florence-2 grounding trigger "
                                 f"for image {image_id} with nouns={sorted(consensus_nouns)}"
                             )
-                        timing['trigger_florence2_grounding'] = timing.get('trigger_florence2_grounding', 0.0) + (time.time() - t0)
+                        timing['build_florence2_grounding'] = timing.get('build_florence2_grounding', 0.0) + (time.time() - t0)
                     else:
                         # No consensus reached — promote the top noun if it's a clear
                         # leader (strictly ahead of second place). Fires only when the
@@ -244,16 +250,29 @@ class NounConsensusWorker(BaseWorker):
                                 image_id, collapsed, services_present,
                                 processing_time=round(time.time() - start_time, 3),
                                 category_tally=category_tally,
+                                commit=False,
                             )
+                            self.db_conn.commit()
                             t0 = time.time()
-                            if self._should_trigger_florence2_grounding(image_id, [top]):
-                                self._trigger_florence2_grounding(image_id, image_transport, [top], subject_noun, tier)
+                            should_trigger_grounding = self._should_trigger_florence2_grounding(image_id, [top])
+                            timing['check_florence2_grounding'] = timing.get('check_florence2_grounding', 0.0) + (time.time() - t0)
+                            t0 = time.time()
+                            if should_trigger_grounding:
+                                downstream_actions.append(
+                                    self._build_florence2_grounding_action(
+                                        image_id=image_id,
+                                        image_transport=image_transport,
+                                        nouns=[top],
+                                        subject_noun=subject_noun,
+                                        tier=tier,
+                                    )
+                                )
                             else:
                                 self.logger.debug(
                                     f"noun_consensus: skipping duplicate promoted Florence-2 grounding trigger "
                                     f"for image {image_id} with noun={top}"
                                 )
-                            timing['trigger_florence2_grounding'] = timing.get('trigger_florence2_grounding', 0.0) + (time.time() - t0)
+                            timing['build_florence2_grounding'] = timing.get('build_florence2_grounding', 0.0) + (time.time() - t0)
 
             # Trigger caption_summary only once the tier's full VLM set has
             # reported. Progressive partial caption synthesis is currently
@@ -268,13 +287,21 @@ class NounConsensusWorker(BaseWorker):
                     )
                 else:
                     t0 = time.time()
-                    if self._should_trigger_caption_summary(image_id, tier):
-                        self._maybe_update_caption_summary(image_id, tier)
+                    should_trigger_caption = self._should_trigger_caption_summary(image_id, tier)
+                    timing['check_caption_summary'] = time.time() - t0
+                    t0 = time.time()
+                    if should_trigger_caption:
+                        downstream_actions.append(
+                            self._build_caption_summary_action(
+                                image_id=image_id,
+                                tier=tier,
+                            )
+                        )
                     else:
                         self.logger.debug(
                             f"noun_consensus: skipping duplicate caption_summary trigger for image {image_id}"
                         )
-                    timing['trigger_caption_summary'] = time.time() - t0
+                    timing['build_caption_summary'] = time.time() - t0
 
             # Trigger content_analysis only once the tier's full VLM set has
             # reported. The partial progressive pass was still costing seconds
@@ -288,14 +315,73 @@ class NounConsensusWorker(BaseWorker):
                     )
                 else:
                     t0 = time.time()
-                    if self._should_trigger_content_analysis(image_id, services_present, tier):
-                        self._maybe_update_content_analysis(image_id, services_present, tier)
+                    should_trigger_content = self._should_trigger_content_analysis(image_id, services_present, tier)
+                    timing['check_content_analysis'] = time.time() - t0
+                    t0 = time.time()
+                    if should_trigger_content:
+                        downstream_actions.append(
+                            self._build_content_analysis_action(
+                                image_id=image_id,
+                                services_present=services_present,
+                                tier=tier,
+                            )
+                        )
                     else:
                         self.logger.debug(
                             f"noun_consensus: skipping duplicate content_analysis trigger for image {image_id} "
                             f"with services_present={services_present}"
                         )
-                    timing['trigger_content_analysis'] = time.time() - t0
+                    timing['build_content_analysis'] = time.time() - t0
+
+            publish_timings = self._publish_downstream_actions(downstream_actions)
+            for service_name, duration in publish_timings.items():
+                timing[f'publish_{service_name}'] = duration
+
+            # The dedupe SELECTs above start a transaction on this non-autocommit
+            # connection. Close it before writing the terminal result so
+            # result_created / service_events.created_at reflect the actual
+            # post-fanout completion time rather than the earlier read phase.
+            t0 = time.time()
+            self.db_conn.commit()
+            timing['commit_post_fanout_reads'] = time.time() - t0
+
+            t0 = time.time()
+            self._store_terminal_service_result(
+                image_id,
+                {
+                    'service': 'noun_consensus',
+                    'status': 'success',
+                    'nouns': collapsed,
+                    'category_tally': category_tally,
+                    'services_present': services_present,
+                    'metadata': {
+                        'processed_at': datetime.now().isoformat(),
+                        'services_present': services_present,
+                    },
+                },
+                processing_time=round(time.time() - start_time, 3),
+                commit=False,
+            )
+            timing['store_terminal_result'] = time.time() - t0
+
+            t0 = time.time()
+            self._record_service_event(
+                image_id=image_id,
+                service='noun_consensus',
+                event_type='completed',
+                source_service=triggering_service,
+                source_stage='noun_consensus_run',
+                data={
+                    'services_present': services_present,
+                    'downstream_services': [a['service'] for a in downstream_actions if a],
+                },
+                commit=False,
+            )
+            timing['record_completed_event'] = time.time() - t0
+
+            t0 = time.time()
+            self.db_conn.commit()
+            timing['commit_completion_writes'] = time.time() - t0
 
             total_duration = time.time() - start_time
             slow_bits = " ".join(
@@ -312,6 +398,10 @@ class NounConsensusWorker(BaseWorker):
             self.job_completed_successfully()
 
         except Exception as e:
+            try:
+                self.db_conn.rollback()
+            except Exception:
+                pass
             self.logger.error(f"noun_consensus: error processing message: {e}")
             self._safe_nack(ch, method.delivery_tag, requeue=True)
             self.job_failed(str(e))
@@ -346,66 +436,40 @@ class NounConsensusWorker(BaseWorker):
             and name.split('.', 1)[1] in VLM_SERVICES
         ])
 
-    def _maybe_update_caption_summary(self, image_id: int, tier: str):
-        """Trigger caption_summary synthesis once for the final full-tier noun state."""
-        try:
-            queue_name = self._get_queue_name('system.caption_summary')
-            self._record_service_event(
-                image_id=image_id,
-                service='caption_summary',
-                event_type='enqueued',
-                source_service='noun_consensus',
-                source_stage='caption_summary_trigger',
-                data={
-                    'tier': tier,
-                },
-            )
-            self._enqueue_publish(
-                queue_name,
-                json.dumps({'image_id': image_id, 'tier': tier}),
-            )
-            self.logger.info(
-                f"noun_consensus: triggered caption_summary update for image {image_id}"
-            )
-        except Exception as e:
-            self.logger.error(
-                f"noun_consensus: failed to check/trigger caption_summary for image {image_id}: {e}"
-            )
-            raise
+    def _build_caption_summary_action(self, image_id: int, tier: str) -> dict:
+        """Build the downstream caption_summary trigger action."""
+        return {
+            'image_id': image_id,
+            'service': 'caption_summary',
+            'source_stage': 'caption_summary_trigger',
+            'event_data': {'tier': tier},
+            'queue_name': self._get_queue_name('system.caption_summary'),
+            'message_body': json.dumps({'image_id': image_id, 'tier': tier}),
+            'log_message': f"noun_consensus: triggered caption_summary update for image {image_id}",
+        }
 
-    def _maybe_update_content_analysis(self, image_id: int, services_present: list, tier: str):
-        """Trigger content_analysis when noun-consensus inputs materially advance."""
-        try:
-            normalized_services = sorted(services_present or [])
-            queue_name = self._get_queue_name('system.content_analysis')
-            self._record_service_event(
-                image_id=image_id,
-                service='content_analysis',
-                event_type='enqueued',
-                source_service='noun_consensus',
-                source_stage='content_analysis_trigger',
-                data={
-                    'services_present': normalized_services,
-                    'tier': tier,
-                },
-            )
-            self._enqueue_publish(
-                queue_name,
-                json.dumps({
-                    'image_id': image_id,
-                    'tier': tier,
-                    'services_present': normalized_services,
-                }),
-            )
-            self.logger.info(
+    def _build_content_analysis_action(self, image_id: int, services_present: list, tier: str) -> dict:
+        """Build the downstream content_analysis trigger action."""
+        normalized_services = sorted(services_present or [])
+        return {
+            'image_id': image_id,
+            'service': 'content_analysis',
+            'source_stage': 'content_analysis_trigger',
+            'event_data': {
+                'services_present': normalized_services,
+                'tier': tier,
+            },
+            'queue_name': self._get_queue_name('system.content_analysis'),
+            'message_body': json.dumps({
+                'image_id': image_id,
+                'tier': tier,
+                'services_present': normalized_services,
+            }),
+            'log_message': (
                 f"noun_consensus: triggered content_analysis for image {image_id} "
                 f"with {len(normalized_services)} VLMs: {normalized_services}"
-            )
-        except Exception as e:
-            self.logger.error(
-                f"noun_consensus: failed to check/trigger content_analysis for image {image_id}: {e}"
-            )
-            raise
+            ),
+        }
 
     def _should_trigger_content_analysis(self, image_id: int, services_present: list, tier: str) -> bool:
         """Return True only when content_analysis needs a new noun-consensus input set."""
@@ -489,44 +553,46 @@ class NounConsensusWorker(BaseWorker):
             )
             return True
 
-    def _trigger_florence2_grounding(self, image_id: int, image_transport: dict, nouns: list, subject_noun: str = None, tier: str = 'free'):
-        """Publish a Florence-2 grounding request for the final noun consensus.
-        """
+    def _build_florence2_grounding_action(self, image_id: int, image_transport: dict, nouns: list, subject_noun: str = None, tier: str = 'free') -> dict:
+        """Build the downstream Florence-2 grounding trigger action."""
         if not self.config.is_available_for_tier('primary.florence2', tier):
             self.logger.debug(f"noun_consensus: skipping Florence-2 grounding for tier '{tier}' image {image_id}")
-            return
-        try:
-            queue_name = self._get_queue_by_service_type('grounding')
-            self._record_service_event(
-                image_id=image_id,
-                service='florence2_grounding',
-                event_type='enqueued',
-                source_service='noun_consensus',
-                source_stage='grounding_trigger',
-                data={
-                    'nouns': nouns,
-                    'subject_noun': subject_noun,
-                    'tier': tier,
-                },
-            )
-            self._enqueue_publish(
-                queue_name,
-                json.dumps({
-                    'image_id': image_id,
-                    'nouns': nouns,
-                    'subject_noun': subject_noun,
-                    'triggered_at': datetime.now().isoformat(),
-                    'tier': tier,
-                    **(image_transport or {}),
-                }),
-            )
-            self.logger.info(
+            return None
+        return {
+            'image_id': image_id,
+            'service': 'florence2_grounding',
+            'source_stage': 'grounding_trigger',
+            'event_data': {
+                'nouns': nouns,
+                'subject_noun': subject_noun,
+                'tier': tier,
+            },
+            'queue_name': self._get_queue_by_service_type('grounding'),
+            'message_body': json.dumps({
+                'image_id': image_id,
+                'nouns': nouns,
+                'subject_noun': subject_noun,
+                'triggered_at': datetime.now().isoformat(),
+                'tier': tier,
+                **(image_transport or {}),
+            }),
+            'log_message': (
                 f"noun_consensus: triggered Florence-2 grounding for image {image_id} "
                 f"with {len(nouns)} nouns: {nouns}"
-            )
-        except Exception as e:
-            self.logger.error(f"noun_consensus: failed to trigger Florence-2 grounding for image {image_id}: {e}")
-            raise
+            ),
+        }
+
+    def _publish_downstream_actions(self, actions: list) -> dict:
+        """Publish all downstream queue messages after their enqueued events commit."""
+        timings = {}
+        for action in actions:
+            if not action:
+                continue
+            t0 = time.time()
+            self._enqueue_publish(action['queue_name'], action['message_body'])
+            timings[action['service']] = time.time() - t0
+            self.logger.info(action['log_message'])
+        return timings
 
 
     @contextmanager
@@ -546,7 +612,7 @@ class NounConsensusWorker(BaseWorker):
 
         Suppress duplicate enqueue churn when:
         - the latest stored Florence-2 result already used the same noun set, or
-        - an identical Florence-2 request is already enqueued and has not settled yet.
+        - the latest Florence-2 event is an identical unresolved enqueue.
         """
         normalized = sorted({n.lower().strip() for n in nouns if n})
         if not normalized:
@@ -578,8 +644,10 @@ class NounConsensusWorker(BaseWorker):
                 except Exception:
                     pass
 
-            # If any Florence-2 enqueue for the same noun set exists without a later
-            # terminal event for that same noun set, do not stack more copies behind it.
+            # If the latest Florence-2 event is an unresolved enqueue for the same
+            # noun set, do not stack another copy behind it. The upstream primary
+            # dedupe now ensures we only have one tail VLM trying to trigger this
+            # path, so scanning the full event history is unnecessary hot-path cost.
             cursor.execute(
                 """
                 SELECT event_type, data
@@ -587,27 +655,22 @@ class NounConsensusWorker(BaseWorker):
                 WHERE image_id = %s
                   AND service = 'florence2_grounding'
                 ORDER BY event_id DESC
+                LIMIT 1
                 """,
                 (image_id,),
             )
-            rows = cursor.fetchall()
+            row = cursor.fetchone()
             cursor.close()
-            if not rows:
+            if not row:
                 return True
 
-            seen_terminal_for_same_set = False
-            for event_type, data in rows:
-                if not isinstance(data, dict):
-                    continue
-                event_nouns = data.get('nouns') or []
-                event_normalized = sorted({n.lower().strip() for n in event_nouns if n})
-                if event_normalized != normalized:
-                    continue
-                if event_type == 'enqueued' and not seen_terminal_for_same_set:
-                    return False
-                if event_type in ('completed', 'failed'):
-                    seen_terminal_for_same_set = True
-            return True
+            event_type, data = row
+            if event_type != 'enqueued' or not isinstance(data, dict):
+                return True
+
+            event_nouns = data.get('nouns') or []
+            event_normalized = sorted({n.lower().strip() for n in event_nouns if n})
+            return event_normalized != normalized
         except Exception as e:
             self.logger.warning(
                 f"noun_consensus: failed Florence-2 dedupe check for image {image_id}: {e}"
@@ -743,7 +806,8 @@ class NounConsensusWorker(BaseWorker):
     def _upsert_noun_consensus(
         self, image_id: int, nouns: list,
         services_present: list, processing_time: float,
-        category_tally: list = None
+        category_tally: list = None,
+        commit: bool = True,
     ):
         """Insert or update the noun_consensus row for this image."""
         try:
@@ -757,32 +821,36 @@ class NounConsensusWorker(BaseWorker):
                 ON CONFLICT (image_id) DO UPDATE SET
                     nouns = (
                         -- Preserve sam3_validated and grounding_validated from
-                        -- the existing row. noun_consensus runs once per VLM
-                        -- completion; SAM3 and Florence-2 grounding can validate
-                        -- between the first and last VLM triggers, so later
-                        -- upserts must not clear flags set by those workers.
-                        SELECT jsonb_agg(
-                            new_n
-                            || CASE WHEN EXISTS (
-                                    SELECT 1
-                                    FROM jsonb_array_elements(noun_consensus.nouns) old_n
-                                    WHERE (old_n->>'canonical') = (new_n->>'canonical')
-                                      AND (old_n->>'sam3_validated')::boolean = true
-                                )
-                                THEN '{"sam3_validated": true}'::jsonb
-                                ELSE '{}'::jsonb
-                               END
-                            || CASE WHEN EXISTS (
-                                    SELECT 1
-                                    FROM jsonb_array_elements(noun_consensus.nouns) old_n
-                                    WHERE (old_n->>'canonical') = (new_n->>'canonical')
-                                      AND (old_n->>'grounding_validated')::boolean = true
-                                )
-                                THEN '{"grounding_validated": true}'::jsonb
-                                ELSE '{}'::jsonb
-                               END
+                        -- the existing row. Build the old flag map once, then
+                        -- join it against each new noun instead of rescanning
+                        -- the full old JSON array for every flag on every noun.
+                        WITH old_flags AS (
+                            SELECT
+                                old_n->>'canonical' AS canonical,
+                                bool_or(COALESCE((old_n->>'sam3_validated')::boolean, false)) AS sam3_validated,
+                                bool_or(COALESCE((old_n->>'grounding_validated')::boolean, false)) AS grounding_validated
+                            FROM jsonb_array_elements(noun_consensus.nouns) old_n
+                            GROUP BY 1
+                        )
+                        SELECT COALESCE(
+                            jsonb_agg(
+                                new_n
+                                || CASE
+                                    WHEN COALESCE(old_flags.sam3_validated, false)
+                                    THEN '{"sam3_validated": true}'::jsonb
+                                    ELSE '{}'::jsonb
+                                   END
+                                || CASE
+                                    WHEN COALESCE(old_flags.grounding_validated, false)
+                                    THEN '{"grounding_validated": true}'::jsonb
+                                    ELSE '{}'::jsonb
+                                   END
+                            ),
+                            '[]'::jsonb
                         )
                         FROM jsonb_array_elements(EXCLUDED.nouns) new_n
+                        LEFT JOIN old_flags
+                          ON old_flags.canonical = (new_n->>'canonical')
                     ),
                     category_tally   = EXCLUDED.category_tally,
                     services_present = EXCLUDED.services_present,
@@ -799,7 +867,8 @@ class NounConsensusWorker(BaseWorker):
                     processing_time,
                 )
             )
-            self.db_conn.commit()
+            if commit:
+                self.db_conn.commit()
             cursor.close()
         except Exception as e:
             self.logger.error(

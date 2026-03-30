@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import uuid
+import logging
 from dataclasses import dataclass
 from threading import Lock
 from threading import Thread
@@ -28,6 +29,7 @@ _client = None
 _client_lock = Lock()
 _keepalive_thread = None
 _keepalive_stop = Event()
+logger = logging.getLogger(__name__)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -109,18 +111,18 @@ def is_valkey_image_store_enabled() -> bool:
     return get_image_store_config().enabled
 
 
-def get_client(config: Optional[ImageStoreConfig] = None):
+def _get_client_with_state(config: Optional[ImageStoreConfig] = None):
     global _client, _keepalive_thread
     config = config or get_image_store_config()
     if not config.enabled:
         raise RuntimeError("Valkey image store requested while IMAGE_STORE_MODE is not 'valkey'")
 
     if _client is not None:
-        return _client
+        return _client, False
 
     with _client_lock:
         if _client is not None:
-            return _client
+            return _client, False
         kwargs = {
             "host": config.host,
             "port": config.port,
@@ -145,7 +147,12 @@ def get_client(config: Optional[ImageStoreConfig] = None):
                 name="image_store_keepalive",
             )
             _keepalive_thread.start()
-        return _client
+        return _client, True
+
+
+def get_client(config: Optional[ImageStoreConfig] = None):
+    client, _ = _get_client_with_state(config)
+    return client
 
 
 def _keepalive_loop(interval_seconds: int) -> None:
@@ -190,29 +197,66 @@ def put_crop(crop_bytes: bytes, ttl_s: Optional[int] = None, config: Optional[Im
     return put_bytes(ref, crop_bytes, ttl_s, config=config)
 
 
-def get_bytes(ref: str, refresh_ttl_s: Optional[int] = None, config: Optional[ImageStoreConfig] = None) -> Optional[bytes]:
-    client = get_client(config)
+def get_bytes(
+    ref: str,
+    refresh_ttl_s: Optional[int] = None,
+    config: Optional[ImageStoreConfig] = None,
+    log: Optional[logging.Logger] = None,
+) -> Optional[bytes]:
+    client, client_created = _get_client_with_state(config)
+    op_name = "getex" if refresh_ttl_s else "get"
+    start = time.perf_counter()
+    retried = False
+    retry_reason = None
+    active_logger = log or logger
     try:
         if refresh_ttl_s:
-            return client.getex(ref, ex=refresh_ttl_s)
-        return client.get(ref)
-    except (RedisTimeoutError, RedisConnectionError):
+            payload = client.getex(ref, ex=refresh_ttl_s)
+        else:
+            payload = client.get(ref)
+    except (RedisTimeoutError, RedisConnectionError) as exc:
+        retried = True
+        retry_reason = exc.__class__.__name__
         client.connection_pool.disconnect()
         if refresh_ttl_s:
-            return client.getex(ref, ex=refresh_ttl_s)
-        return client.get(ref)
+            payload = client.getex(ref, ex=refresh_ttl_s)
+        else:
+            payload = client.get(ref)
+    duration = time.perf_counter() - start
+    payload_size = len(payload) if payload is not None else 0
+    active_logger.info(
+        "image_store %s ref=%s duration=%.3fs bytes=%d client=%s retried=%s retry_reason=%s",
+        op_name,
+        ref,
+        duration,
+        payload_size,
+        "created" if client_created else "reused",
+        retried,
+        retry_reason or "-",
+    )
+    return payload
 
 
-def get_image(ref: str, refresh_ttl_s: Optional[int] = None, config: Optional[ImageStoreConfig] = None) -> Optional[bytes]:
+def get_image(
+    ref: str,
+    refresh_ttl_s: Optional[int] = None,
+    config: Optional[ImageStoreConfig] = None,
+    log: Optional[logging.Logger] = None,
+) -> Optional[bytes]:
     config = config or get_image_store_config()
     refresh_ttl_s = refresh_ttl_s or config.image_ttl_seconds
-    return get_bytes(ref, refresh_ttl_s=refresh_ttl_s, config=config)
+    return get_bytes(ref, refresh_ttl_s=refresh_ttl_s, config=config, log=log)
 
 
-def get_crop(ref: str, refresh_ttl_s: Optional[int] = None, config: Optional[ImageStoreConfig] = None) -> Optional[bytes]:
+def get_crop(
+    ref: str,
+    refresh_ttl_s: Optional[int] = None,
+    config: Optional[ImageStoreConfig] = None,
+    log: Optional[logging.Logger] = None,
+) -> Optional[bytes]:
     config = config or get_image_store_config()
     refresh_ttl_s = refresh_ttl_s or config.crop_ttl_seconds
-    return get_bytes(ref, refresh_ttl_s=refresh_ttl_s, config=config)
+    return get_bytes(ref, refresh_ttl_s=refresh_ttl_s, config=config, log=log)
 
 
 def touch(ref: str, ttl_s: int, config: Optional[ImageStoreConfig] = None) -> bool:

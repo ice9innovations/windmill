@@ -710,7 +710,7 @@ class ContentAnalysisWorker(BaseWorker):
             self.logger.error(traceback.format_exc())
             return None
 
-    def store_analysis(self, analysis, processing_time=None):
+    def store_analysis(self, analysis, processing_time=None, commit=True):
         """Store content analysis in database"""
         try:
             cursor = self.db_conn.cursor()
@@ -733,7 +733,8 @@ class ContentAnalysisWorker(BaseWorker):
                 processing_time
             ))
 
-            self.db_conn.commit()
+            if commit:
+                self.db_conn.commit()
             cursor.close()
 
             # Build log message from nested full_analysis structure
@@ -836,6 +837,7 @@ class ContentAnalysisWorker(BaseWorker):
                     },
                     processing_time=round(time.time() - start_time, 3),
                     service='content_analysis',
+                    commit=False,
                 )
                 self._record_service_event(
                     image_id=image_id,
@@ -844,15 +846,20 @@ class ContentAnalysisWorker(BaseWorker):
                     source_service=message.get('triggered_by'),
                     source_stage='content_analysis_run',
                     data={'error_message': 'Content analysis returned no terminal analysis payload'},
-                    commit=True,
+                    commit=False,
                 )
+                self.db_conn.commit()
                 self.logger.error(f"Failed to analyze content for {image_id}")
                 self._safe_ack(ch, method.delivery_tag)
                 self.job_completed_successfully()
                 return
 
             # Store analysis
-            if not self.store_analysis(analysis, processing_time=round(time.time() - start_time, 3)):
+            if not self.store_analysis(
+                analysis,
+                processing_time=round(time.time() - start_time, 3),
+                commit=False,
+            ):
                 self.logger.error(f"Failed to store analysis for {image_id}")
                 self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Storage failed")
@@ -871,6 +878,7 @@ class ContentAnalysisWorker(BaseWorker):
                 },
                 processing_time=round(time.time() - start_time, 3),
                 service='content_analysis',
+                commit=False,
             )
             self._record_service_event(
                 image_id=image_id,
@@ -883,8 +891,9 @@ class ContentAnalysisWorker(BaseWorker):
                     'services_present': services_present,
                     'tier': tier,
                 },
-                commit=True,
+                commit=False,
             )
+            self.db_conn.commit()
 
             # Acknowledge message
             self._safe_ack(ch, method.delivery_tag)
