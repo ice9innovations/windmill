@@ -21,6 +21,8 @@ from PIL import Image
 sys.path.append(os.path.dirname(__file__))
 
 from base_worker import BaseWorker
+from core.postgres_connection import close_quietly, commit_if_needed
+from core.rabbitmq_connection import declare_queue
 from noun_extractor import categorize_nouns
 
 logger = logging.getLogger(__name__)
@@ -48,7 +50,7 @@ class Sam3Worker(BaseWorker):
 
         try:
             if not self.ensure_database_connection():
-                self._safe_nack(ch, method.delivery_tag, requeue=False)
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Database unavailable")
                 return
 
@@ -61,8 +63,14 @@ class Sam3Worker(BaseWorker):
 
             if not image_bytes:
                 self.logger.error(f"sam3: no image bytes in message for image {image_id}")
-                self._safe_nack(ch, method.delivery_tag, requeue=False)
-                self.job_failed("No image bytes")
+                self._ack_terminal_message_failure(
+                    ch,
+                    method.delivery_tag,
+                    image_id=image_id,
+                    reason="image_ref missing, expired, or otherwise unavailable",
+                    service='sam3',
+                    source_stage='image_transport_resolve',
+                )
                 return
 
             if not nouns:
@@ -556,8 +564,8 @@ class Sam3Worker(BaseWorker):
                     processing_time,
                 )
             )
-            self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=True)
+            close_quietly(cursor)
         except Exception as e:
             self.logger.error(f"sam3: upsert failed for image {image_id}: {e}")
             raise
@@ -596,8 +604,8 @@ class Sam3Worker(BaseWorker):
                 """,
                 (validated, image_id)
             )
-            self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=True)
+            close_quietly(cursor)
             self.logger.info(
                 f"sam3: validated {len(validated)} nouns for image {image_id}: {validated}"
             )
@@ -611,12 +619,7 @@ class Sam3Worker(BaseWorker):
         """Publish image_id to the rembg queue for background removal refinement."""
         try:
             queue = self._get_queue_name('system.rembg')
-            dlq = f"{queue}.dlq"
-            self.channel.queue_declare(queue=dlq, durable=True)
-            self.channel.queue_declare(
-                queue=queue, durable=True,
-                arguments={'x-dead-letter-exchange': '', 'x-dead-letter-routing-key': dlq}
-            )
+            declare_queue(self.channel, queue)
             self.channel.basic_publish(
                 exchange='',
                 routing_key=queue,

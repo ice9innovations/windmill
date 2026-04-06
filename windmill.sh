@@ -66,7 +66,7 @@ get_all_workers() {
             basename_file=$(basename "$worker_file" ".py")
             
             # Skip base classes and utilities
-            if [[ "$basename_file" != "base_worker" && "$basename_file" != "postprocessing_worker" && "$basename_file" != "service_config" ]]; then
+            if [[ "$basename_file" != "base_worker" && "$basename_file" != "postprocessing_worker" && "$basename_file" != "db_worker" && "$basename_file" != "service_config" ]]; then
                 echo "$basename_file"
             fi
         fi

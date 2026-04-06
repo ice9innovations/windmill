@@ -22,6 +22,7 @@ import requests
 sys.path.append(os.path.dirname(__file__))
 
 from base_worker import BaseWorker
+from core.postgres_connection import close_quietly, commit_if_needed
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ class RembgWorker(BaseWorker):
 
         try:
             if not self.ensure_database_connection():
-                self._safe_nack(ch, method.delivery_tag, requeue=False)
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Database unavailable")
                 return
 
@@ -54,8 +55,14 @@ class RembgWorker(BaseWorker):
 
             if not image_bytes:
                 self.logger.error(f"rembg: no usable image payload in message for image {image_id}")
-                self._safe_nack(ch, method.delivery_tag, requeue=False)
-                self.job_failed("No image data")
+                self._ack_terminal_message_failure(
+                    ch,
+                    method.delivery_tag,
+                    image_id=image_id,
+                    reason="image_ref missing, expired, or otherwise unavailable",
+                    service='rembg',
+                    source_stage='image_transport_resolve',
+                )
                 return
 
             # Dedup guard — skip if already processed
@@ -166,8 +173,8 @@ class RembgWorker(BaseWorker):
                     processing_time,
                 )
             )
-            self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=True)
+            close_quietly(cursor)
         except Exception as e:
             self.logger.error(f"rembg: upsert failed for image {image_id}: {e}")
             raise

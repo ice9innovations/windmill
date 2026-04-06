@@ -24,6 +24,7 @@ from datetime import datetime
 sys.path.append(os.path.dirname(__file__))
 
 from base_worker import BaseWorker
+from core.postgres_connection import close_quietly, commit_if_needed, rollback_quietly
 from service_config import get_service_config
 from noun_utils import collapse_synonyms, warmup_wordnet, load_conceptnet, load_mwe, apply_mwe_normalization
 from noun_extractor import extract_nouns, categorize_nouns, extract_subject, extract_nouns_and_subject, warmup_noun_extractor
@@ -55,19 +56,13 @@ class NounConsensusWorker(BaseWorker):
     def connect_to_database(self):
         """Connect with autocommit disabled so this worker can batch writes."""
         try:
-            if self.db_conn:
-                try:
-                    self.db_conn.close()
-                except Exception:
-                    pass
-            self.db_conn = self._new_db_connection(autocommit=False)
-            self.logger.info(f"Connected to PostgreSQL at {self.db_host}")
-            self.consecutive_db_failures = 0
-            self.db_backoff_delay = 1
-            return True
+            return self._connect_main_database(autocommit=False)
         except Exception as e:
             self.logger.error(f"Failed to connect to database: {e}")
             return False
+
+    def _declare_additional_queues(self, declare_queue):
+        declare_queue(self._get_queue_by_service_type('postprocessing_orchestrator'))
 
     def process_message(self, ch, method, properties, body):
         """Override base process_message - no ML service call, DB-only logic."""
@@ -76,7 +71,7 @@ class NounConsensusWorker(BaseWorker):
 
         try:
             if not self.ensure_database_connection():
-                self._safe_nack(ch, method.delivery_tag, requeue=False)
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Database unavailable")
                 return
 
@@ -183,7 +178,7 @@ class NounConsensusWorker(BaseWorker):
             timing['upsert_noun_consensus'] = time.time() - t0
 
             t0 = time.time()
-            self.db_conn.commit()
+            commit_if_needed(self.db_conn, force=True)
             timing['commit_consensus_artifact'] = time.time() - t0
 
             t0 = time.time()
@@ -198,7 +193,7 @@ class NounConsensusWorker(BaseWorker):
             timing['upsert_verb_consensus'] = time.time() - t0
 
             t0 = time.time()
-            self.db_conn.commit()
+            commit_if_needed(self.db_conn, force=True)
             timing['commit_verb_consensus_artifact'] = time.time() - t0
 
             self.logger.info(
@@ -283,7 +278,7 @@ class NounConsensusWorker(BaseWorker):
                                 category_tally=category_tally,
                                 commit=False,
                             )
-                            self.db_conn.commit()
+                            commit_if_needed(self.db_conn, force=True)
                             t0 = time.time()
                             should_trigger_grounding = self._should_trigger_florence2_grounding(image_id, [top])
                             timing['check_florence2_grounding'] = timing.get('check_florence2_grounding', 0.0) + (time.time() - t0)
@@ -368,10 +363,7 @@ class NounConsensusWorker(BaseWorker):
             self.job_completed_successfully()
 
         except Exception as e:
-            try:
-                self.db_conn.rollback()
-            except Exception:
-                pass
+            rollback_quietly(self.db_conn)
             self.logger.error(f"noun_consensus: error processing message: {e}")
             self._safe_nack(ch, method.delivery_tag, requeue=True)
             self.job_failed(str(e))
@@ -461,9 +453,8 @@ class NounConsensusWorker(BaseWorker):
                     processing_time,
                 )
             )
-            if commit:
-                self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=commit)
+            close_quietly(cursor)
         except Exception as e:
             self.logger.error(
                 f"noun_consensus: verb_consensus upsert failed for image {image_id}: {e}"
@@ -505,8 +496,8 @@ class NounConsensusWorker(BaseWorker):
                     json.dumps({'services_present': verb_payload.get('services_present') or []}),
                 ),
             )
-            self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=True)
+            close_quietly(cursor)
         except Exception as e:
             self.logger.error(
                 f"noun_consensus: failed to persist combined terminal results for image {image_id}: {e}"
@@ -772,9 +763,8 @@ class NounConsensusWorker(BaseWorker):
                     processing_time,
                 )
             )
-            if commit:
-                self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=commit)
+            close_quietly(cursor)
         except Exception as e:
             self.logger.error(
                 f"noun_consensus: upsert failed for image {image_id}: {e}"
@@ -821,8 +811,8 @@ class NounConsensusWorker(BaseWorker):
                     json.dumps(event_data),
                 ),
             )
-            self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=True)
+            close_quietly(cursor)
         except Exception as e:
             self.logger.error(
                 f"noun_consensus: failed to persist terminal result for image {image_id}: {e}"

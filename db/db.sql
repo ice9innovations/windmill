@@ -285,8 +285,8 @@ CREATE INDEX IF NOT EXISTS idx_rembg_results_image ON rembg_results(image_id);
 -- Service Dispatch table: Unified job lifecycle tracking for all dispatched services.
 -- Primary services written at submission time by api.py.
 -- Secondary services (face/pose/sam3) written at dispatch time by harmony/noun_consensus workers.
--- status: pending → complete | failed | dead-lettered
--- failed_reason: error message (workers) or x-death reason (dlq_worker); NULL on success.
+-- status: pending → complete | failed
+-- failed_reason: error message from the terminal worker path; NULL on success.
 -- Note: sequence and FK constraint names retain 'secondary_dispatch' prefix from original naming.
 CREATE TABLE IF NOT EXISTS service_dispatch (
     dispatch_id    BIGSERIAL PRIMARY KEY,  -- sequence: secondary_dispatch_dispatch_id_seq
@@ -294,8 +294,8 @@ CREATE TABLE IF NOT EXISTS service_dispatch (
     service        TEXT NOT NULL,          -- service short name, e.g. 'blip', 'face', 'sam3'
     cluster_id     TEXT,                   -- bbox cluster_id for face/pose; NULL for image-level
     dispatched_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    status         TEXT NOT NULL DEFAULT 'pending',  -- pending, complete, failed, dead-lettered
-    failed_reason  TEXT                   -- error detail or DLQ death reason; NULL on success
+    status         TEXT NOT NULL DEFAULT 'pending',  -- pending, complete, failed
+    failed_reason  TEXT                   -- error detail or DLQ retry-exhaustion reason; NULL on success
 );
 
 CREATE INDEX IF NOT EXISTS idx_service_dispatch_image ON service_dispatch(image_id);

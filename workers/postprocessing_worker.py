@@ -14,6 +14,7 @@ from datetime import datetime
 import requests
 
 from base_worker import BaseWorker
+from core.postgres_connection import close_quietly, commit_if_needed, rollback_quietly
 
 
 class PostProcessingWorker(BaseWorker):
@@ -62,10 +63,7 @@ class PostProcessingWorker(BaseWorker):
             return
         if self.db_conn.autocommit == autocommit:
             return
-        try:
-            self.db_conn.rollback()
-        except Exception:
-            pass
+        rollback_quietly(self.db_conn)
         self.db_conn.autocommit = autocommit
 
     def process_service(self, cropped_image_bytes):
@@ -118,11 +116,10 @@ class PostProcessingWorker(BaseWorker):
             insert_duration = time.time() - insert_started_at
 
             commit_duration = 0.0
-            if commit:
+            if commit_if_needed(self.db_conn, force=commit):
                 commit_started_at = time.time()
-                self.db_conn.commit()
                 commit_duration = time.time() - commit_started_at
-            cursor.close()
+            close_quietly(cursor)
             return True, {'insert': insert_duration, 'commit': commit_duration}
 
         except Exception as e:
@@ -131,15 +128,10 @@ class PostProcessingWorker(BaseWorker):
                 self.logger.info(
                     f"Merged_box_id {merged_box_id} no longer exists (superseded by reharmonization) - skipping"
                 )
-                if self.db_conn:
-                    self.db_conn.rollback()
+                rollback_quietly(self.db_conn)
                 return True, {'insert': 0.0, 'commit': 0.0}
             self.logger.error(f"Error saving postprocessing result: {e}")
-            if self.db_conn:
-                try:
-                    self.db_conn.rollback()
-                except Exception:
-                    pass
+            rollback_quietly(self.db_conn)
             return False, {'insert': 0.0, 'commit': 0.0}
 
     def _store_terminal_postprocessing_failure(
@@ -192,8 +184,8 @@ class PostProcessingWorker(BaseWorker):
             callback_started_at = time.time()
             db_health_started_at = time.time()
             if not self.ensure_database_connection():
-                self.logger.error("Database connection unavailable, rejecting message without requeue.")
-                self._safe_nack(ch, method.delivery_tag, requeue=False)
+                self.logger.error("Database connection unavailable, requeueing message.")
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
                 return
             db_health_duration = time.time() - db_health_started_at
 

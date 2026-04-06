@@ -173,7 +173,7 @@ def get_channel():
 
 
 def declare_queue(channel, queue_name):
-    """Declare a queue with DLQ, matching worker convention."""
+    """Declare a queue compatible with the existing broker shape."""
     dlq_name = f"{queue_name}.dlq"
     channel.queue_declare(queue=dlq_name, durable=True)
     args = {
@@ -407,8 +407,8 @@ def status(image_id):
         # Aggregate results (consensus, noun_consensus, etc.) live in
         # service_results after the fetch_results reshape — check both locations.
         _sr = results_data.get('service_results', {})
-        _terminal = {'complete', 'failed', 'dead-lettered'}
-        _failed_states = {'failed', 'dead-lettered'}
+        _terminal = {'complete', 'failed'}
+        _failed_states = {'failed'}
         _sd = results_data.get('service_dispatch', [])
         _current_sd = results_data.get('current_service_dispatch', [])
         _current_pp = results_data.get('current_postprocessing_events', [])

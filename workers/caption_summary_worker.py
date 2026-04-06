@@ -32,6 +32,7 @@ from datetime import datetime
 sys.path.append(os.path.dirname(__file__))
 
 from base_worker import BaseWorker
+from core.postgres_connection import close_quietly, commit_if_needed, rollback_quietly
 from service_config import get_service_config
 
 logger = logging.getLogger(__name__)
@@ -81,7 +82,7 @@ class CaptionSummaryWorker(BaseWorker):
 
         try:
             if not self.ensure_database_connection():
-                self._safe_nack(ch, method.delivery_tag, requeue=False)
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Database unavailable")
                 return
 
@@ -268,10 +269,7 @@ class CaptionSummaryWorker(BaseWorker):
 
         except Exception as e:
             if self.db_conn and previous_autocommit is False:
-                try:
-                    self.db_conn.rollback()
-                except Exception:
-                    pass
+                rollback_quietly(self.db_conn)
             self.logger.error(f"caption_summary: error processing message: {e}")
             self._safe_nack(ch, method.delivery_tag, requeue=True)
             self.job_failed(str(e))
@@ -432,8 +430,8 @@ class CaptionSummaryWorker(BaseWorker):
                     json.dumps(event_data),
                 ),
             )
-            self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=True)
+            close_quietly(cursor)
         except Exception as e:
             self.logger.error(
                 f"caption_summary: failed to persist terminal result for image {image_id}: {e}"
@@ -509,8 +507,8 @@ class CaptionSummaryWorker(BaseWorker):
                     json.dumps({'services_present': services_present}),
                 ),
             )
-            self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=True)
+            close_quietly(cursor)
         except Exception as e:
             self.logger.error(
                 f"caption_summary: failed to persist successful summary for image {image_id}: {e}"

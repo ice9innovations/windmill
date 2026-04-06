@@ -16,6 +16,8 @@ import re
 import requests
 from datetime import datetime
 from base_worker import BaseWorker
+from core.postgres_connection import commit_if_needed, rollback_quietly
+from core.rabbitmq_connection import declare_queue
 from PIL import Image
 
 THRESHOLD = .1  # Balanced for 640px images
@@ -85,6 +87,10 @@ class HarmonyWorker(BaseWorker):
         self.logger.info(f"Using bbox harmonization method: {bbox_method}")
         
         # Harmony worker needs separate read connection for queries
+        self.read_db = self._new_managed_db_connection(
+            autocommit=True,
+            label='read database',
+        )
         self.read_db_conn = None
         
     
@@ -94,13 +100,6 @@ class HarmonyWorker(BaseWorker):
     
     def connect_to_database(self):
         """Connect to PostgreSQL database with dual connections"""
-        # Close existing read connection to prevent leaks on reconnect
-        if hasattr(self, 'read_db_conn') and self.read_db_conn:
-            try:
-                self.read_db_conn.close()
-            except Exception:
-                pass
-
         # Call parent to set up main connection
         if not super().connect_to_database():
             return False
@@ -110,7 +109,7 @@ class HarmonyWorker(BaseWorker):
             self.db_conn.autocommit = False
 
             # Create separate read connection for queries
-            self.read_db_conn = self._new_db_connection(autocommit=True)
+            self.read_db_conn = self.read_db.connect()
             
             return True
             
@@ -142,33 +141,20 @@ class HarmonyWorker(BaseWorker):
     def connect_to_queue(self):
         """Connect to RabbitMQ for queue-based processing"""
         try:
-            self.queue_connection = pika.BlockingConnection(self._build_queue_params())
-            self.queue_channel = self.queue_connection.channel()
+            self.queue_connection, self.queue_channel = self._consume_queue.connect()
             
             # Also set BaseWorker's expected connection variables for trigger_consensus()
             self.connection = self.queue_connection
             self.channel = self.queue_channel
-            
-            # Declare queues (create if they don't exist) with DLQ (TTL optional)
-            def declare_with_dlq(channel, queue_name):
-                dlq_name = f"{queue_name}.dlq"
-                channel.queue_declare(queue=dlq_name, durable=True)
-                args = {
-                    'x-dead-letter-exchange': '',
-                    'x-dead-letter-routing-key': dlq_name
-                }
-                ttl_env = os.getenv('QUEUE_MESSAGE_TTL_MS')
-                if ttl_env and ttl_env.isdigit() and int(ttl_env) > 0:
-                    args['x-message-ttl'] = int(ttl_env)
-                channel.queue_declare(queue=queue_name, durable=True, arguments=args)
+            ttl_ms = self._queue_message_ttl_ms()
 
-            declare_with_dlq(self.queue_channel, self.queue_name)
+            declare_queue(self.queue_channel, self.queue_name, ttl_ms=ttl_ms)
             # Removed old downstream queue
             
             face_queue = self._get_queue_name('postprocessing.face')
             pose_queue = self._get_queue_name('postprocessing.pose')
-            declare_with_dlq(self.queue_channel, face_queue)
-            declare_with_dlq(self.queue_channel, pose_queue)
+            declare_queue(self.queue_channel, face_queue, ttl_ms=ttl_ms)
+            declare_queue(self.queue_channel, pose_queue, ttl_ms=ttl_ms)
             self.postprocessing_queues = {
                 'face': face_queue,
                 'pose': pose_queue,
@@ -185,6 +171,10 @@ class HarmonyWorker(BaseWorker):
         except Exception as e:
             self.logger.error(f"Failed to connect to RabbitMQ: {e}")
             return False
+
+    def _declare_additional_queues(self, declare_queue):
+        declare_queue(self._get_queue_name('postprocessing.face'))
+        declare_queue(self._get_queue_name('postprocessing.pose'))
     
     # Removed publish_to_downstream - using new dispatch_bbox_postprocessing instead
     
@@ -1473,7 +1463,7 @@ class HarmonyWorker(BaseWorker):
                 # that silently drops the result.  Commit first to guarantee the
                 # FK target is visible when the workers arrive.
                 commit_started_at = time.time()
-                self.db_conn.commit()
+                commit_if_needed(self.db_conn, force=True)
                 commit_duration = time.time() - commit_started_at
                 if self.current_trace_id:
                     self.logger.info(
@@ -1488,7 +1478,7 @@ class HarmonyWorker(BaseWorker):
                         self.dispatch_bbox_postprocessing(image_id, image_filename, merged_data, image_bytes)
                         # Commit service_dispatch records written during dispatch
                         dispatch_commit_started_at = time.time()
-                        self.db_conn.commit()
+                        commit_if_needed(self.db_conn, force=True)
                         dispatch_commit_duration = time.time() - dispatch_commit_started_at
                         if self.current_trace_id:
                             self.logger.info(
@@ -1500,10 +1490,7 @@ class HarmonyWorker(BaseWorker):
                         self.logger.error(f"Failed to dispatch postprocessing for {image_filename}: {e}")
                         # merged_boxes are already committed; dispatch failed but harmonization succeeded.
                         # Do not return False — the merge is done, dispatch can be retried via reharmonization.
-                        try:
-                            self.db_conn.rollback()
-                        except Exception:
-                            pass
+                        rollback_quietly(self.db_conn)
 
                 if self.current_trace_id:
                     self.logger.info(
@@ -1531,11 +1518,7 @@ class HarmonyWorker(BaseWorker):
                 self.logger.error(f"Error updating merged boxes for image {image_id} (attempt {attempt + 1}/{max_retries}): {e}")
                 
                 # Rollback transaction on error
-                try:
-                    if self.db_conn:
-                        self.db_conn.rollback()
-                except:
-                    pass
+                rollback_quietly(self.db_conn)
                 
                 # If not the last attempt, wait and retry
                 if attempt < max_retries - 1:

@@ -26,6 +26,7 @@ from datetime import datetime
 sys.path.append(os.path.dirname(__file__))
 
 from base_worker import BaseWorker
+from core.postgres_connection import close_quietly, commit_if_needed, rollback_quietly
 from service_config import get_service_config
 from verb_utils import collapse_synonyms, warmup_wordnet
 from verb_extractor import extract_verbs_and_svo, warmup_verb_extractor
@@ -50,16 +51,7 @@ class VerbConsensusWorker(BaseWorker):
     def connect_to_database(self):
         """Connect with autocommit disabled so this worker can batch writes."""
         try:
-            if self.db_conn:
-                try:
-                    self.db_conn.close()
-                except Exception:
-                    pass
-            self.db_conn = self._new_db_connection(autocommit=False)
-            self.logger.info(f"Connected to PostgreSQL at {self.db_host}")
-            self.consecutive_db_failures = 0
-            self.db_backoff_delay = 1
-            return True
+            return self._connect_main_database(autocommit=False)
         except Exception as e:
             self.logger.error(f"Failed to connect to database: {e}")
             return False
@@ -71,7 +63,7 @@ class VerbConsensusWorker(BaseWorker):
 
         try:
             if not self.ensure_database_connection():
-                self._safe_nack(ch, method.delivery_tag, requeue=False)
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Database unavailable")
                 return
 
@@ -168,10 +160,7 @@ class VerbConsensusWorker(BaseWorker):
             )
 
         except Exception as e:
-            try:
-                self.db_conn.rollback()
-            except Exception:
-                pass
+            rollback_quietly(self.db_conn)
             self.logger.error(f"verb_consensus: error processing message: {e}")
             self._safe_nack(ch, method.delivery_tag, requeue=True)
             self.job_failed(str(e))
@@ -203,7 +192,7 @@ class VerbConsensusWorker(BaseWorker):
                 (image_id, VLM_SERVICES)
             )
             rows = cursor.fetchall()
-            cursor.close()
+            close_quietly(cursor)
 
             for service, data in rows:
                 if not isinstance(data, dict):
@@ -258,9 +247,8 @@ class VerbConsensusWorker(BaseWorker):
                     processing_time,
                 )
             )
-            if commit:
-                self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=commit)
+            close_quietly(cursor)
         except Exception as e:
             self.logger.error(
                 f"verb_consensus: upsert failed for image {image_id}: {e}"
@@ -307,8 +295,8 @@ class VerbConsensusWorker(BaseWorker):
                     json.dumps(event_data),
                 ),
             )
-            self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=True)
+            close_quietly(cursor)
         except Exception as e:
             self.logger.error(
                 f"verb_consensus: failed to persist terminal result for image {image_id}: {e}"

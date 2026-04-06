@@ -19,8 +19,6 @@ import requests
 import yaml
 import re
 from PIL import Image
-from collections import deque
-from functools import partial
 from datetime import datetime
 from dotenv import load_dotenv
 from service_config import get_service_config
@@ -34,6 +32,21 @@ from core.image_store import (
     ping as ping_image_store,
     put_crop,
 )
+from core.postgres_connection import (
+    close_quietly,
+    commit_if_needed,
+    ManagedPostgresConnection,
+    PostgresConnectionConfig,
+    rollback_quietly,
+    create_connection,
+)
+from core.rabbitmq_connection import (
+    declare_queue,
+    ManagedRabbitMQAsyncPublisher,
+    ManagedRabbitMQBlockingConnection,
+    RabbitMQConnectionConfig,
+)
+from core.worker_registry import ManagedWorkerRegistry
 
 class BaseWorker:
     """Base class for all ML service workers"""
@@ -42,6 +55,12 @@ class BaseWorker:
         self.service_name = service_name
         self.load_config(env_file)
         self.setup_logging()
+        self._db_connection = ManagedPostgresConnection(
+            self.db_config,
+            autocommit=True,
+            logger=self.logger,
+            label=f"{self.service_name} main database",
+        )
         self.db_conn = None
         self.channel = None
         self.jobs_completed = 0
@@ -55,20 +74,30 @@ class BaseWorker:
 
         # Async publisher state — outbound publishes run on a dedicated RabbitMQ
         # I/O loop instead of blocking the consume thread.
-        self._publish_thread = None
-        self._publish_connection = None
-        self._publish_channel = None
-        self._publish_ready = threading.Event()
-        self._publish_lock = threading.Lock()
-        self._publish_pending = deque()
         self._sync_publish_connection = None
         self._sync_publish_channel = None
         self._running = False
 
-        # Heartbeat thread — keeps worker_registry up to date while running
-        self._heartbeat_thread = None
-        self._heartbeat_stop = threading.Event()
         self._heartbeat_interval = int(os.getenv('WORKER_HEARTBEAT_INTERVAL', '30'))
+        self._consume_queue = self._new_managed_queue_connection(label='consume queue')
+        self._sync_publish_queue = self._new_managed_queue_connection(label='sync publish queue')
+        self._async_publisher = ManagedRabbitMQAsyncPublisher(
+            params_factory=self._build_queue_params,
+            declaration_provider=self._get_publish_declarations,
+            prepare_body=self._augment_publish_body,
+            publish_timing_logger=self._log_publish_timing,
+            logger=self.logger,
+            retry_delay=self.retry_delay,
+            label=f"{self.service_name}_publish",
+        )
+        self._registry = ManagedWorkerRegistry(
+            connection_factory=self._new_db_connection,
+            logger=self.logger,
+            worker_id=self.worker_id,
+            service=self._get_clean_service_name(),
+            heartbeat_interval=self._heartbeat_interval,
+            stale_threshold=self._heartbeat_interval * 3,
+        )
 
         # SIGTERM handler — converts kill signal into KeyboardInterrupt for clean shutdown
         import signal
@@ -98,6 +127,14 @@ class BaseWorker:
         self.queue_ssl = os.getenv('QUEUE_SSL', '').lower() in ('true', '1', 'yes')
         self.queue_user = self._get_required('QUEUE_USER')
         self.queue_password = self._get_required('QUEUE_PASSWORD')
+        self.queue_config = RabbitMQConnectionConfig(
+            host=self.queue_host,
+            port=self.queue_port,
+            user=self.queue_user,
+            password=self.queue_password,
+            use_ssl=self.queue_ssl,
+            server_hostname=self.queue_host,
+        )
 
         # Database configuration
         self.db_host = self._get_required('DB_HOST')
@@ -105,6 +142,13 @@ class BaseWorker:
         self.db_user = self._get_required('DB_USER')
         self.db_password = self._get_required('DB_PASSWORD')
         self.db_sslmode = os.getenv('DB_SSLMODE')
+        self.db_config = PostgresConnectionConfig(
+            host=self.db_host,
+            database=self.db_name,
+            user=self.db_user,
+            password=self.db_password,
+            sslmode=self.db_sslmode,
+        )
         
         # Worker configuration
         self.worker_id = f"worker_{self.service_name}_{int(time.time())}"
@@ -316,7 +360,7 @@ class BaseWorker:
         """Legacy bbox postprocessing fanout is disabled."""
         return []
 
-    def _declare_additional_queues(self, declare_with_dlq):
+    def _declare_additional_queues(self, declare_queue):
         """Override in subclasses to declare additional downstream queues on the publish channel."""
         pass
 
@@ -335,7 +379,6 @@ class BaseWorker:
     
     def _build_queue_params(self, **overrides):
         """Build pika ConnectionParameters with optional TLS support."""
-        credentials = pika.PlainCredentials(self.queue_user, self.queue_password)
         heartbeat = int(os.getenv('QUEUE_HEARTBEAT_SECONDS', '300'))
         blocked_timeout = int(os.getenv('QUEUE_BLOCKED_TIMEOUT_SECONDS', '600'))
         socket_timeout = int(os.getenv('QUEUE_SOCKET_TIMEOUT_SECONDS', '30'))
@@ -353,10 +396,7 @@ class BaseWorker:
                 tcp_options[socket.TCP_KEEPINTVL] = keepintvl
             if hasattr(socket, 'TCP_KEEPCNT'):
                 tcp_options[socket.TCP_KEEPCNT] = keepcnt
-        kwargs = dict(
-            host=self.queue_host,
-            port=self.queue_port,
-            credentials=credentials,
+        return self.queue_config.build_params(
             # BlockingConnection heartbeats are serviced by the adapter loop.
             # Many workers spend long stretches inside message callbacks, so a
             # 60s heartbeat is too aggressive and causes gratuitous reconnects.
@@ -366,15 +406,11 @@ class BaseWorker:
             retry_delay=retry_delay,
             socket_timeout=socket_timeout,
             tcp_options=tcp_options or None,
+            **overrides,
         )
-        if self.queue_ssl:
-            ssl_context = ssl.create_default_context()
-            kwargs['ssl_options'] = pika.SSLOptions(ssl_context, self.queue_host)
-        kwargs.update(overrides)
-        return pika.ConnectionParameters(**kwargs)
 
     def _get_publish_declarations(self):
-        """Return downstream queues this worker may publish to, including DLQs."""
+        """Return downstream queues this worker may publish to."""
         declarations = []
 
         def add_queue(queue_name):
@@ -382,7 +418,7 @@ class BaseWorker:
             declarations.append((dlq_name, None))
             args = {
                 'x-dead-letter-exchange': '',
-                'x-dead-letter-routing-key': dlq_name
+                'x-dead-letter-routing-key': dlq_name,
             }
             ttl_env = os.getenv('QUEUE_MESSAGE_TTL_MS')
             if ttl_env and ttl_env.isdigit() and int(ttl_env) > 0:
@@ -393,38 +429,42 @@ class BaseWorker:
             add_queue(self._get_queue_by_service_type('noun_consensus'))
         if self.enable_verb_consensus:
             add_queue(self._get_queue_by_service_type('verb_consensus'))
-        self._declare_additional_queues(lambda _channel, queue_name: add_queue(queue_name))
+        if self.config.is_available_for_tier('system.postprocessing_orchestrator', 'free') \
+                or self.config.is_available_for_tier('system.postprocessing_orchestrator', 'paid') \
+                or self.config.is_available_for_tier('system.postprocessing_orchestrator', 'pro'):
+            add_queue(self._get_queue_by_service_type('postprocessing_orchestrator'))
+        self._declare_additional_queues(add_queue)
         return declarations
+
+    def _queue_message_ttl_ms(self):
+        ttl_env = os.getenv('QUEUE_MESSAGE_TTL_MS')
+        if ttl_env and ttl_env.isdigit():
+            ttl_ms = int(ttl_env)
+            if ttl_ms > 0:
+                return ttl_ms
+        return None
+
+    def _new_managed_queue_connection(self, label='RabbitMQ queue'):
+        return ManagedRabbitMQBlockingConnection(
+            params_factory=self._build_queue_params,
+            logger=self.logger,
+            label=f"{self.service_name} {label}",
+        )
 
     def _connect_sync_publish_channel(self):
         """Create a dedicated publish-confirm channel owned by the consume thread."""
-        if self._sync_publish_connection:
-            try:
-                self._sync_publish_connection.close()
-            except Exception:
-                pass
-
-        self._sync_publish_connection = pika.BlockingConnection(self._build_queue_params())
-        self._sync_publish_channel = self._sync_publish_connection.channel()
+        self._sync_publish_connection, self._sync_publish_channel = self._sync_publish_queue.connect()
         self._sync_publish_channel.confirm_delivery()
+        ttl_ms = self._queue_message_ttl_ms()
 
-        def declare_with_dlq(channel, queue_name):
-            dlq_name = f"{queue_name}.dlq"
-            channel.queue_declare(queue=dlq_name, durable=True)
-            args = {
-                'x-dead-letter-exchange': '',
-                'x-dead-letter-routing-key': dlq_name
-            }
-            ttl_env = os.getenv('QUEUE_MESSAGE_TTL_MS')
-            if ttl_env and ttl_env.isdigit() and int(ttl_env) > 0:
-                args['x-message-ttl'] = int(ttl_env)
-            channel.queue_declare(queue=queue_name, durable=True, arguments=args)
+        def declare_shared_queue(channel, queue_name):
+            declare_queue(channel, queue_name, ttl_ms=ttl_ms)
 
         if self.enable_noun_consensus:
-            declare_with_dlq(self._sync_publish_channel, self._get_queue_by_service_type('noun_consensus'))
+            declare_shared_queue(self._sync_publish_channel, self._get_queue_by_service_type('noun_consensus'))
         if self.enable_verb_consensus:
-            declare_with_dlq(self._sync_publish_channel, self._get_queue_by_service_type('verb_consensus'))
-        self._declare_additional_queues(declare_with_dlq)
+            declare_shared_queue(self._sync_publish_channel, self._get_queue_by_service_type('verb_consensus'))
+        self._declare_additional_queues(declare_shared_queue)
 
     def _publish_messages_sync_confirm(self, messages):
         """Publish required downstream messages synchronously with broker confirms.
@@ -464,124 +504,9 @@ class BaseWorker:
                 if published is False:
                     raise RuntimeError(f"Broker did not confirm publish to {routing_key} after reconnect")
 
-    def _start_async_publisher(self):
-        """Publisher thread target using RabbitMQ's async I/O loop."""
-        while self._running:
-            try:
-                self._publish_ready.clear()
-                self._publish_connection = pika.SelectConnection(
-                    self._build_queue_params(),
-                    on_open_callback=self._on_publish_connection_open,
-                    on_open_error_callback=self._on_publish_connection_open_error,
-                    on_close_callback=self._on_publish_connection_closed,
-                )
-                self._publish_connection.ioloop.start()
-            except Exception as e:
-                if self._running:
-                    self.logger.error(f"Async publish loop failed: {e}")
-            finally:
-                self._publish_ready.clear()
-                self._publish_channel = None
-                self._publish_connection = None
-
-            if self._running:
-                time.sleep(self.retry_delay)
-
-        self.logger.info("Async publish thread stopped")
-
-    def _on_publish_connection_open(self, connection):
-        connection.channel(on_open_callback=self._on_publish_channel_open)
-
-    def _on_publish_connection_open_error(self, connection, error):
-        self.logger.warning(f"Async publish connection open failed: {error}")
-        connection.ioloop.stop()
-
-    def _on_publish_connection_closed(self, connection, reason):
-        self._publish_ready.clear()
-        self._publish_channel = None
-        if self._running:
-            self.logger.warning(f"Async publish connection closed: {reason}")
-        connection.ioloop.stop()
-
-    def _on_publish_channel_open(self, channel):
-        self._publish_channel = channel
-        declarations = self._get_publish_declarations()
-        self._declare_publish_queue_at_index(declarations, 0)
-
-    def _declare_publish_queue_at_index(self, declarations, index):
-        if self._publish_channel is None:
-            return
-        if index >= len(declarations):
-            self._publish_ready.set()
-            self.logger.info("Async publisher connected to RabbitMQ")
-            self._flush_pending_async_publishes()
-            return
-
-        queue_name, arguments = declarations[index]
-        self._publish_channel.queue_declare(
-            queue=queue_name,
-            durable=True,
-            arguments=arguments,
-            callback=lambda _frame: self._declare_publish_queue_at_index(declarations, index + 1),
-        )
-
-    def _flush_pending_async_publishes(self):
-        while True:
-            with self._publish_lock:
-                if not self._publish_pending:
-                    return
-                routing_key, body, local_enqueued_at = self._publish_pending.popleft()
-            self._async_publish_message(routing_key, body, local_enqueued_at)
-
     def _enqueue_publish(self, routing_key, body):
         """Publish through the async RabbitMQ connection without blocking the worker."""
-        body = self._augment_publish_body(
-            body,
-            _publisher_enqueued_at=self._now_iso(),
-        )
-        local_enqueued_at = time.monotonic()
-
-        if (
-            self._publish_connection is not None
-            and self._publish_channel is not None
-            and self._publish_ready.is_set()
-        ):
-            try:
-                self._publish_connection.ioloop.add_callback_threadsafe(
-                    partial(self._async_publish_message, routing_key, body, local_enqueued_at)
-                )
-                return
-            except Exception as e:
-                self.logger.warning(f"Async publish handoff failed, buffering locally: {e}")
-
-        with self._publish_lock:
-            self._publish_pending.append((routing_key, body, local_enqueued_at))
-
-    def _async_publish_message(self, routing_key, body, local_enqueued_at):
-        if self._publish_channel is None or self._publish_channel.is_closed:
-            with self._publish_lock:
-                self._publish_pending.appendleft((routing_key, body, local_enqueued_at))
-            return
-
-        local_queue_wait = time.monotonic() - local_enqueued_at
-        body = self._augment_publish_body(
-            body,
-            _publisher_started_at=self._now_iso(),
-        )
-        publish_started_at = time.time()
-        self._publish_channel.basic_publish(
-            exchange='',
-            routing_key=routing_key,
-            body=body,
-            properties=pika.BasicProperties(delivery_mode=2),
-        )
-        publish_duration = time.time() - publish_started_at
-        self._log_publish_timing(
-            routing_key,
-            body,
-            local_queue_wait,
-            publish_duration,
-        )
+        self._async_publisher.publish(routing_key, body)
 
     def _augment_publish_body(self, body, **fields):
         """Add publish-trace metadata to JSON object bodies.
@@ -695,7 +620,7 @@ class BaseWorker:
                 )
             row = cursor.fetchone()
             cursor.close()
-            return bool(row and row[0] in ('complete', 'failed', 'dead_lettered'))
+            return bool(row and row[0] in ('complete', 'failed', 'dead-lettered', 'dead_lettered'))
         except Exception as e:
             self.logger.warning(
                 f"Failed terminal-dispatch check for {service}/{image_id}/{cluster_id}: {e}"
@@ -748,6 +673,29 @@ class BaseWorker:
             data={'error_message': reason},
             commit=True,
         )
+
+    def _ack_terminal_message_failure(
+        self,
+        ch,
+        delivery_tag,
+        *,
+        image_id,
+        reason,
+        trace_id=None,
+        service=None,
+        cluster_id=None,
+        source_stage='message_validation',
+    ):
+        self._store_terminal_message_failure(
+            image_id=image_id,
+            reason=reason,
+            trace_id=trace_id,
+            service=service,
+            cluster_id=cluster_id,
+            source_stage=source_stage,
+        )
+        self._safe_ack(ch, delivery_tag)
+        self.job_failed(reason)
 
     def job_completed_successfully(self):
         """Call this after successfully completing a job"""
@@ -1168,12 +1116,11 @@ class BaseWorker:
                     )
             execute_duration = time.time() - execute_started_at
             close_started_at = time.time()
-            cursor.close()
+            close_quietly(cursor)
             close_duration = time.time() - close_started_at
             commit_duration = 0.0
-            if not self.db_conn.autocommit:
+            if commit_if_needed(self.db_conn):
                 commit_started_at = time.time()
-                self.db_conn.commit()
                 commit_duration = time.time() - commit_started_at
             if getattr(self, "service_name", None) == "system.harmony":
                 self.logger.info(
@@ -1189,11 +1136,7 @@ class BaseWorker:
             self.logger.warning(
                 f"Failed to update service_dispatch for {service}/{image_id}: {e}"
             )
-            if not self.db_conn.autocommit:
-                try:
-                    self.db_conn.rollback()
-                except Exception:
-                    pass
+            rollback_quietly(self.db_conn)
 
     def _record_postprocessing_event(
         self,
@@ -1235,20 +1178,16 @@ class BaseWorker:
             )
             insert_duration = time.time() - insert_started_at
             commit_duration = 0.0
-            if getattr(self.db_conn, "autocommit", False) or commit:
+            if commit_if_needed(self.db_conn, force=commit):
                 commit_started_at = time.time()
-                self.db_conn.commit()
                 commit_duration = time.time() - commit_started_at
-            cursor.close()
+            close_quietly(cursor)
             return {'insert': insert_duration, 'commit': commit_duration}
         except Exception as e:
             self.logger.warning(
                 f"Failed to record postprocessing_event for {service}/{image_id}/{cluster_id}: {e}"
             )
-            try:
-                self.db_conn.rollback()
-            except Exception:
-                pass
+            rollback_quietly(self.db_conn)
             return {'insert': 0.0, 'commit': 0.0}
 
     def _record_service_event(
@@ -1283,20 +1222,16 @@ class BaseWorker:
             )
             insert_duration = time.time() - insert_started_at
             commit_duration = 0.0
-            if getattr(self.db_conn, "autocommit", False) or commit:
+            if commit_if_needed(self.db_conn, force=commit):
                 commit_started_at = time.time()
-                self.db_conn.commit()
                 commit_duration = time.time() - commit_started_at
-            cursor.close()
+            close_quietly(cursor)
             return {'insert': insert_duration, 'commit': commit_duration}
         except Exception as e:
             self.logger.warning(
                 f"Failed to record service_event for {service}/{image_id}: {e}"
             )
-            try:
-                self.db_conn.rollback()
-            except Exception:
-                pass
+            rollback_quietly(self.db_conn)
             return {'insert': 0.0, 'commit': 0.0}
 
     def _record_service_events_batch(self, events, commit=False):
@@ -1329,18 +1264,14 @@ class BaseWorker:
             )
             insert_duration = time.time() - insert_started_at
             commit_duration = 0.0
-            if getattr(self.db_conn, "autocommit", False) or commit:
+            if commit_if_needed(self.db_conn, force=commit):
                 commit_started_at = time.time()
-                self.db_conn.commit()
                 commit_duration = time.time() - commit_started_at
-            cursor.close()
+            close_quietly(cursor)
             return {'insert': insert_duration, 'commit': commit_duration}
         except Exception as e:
             self.logger.warning(f"Failed to record batched service_events: {e}")
-            try:
-                self.db_conn.rollback()
-            except Exception:
-                pass
+            rollback_quietly(self.db_conn)
             return {'insert': 0.0, 'commit': 0.0}
 
     def _store_terminal_service_result(
@@ -1380,134 +1311,31 @@ class BaseWorker:
                     processing_time,
                 ),
             )
-            if commit:
-                self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=commit)
+            close_quietly(cursor)
             return True
         except Exception as e:
             self.logger.error(
                 f"Failed to store terminal result for {service}/{image_id}: {e}"
             )
-            try:
-                self.db_conn.rollback()
-            except Exception:
-                pass
+            rollback_quietly(self.db_conn)
             return False
 
     def _handle_sigterm(self, signum, frame):
         """Convert SIGTERM to KeyboardInterrupt so workers can clean up on windmill.sh stop."""
         raise KeyboardInterrupt("SIGTERM received")
 
-    def _register_worker(self):
-        """Register this worker in worker_registry. Called once on startup.
-
-        - Marks any existing online row for this (service, host) as offline at its last_heartbeat
-          (best approximation of when it died for unclean exits)
-        - Sweeps any globally stale online rows (last_heartbeat older than 3x heartbeat interval)
-        - Opportunistically deletes offline rows older than WORKER_REGISTRY_RETENTION_DAYS
-        - Inserts a fresh online row for this worker
-        """
-        service = self._get_clean_service_name()
-        host = socket.gethostname()
-        stale_threshold = self._heartbeat_interval * 3
+    def _start_registry(self):
+        """Register and start heartbeat thread. Call after DB connection established."""
         try:
-            cursor = self.db_conn.cursor()
-
-            # Mark previous row for this (service, host) offline at its last known heartbeat
-            cursor.execute("""
-                UPDATE worker_registry
-                SET status = 'offline', offline_at = last_heartbeat
-                WHERE service = %s AND host = %s AND status = 'online'
-            """, (service, host))
-
-            # Sweep globally stale online rows from any host
-            cursor.execute("""
-                UPDATE worker_registry
-                SET status = 'offline', offline_at = last_heartbeat
-                WHERE status = 'online'
-                  AND last_heartbeat < NOW() - INTERVAL '%s seconds'
-            """, (stale_threshold,))
-
-            # Insert fresh row for this worker
-            cursor.execute("""
-                INSERT INTO worker_registry (worker_id, service, host, started_at, last_heartbeat, status)
-                VALUES (%s, %s, %s, NOW(), NOW(), 'online')
-            """, (self.worker_id, service, host))
-
-            cursor.close()
-            if not self.db_conn.autocommit:
-                self.db_conn.commit()
-            self.logger.info(f"Registered in worker registry ({host})")
+            self._registry.start(self.db_conn)
+            self.logger.info(f"Registered in worker registry ({self._registry.host})")
         except Exception as e:
             self.logger.warning(f"Failed to register in worker registry: {e}")
 
-    def _heartbeat_loop(self):
-        """Background thread: updates last_heartbeat every WORKER_HEARTBEAT_INTERVAL seconds.
-        Marks status='offline' on clean exit so consumers can distinguish clean vs unclean shutdowns."""
-        try:
-            self._heartbeat_loop_inner()
-        except Exception as e:
-            self.logger.error(f"Heartbeat thread crashed unexpectedly: {e}", exc_info=True)
-
-    def _heartbeat_loop_inner(self):
-        """Inner heartbeat loop — separated so the outer method can catch any unexpected exit."""
-        try:
-            conn = self._new_db_connection(autocommit=True)
-        except Exception as e:
-            self.logger.warning(f"Heartbeat thread failed to connect to DB: {e}")
-            return
-
-        # Event.wait(timeout) blocks for up to timeout seconds, returns True if stop was signalled
-        while not self._heartbeat_stop.wait(self._heartbeat_interval):
-            try:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE worker_registry SET last_heartbeat = NOW() WHERE worker_id = %s",
-                    (self.worker_id,)
-                )
-                cursor.close()
-                self.logger.debug("Heartbeat sent")
-            except Exception as e:
-                self.logger.warning(f"Heartbeat failed: {e}. Reconnecting...")
-                try:
-                    conn.close()
-                    conn = self._new_db_connection(autocommit=True)
-                except Exception as reconnect_e:
-                    self.logger.error(f"Heartbeat reconnect failed: {reconnect_e}")
-
-        # Clean shutdown — mark offline with precise offline_at timestamp
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE worker_registry SET status = 'offline', offline_at = NOW() WHERE worker_id = %s",
-                (self.worker_id,)
-            )
-            cursor.close()
-            self.logger.info("Marked offline in worker registry")
-        except Exception as e:
-            self.logger.warning(f"Failed to mark offline in worker registry: {e}")
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    def _start_registry(self):
-        """Register and start heartbeat thread. Call after DB connection established."""
-        self._heartbeat_stop.clear()
-        self._register_worker()
-        self._heartbeat_thread = threading.Thread(
-            target=self._heartbeat_loop,
-            daemon=True,
-            name=f"{self.service_name}_heartbeat"
-        )
-        self._heartbeat_thread.start()
-
     def _stop_registry(self):
         """Signal heartbeat to stop and wait for offline marker to be written."""
-        self._heartbeat_stop.set()
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            self._heartbeat_thread.join(timeout=5)
+        self._registry.stop(join_timeout=5)
 
     def after_result_stored(self, image_id, result, message):
         """Hook called after storing the ML result. Override in subclasses for
@@ -1523,40 +1351,29 @@ class BaseWorker:
     def _new_db_connection(self, autocommit=True):
         """Create a new PostgreSQL connection using the worker's config.
         Subclasses should use this for any additional connections (e.g. read replicas)."""
-        kwargs = dict(
-            host=self.db_host,
-            database=self.db_name,
-            user=self.db_user,
-            password=self.db_password,
-            connect_timeout=10,
-            keepalives=1,
-            keepalives_idle=30,
-            keepalives_interval=10,
-            keepalives_count=3,
+        return create_connection(self.db_config, autocommit=autocommit)
+
+    def _new_managed_db_connection(self, autocommit=True, label='database'):
+        return ManagedPostgresConnection(
+            self.db_config,
+            autocommit=autocommit,
+            logger=self.logger,
+            label=f"{self.service_name} {label}",
         )
-        if self.db_sslmode:
-            kwargs['sslmode'] = self.db_sslmode
-        conn = psycopg2.connect(**kwargs)
-        conn.autocommit = autocommit
-        return conn
+
+    def _connect_main_database(self, autocommit=True):
+        self._db_connection.autocommit = autocommit
+        self.db_conn = self._db_connection.connect()
+        self.logger.info(f"Connected to PostgreSQL at {self.db_host}")
+
+        self.consecutive_db_failures = 0
+        self.db_backoff_delay = 1
+        return True
 
     def connect_to_database(self):
         """Connect to PostgreSQL database"""
         try:
-            # Close existing connection to prevent leaks on reconnect
-            if self.db_conn:
-                try:
-                    self.db_conn.close()
-                except Exception:
-                    pass
-            self.db_conn = self._new_db_connection(autocommit=True)
-            self.logger.info(f"Connected to PostgreSQL at {self.db_host}")
-
-            # Reset failure tracking on successful connection
-            self.consecutive_db_failures = 0
-            self.db_backoff_delay = 1
-
-            return True
+            return self._connect_main_database(autocommit=True)
         except Exception as e:
             self.logger.error(f"Failed to connect to database: {e}")
             return False
@@ -1622,25 +1439,43 @@ class BaseWorker:
             )
 
         return success
+
+    def _retry_db_read_once(self, operation_name: str, fn, default):
+        """Retry one safe read after a forced reconnect.
+
+        This is intentionally limited to retry-safe read paths. Write paths need
+        explicit idempotency/transaction rules and should not silently reuse this.
+        """
+        try:
+            return fn()
+        except Exception as first_error:
+            self.logger.warning(
+                f"{self.service_name}: {operation_name} failed on first attempt: "
+                f"{first_error}; retrying after reconnect"
+            )
+            if not self._reconnect_database():
+                self.logger.warning(
+                    f"{self.service_name}: reconnect failed while retrying {operation_name}"
+                )
+                return default
+            try:
+                return fn()
+            except Exception as second_error:
+                self.logger.warning(
+                    f"{self.service_name}: could not {operation_name}: {second_error}"
+                )
+                return default
     
     def connect_to_queue(self):
         """Connect to RabbitMQ for consuming. Only declares this worker's own queue.
         Downstream queues are declared by the background publish thread."""
         try:
-            self.connection = pika.BlockingConnection(self._build_queue_params())
-            self.channel = self.connection.channel()
-
-            # Declare this worker's consume queue with DLQ
-            dlq_name = f"{self.queue_name}.dlq"
-            self.channel.queue_declare(queue=dlq_name, durable=True)
-            args = {
-                'x-dead-letter-exchange': '',
-                'x-dead-letter-routing-key': dlq_name
-            }
-            ttl_env = os.getenv('QUEUE_MESSAGE_TTL_MS')
-            if ttl_env and ttl_env.isdigit() and int(ttl_env) > 0:
-                args['x-message-ttl'] = int(ttl_env)
-            self.channel.queue_declare(queue=self.queue_name, durable=True, arguments=args)
+            self.connection, self.channel = self._consume_queue.connect()
+            declare_queue(
+                self.channel,
+                self.queue_name,
+                ttl_ms=self._queue_message_ttl_ms(),
+            )
 
             self.channel.basic_qos(prefetch_count=self.worker_prefetch_count)
             self.logger.info(f"Connected to RabbitMQ at {self.queue_host}")
@@ -1674,12 +1509,10 @@ class BaseWorker:
             # Ensure database connection is healthy before processing
             if not self.ensure_database_connection():
                 self.logger.error(
-                    "Database connection unavailable, rejecting message without requeue. "
+                    "Database connection unavailable, requeueing message. "
                     "Worker will retry after backoff delay."
                 )
-                # Reject without requeue to prevent CPU spin during DB outage
-                # Message will go to DLQ after max retries
-                self._safe_nack(ch, method.delivery_tag, requeue=False)
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Database unavailable")
                 return
 
@@ -1728,15 +1561,15 @@ class BaseWorker:
             image_fetch_duration = time.time() - fetch_started_at
             if image_bytes is None:
                 failure_reason = "image_ref missing, expired, or otherwise unavailable"
-                self._store_terminal_message_failure(
+                self._ack_terminal_message_failure(
+                    ch,
+                    method.delivery_tag,
                     image_id=image_id,
                     reason=failure_reason,
                     trace_id=trace_id,
                     service=self._get_clean_service_name(),
                     source_stage='image_transport_resolve',
                 )
-                self._safe_ack(ch, method.delivery_tag)
-                self.job_failed(failure_reason)
                 return
 
             request_started_at = time.time()
@@ -1805,9 +1638,9 @@ class BaseWorker:
                 None if result_status == 'success' else failed_reason,
                 self._get_clean_service_name(),
             ))
-            self.db_conn.commit()  # CRITICAL: Commit the transaction!
+            commit_if_needed(self.db_conn, force=True)
             persist_duration = time.time() - persist_started_at
-            cursor.close()
+            close_quietly(cursor)
 
             if trace_id:
                 self.logger.info(
@@ -2065,12 +1898,7 @@ class BaseWorker:
 
         # Start background publish thread
         self._running = True
-        self._publish_thread = threading.Thread(
-            target=self._start_async_publisher,
-            daemon=True,
-            name=f"{self.service_name}_publish"
-        )
-        self._publish_thread.start()
+        self._async_publisher.start()
 
         # Register in worker registry and start heartbeat thread
         self._start_registry()
@@ -2091,22 +1919,9 @@ class BaseWorker:
                     self.channel.stop_consuming()
                 except Exception:
                     pass
-                try:
-                    self.connection.close()
-                except Exception:
-                    pass
-                if self._publish_connection:
-                    try:
-                        self._publish_connection.ioloop.add_callback_threadsafe(
-                            self._publish_connection.ioloop.stop
-                        )
-                    except Exception:
-                        pass
-                if self._publish_thread and self._publish_thread.is_alive():
-                    self.logger.info("Waiting for async publisher thread to stop...")
-                    self._publish_thread.join(timeout=10)
-                    if self._publish_thread.is_alive():
-                        self.logger.warning("Async publisher thread did not stop within timeout")
+                self._consume_queue.close()
+                self.logger.info("Waiting for async publisher thread to stop...")
+                self._async_publisher.stop(join_timeout=10)
                 self._stop_registry()
                 break
             except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
@@ -2125,11 +1940,7 @@ class BaseWorker:
                         pass
 
         self._cleanup()
-        if self.db_conn:
-            self.db_conn.close()
-        if self._sync_publish_connection:
-            try:
-                self._sync_publish_connection.close()
-            except Exception:
-                pass
+        close_quietly(self.db_conn)
+        self._consume_queue.close()
+        self._sync_publish_queue.close()
         self.logger.info(f"{self.service_name} worker stopped")

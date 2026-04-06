@@ -58,7 +58,6 @@ all:
             - caption_summary_worker
             - colors_worker
             - content_analysis_worker
-            - dlq_worker
             - gemini_worker
             - gpt_nano_worker
             - haiku_worker

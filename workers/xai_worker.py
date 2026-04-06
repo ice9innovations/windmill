@@ -42,7 +42,7 @@ class XaiWorker(BaseWorker):
 
     def process_message(self, ch, method, properties, body):
         if not self.ensure_database_connection():
-            self._safe_nack(ch, method.delivery_tag, requeue=False)
+            self._safe_nack(ch, method.delivery_tag, requeue=True)
             self.job_failed("Database unavailable")
             return
 

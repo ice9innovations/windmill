@@ -302,10 +302,7 @@ Every primary service dispatch is tracked in `service_dispatch`:
 |--------|---------|
 | pending | Dispatched to queue, not yet processed |
 | complete | Worker wrote a result successfully |
-| failed | Worker caught an error and nacked the message |
-| dead-lettered | Message exceeded retries and landed in the DLQ |
-
-The `dlq_worker` consumes from all `.dlq` queues and writes `dead-lettered` with the x-death reason. This makes `service_dispatch` the authoritative lifecycle view — polling `results` for stale detection is no longer needed.
+| failed | Worker reported a terminal failure |
 
 ---
 
@@ -349,24 +346,11 @@ tail -f logs/noun_consensus_worker.log
 
 ---
 
-## Dead Letter Queues
+## Queue Failures
 
-Every queue `X` has a paired `X.dlq`. The `dlq_worker` automatically consumes all DLQs and records the failure reason.
+Queues are declared directly without a paired DLQ worker. Terminal worker failures are written explicitly to `service_dispatch.failed_reason` and the message is acknowledged by the worker.
 
-To inspect DLQs:
-```bash
-QUEUE_HOST=... QUEUE_USER=... QUEUE_PASSWORD=... python utils/list_dlqs.py
-```
-
-To requeue from a DLQ:
-```bash
-QUEUE_HOST=... QUEUE_USER=... QUEUE_PASSWORD=... \
-  python utils/requeue_from_dlq.py harmony --limit 500
-```
-
-Alternatively use the RabbitMQ management UI: Queues → select a `.dlq` → Get messages or enable the Shovel plugin for bulk requeue.
-
-Investigate the failure reason (logged in `service_dispatch.failed_reason`) before mass requeueing.
+Use the RabbitMQ management UI to inspect live queues directly if needed.
 
 ---
 
@@ -378,7 +362,7 @@ Full schema in `db/db.sql`. Key tables:
 |-------|---------|---------|
 | images | INSERT | Source image metadata, tier, services_submitted |
 | results | INSERT | Per-service ML results |
-| service_dispatch | UPDATE | Job lifecycle per service (pending → complete/failed/dead-lettered) |
+| service_dispatch | UPDATE | Job lifecycle per service (pending → complete/failed) |
 | merged_boxes | DELETE+INSERT | Harmonized bounding boxes |
 | postprocessing | INSERT | Per-bbox service results |
 | noun_consensus | UPSERT | Extracted nouns, categories, confidence |
@@ -427,7 +411,6 @@ workers/
   noun_utils.py           ConceptNet synonym collapse
   caption_summary_worker.py LLM caption synthesis
   sam3_worker.py          SAM3 segmentation dispatcher
-  dlq_worker.py           Dead-letter queue consumer
   registry_sweeper_worker.py Stale worker cleanup
   producer.py             Batch job submission
 service_config.yaml       Service definitions, tiers, ports

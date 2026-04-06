@@ -26,11 +26,12 @@ import time
 from PIL import Image
 
 from base_worker import BaseWorker
+from core.postgres_connection import close_quietly, commit_if_needed, rollback_quietly
 from utils.semantic_validation import infer_gender_from_anatomy
 from utils.spatial_analysis import detect_person_containment, detect_sexual_activities
 from utils.framing_analysis import classify_framing
 
-SPATIAL_ANALYSIS_VERSION = 'spatial_1.0'
+SPATIAL_ANALYSIS_VERSION = 'spatial_1.2'
 
 
 
@@ -57,6 +58,14 @@ class NudenetWorker(BaseWorker):
                     'anatomy_exposed': [],
                     'scene_type': 'sfw',
                     'intimacy_level': 'none',
+                    'scene_summary': {
+                        'people': 0,
+                        'gender': {
+                            'presentation': 'unknown',
+                            'mixed': False,
+                            'confidence': 0.0,
+                        },
+                    },
                     'activities_detected': [],
                     'spatial_relationships': [],
                     'person_bboxes_raw': 0,
@@ -106,6 +115,28 @@ class NudenetWorker(BaseWorker):
                 'reasoning': spatial_gender['reasoning']
             }
 
+            if gender_breakdown['mixed_gender']:
+                scene_gender_presentation = 'mixed'
+                scene_gender_confidence = max(
+                    gender_breakdown['confidence']['female'],
+                    gender_breakdown['confidence']['male'],
+                )
+            elif spatial_gender['gender'] in ['female', 'male']:
+                scene_gender_presentation = spatial_gender['gender']
+                scene_gender_confidence = spatial_gender['confidence']
+            else:
+                scene_gender_presentation = 'unknown'
+                scene_gender_confidence = 0.0
+
+            scene_summary = {
+                'people': len(person_bboxes_deduplicated),
+                'gender': {
+                    'presentation': scene_gender_presentation,
+                    'mixed': gender_breakdown['mixed_gender'],
+                    'confidence': scene_gender_confidence,
+                },
+            }
+
             # No VLM captions yet — pass empty string; activity detection is
             # spatial only for this pass.
             activity_analysis = detect_sexual_activities(
@@ -132,6 +163,7 @@ class NudenetWorker(BaseWorker):
                 'anatomy_exposed': anatomy_exposed,
                 'scene_type': activity_analysis['scene_type'],
                 'intimacy_level': activity_analysis['intimacy_level'],
+                'scene_summary': scene_summary,
                 'activities_detected': activity_analysis['activities'],
                 'spatial_relationships': activity_analysis['spatial_relationships'],
                 'person_bboxes_raw': len(person_bboxes),
@@ -255,7 +287,7 @@ class NudenetWorker(BaseWorker):
         nsfw2_says_nsfw = nsfw2_result.get('nsfw', False)
         nsfw2_confidence = nsfw2_result.get('confidence', 0.0)
         nsfw2_verdict = 'nsfw' if nsfw2_says_nsfw else 'sfw'
-        spatial_nsfw = scene_type in ['sexually_explicit', 'softcore_pornography', 'simple_nudity']
+        spatial_nsfw = scene_type in ['suggestive', 'nudity', 'softcore_pornography', 'sexually_explicit']
 
         return {
             'agreement': spatial_nsfw == nsfw2_says_nsfw,
@@ -282,6 +314,8 @@ class NudenetWorker(BaseWorker):
         """
         try:
             full_analysis = {
+                'category': analysis['scene_type'],
+                'scene': analysis['scene_summary'],
                 'anatomy_exposed': analysis['anatomy_exposed'],
                 'gender_breakdown': analysis['gender_breakdown'],
                 'person_attributions': [],
@@ -313,7 +347,7 @@ class NudenetWorker(BaseWorker):
                     full_analysis    = EXCLUDED.full_analysis,
                     analysis_version = EXCLUDED.analysis_version,
                     processing_time  = EXCLUDED.processing_time
-                WHERE content_analysis.analysis_version = 'spatial_1.0'
+                WHERE content_analysis.analysis_version IN ('spatial_1.0', 'spatial_1.1', 'spatial_1.2')
                    OR content_analysis.analysis_version IS NULL
             """, (
                 analysis['image_id'],
@@ -321,8 +355,8 @@ class NudenetWorker(BaseWorker):
                 SPATIAL_ANALYSIS_VERSION,
                 processing_time,
             ))
-            self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=True)
+            close_quietly(cursor)
 
             self.logger.info(
                 f"Spatial pass stored for image {analysis['image_id']}: "
@@ -332,7 +366,7 @@ class NudenetWorker(BaseWorker):
             )
         except Exception as e:
             self.logger.error(f"Failed to store spatial analysis for image {analysis['image_id']}: {e}")
-            self.db_conn.rollback()
+            rollback_quietly(self.db_conn)
             raise
 
 

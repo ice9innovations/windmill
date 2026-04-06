@@ -17,6 +17,7 @@ from datetime import datetime
 sys.path.append(os.path.dirname(__file__))
 
 from base_worker import BaseWorker
+from core.postgres_connection import close_quietly, commit_if_needed, rollback_quietly
 
 logger = logging.getLogger(__name__)
 
@@ -30,19 +31,15 @@ class PostprocessingOrchestratorWorker(BaseWorker):
 
     def connect_to_database(self):
         try:
-            if self.db_conn:
-                try:
-                    self.db_conn.close()
-                except Exception:
-                    pass
-            self.db_conn = self._new_db_connection(autocommit=False)
-            self.logger.info(f"Connected to PostgreSQL at {self.db_host}")
-            self.consecutive_db_failures = 0
-            self.db_backoff_delay = 1
-            return True
+            return self._connect_main_database(autocommit=False)
         except Exception as e:
             self.logger.error(f"Failed to connect to database: {e}")
             return False
+
+    def _declare_additional_queues(self, declare_queue):
+        declare_queue(self._get_queue_name('system.content_analysis'))
+        declare_queue(self._get_queue_by_service_type('grounding'))
+        declare_queue(self._get_queue_name('system.caption_summary'))
 
     def process_message(self, ch, method, properties, body):
         start_time = time.time()
@@ -50,7 +47,7 @@ class PostprocessingOrchestratorWorker(BaseWorker):
 
         try:
             if not self.ensure_database_connection():
-                self._safe_nack(ch, method.delivery_tag, requeue=False)
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Database unavailable")
                 return
 
@@ -157,10 +154,7 @@ class PostprocessingOrchestratorWorker(BaseWorker):
             self._safe_ack(ch, method.delivery_tag)
             self.job_completed_successfully()
         except Exception as e:
-            try:
-                self.db_conn.rollback()
-            except Exception:
-                pass
+            rollback_quietly(self.db_conn)
             self.logger.error(f"postprocessing_orchestrator: error processing message: {e}")
             self._safe_nack(ch, method.delivery_tag, requeue=True)
             self.job_failed(str(e))
@@ -244,9 +238,9 @@ class PostprocessingOrchestratorWorker(BaseWorker):
                     }),
                 ),
             )
-            self.db_conn.commit()
+            commit_if_needed(self.db_conn, force=True)
         finally:
-            cursor.close()
+            close_quietly(cursor)
 
 
 if __name__ == "__main__":

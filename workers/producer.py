@@ -8,9 +8,7 @@ import uuid
 import sys
 import json
 import time
-import ssl
 import pika
-import psycopg2
 import argparse
 import base64
 import requests
@@ -21,6 +19,12 @@ import io
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from core.image_store import is_valkey_image_store_enabled, put_image
+from core.postgres_connection import PostgresConnectionConfig, create_connection
+from core.rabbitmq_connection import (
+    declare_queue,
+    ManagedRabbitMQBlockingConnection,
+    RabbitMQConnectionConfig,
+)
 
 class ProducerConfig:
     """Load producer configuration"""
@@ -39,6 +43,14 @@ class ProducerConfig:
         self.queue_ssl = os.getenv('QUEUE_SSL', '').lower() in ('true', '1', 'yes')
         self.queue_user = self._get_required('QUEUE_USER')
         self.queue_password = self._get_required('QUEUE_PASSWORD')
+        self.queue_config = RabbitMQConnectionConfig(
+            host=self.queue_host,
+            port=self.queue_port,
+            user=self.queue_user,
+            password=self.queue_password,
+            use_ssl=self.queue_ssl,
+            server_hostname=self.queue_host,
+        )
 
         # Database configuration
         self.db_host = self._get_required('DB_HOST')
@@ -46,6 +58,13 @@ class ProducerConfig:
         self.db_user = self._get_required('DB_USER')
         self.db_password = self._get_required('DB_PASSWORD')
         self.db_sslmode = os.getenv('DB_SSLMODE')
+        self.db_config = PostgresConnectionConfig(
+            host=self.db_host,
+            database=self.db_name,
+            user=self.db_user,
+            password=self.db_password,
+            sslmode=self.db_sslmode,
+        )
     
     def _get_required(self, key):
         """Get required environment variable with no fallback"""
@@ -90,6 +109,15 @@ class GenericProducer:
         self.connection = None
         self.channel = None
         self.db_conn = None
+        self.queue_connection = ManagedRabbitMQBlockingConnection(
+            self.config.queue_config,
+            label="producer queue",
+            heartbeat=60,
+            blocked_connection_timeout=300,
+            connection_attempts=10,
+            retry_delay=5,
+            socket_timeout=10,
+        )
         print(f"🚀 Generic Queue Producer initialized")
     
     def extract_image_dimensions(self, image_bytes):
@@ -104,24 +132,7 @@ class GenericProducer:
     def connect_to_rabbitmq(self):
         """Connect to RabbitMQ"""
         try:
-            credentials = pika.PlainCredentials(self.config.queue_user, self.config.queue_password)
-            kwargs = dict(
-                host=self.config.queue_host,
-                port=self.config.queue_port,
-                credentials=credentials,
-                heartbeat=60,
-                blocked_connection_timeout=300,
-                connection_attempts=10,
-                retry_delay=5,
-                socket_timeout=10,
-            )
-            if self.config.queue_ssl:
-                ssl_context = ssl.create_default_context()
-                kwargs['ssl_options'] = pika.SSLOptions(ssl_context, self.config.queue_host)
-            self.connection = pika.BlockingConnection(
-                pika.ConnectionParameters(**kwargs)
-            )
-            self.channel = self.connection.channel()
+            self.connection, self.channel = self.queue_connection.connect()
             print(f"✅ Connected to RabbitMQ at {self.config.queue_host}")
             return True
             
@@ -132,15 +143,7 @@ class GenericProducer:
     def connect_to_database(self):
         """Connect to PostgreSQL database"""
         try:
-            connect_kwargs = dict(
-                host=self.config.db_host,
-                database=self.config.db_name,
-                user=self.config.db_user,
-                password=self.config.db_password,
-            )
-            if self.config.db_sslmode:
-                connect_kwargs['sslmode'] = self.config.db_sslmode
-            self.db_conn = psycopg2.connect(**connect_kwargs)
+            self.db_conn = create_connection(self.config.db_config, autocommit=False)
             print(f"✅ Connected to PostgreSQL at {self.config.db_host}")
             return True
             
@@ -151,24 +154,13 @@ class GenericProducer:
     def create_queues(self, service_names):
         """Create queues for the specified services"""
         created_queues = []
-        
-        # Helper to declare a queue with DLQ/TTL args matching workers
-        def declare_with_dlq(channel, queue_name):
-            dlq_name = f"{queue_name}.dlq"
-            channel.queue_declare(queue=dlq_name, durable=True)
-            args = {
-                'x-dead-letter-exchange': '',
-                'x-dead-letter-routing-key': dlq_name
-            }
-            ttl_env = os.getenv('QUEUE_MESSAGE_TTL_MS')
-            if ttl_env and ttl_env.isdigit() and int(ttl_env) > 0:
-                args['x-message-ttl'] = int(ttl_env)
-            channel.queue_declare(queue=queue_name, durable=True, arguments=args)
+        ttl_env = os.getenv('QUEUE_MESSAGE_TTL_MS')
+        ttl_ms = int(ttl_env) if ttl_env and ttl_env.isdigit() and int(ttl_env) > 0 else None
 
         for service_name in service_names:
             try:
                 queue_name = self.config.get_queue_name(service_name)
-                declare_with_dlq(self.channel, queue_name)
+                declare_queue(self.channel, queue_name, ttl_ms=ttl_ms)
                 created_queues.append(queue_name)
                 
             except ValueError as e:

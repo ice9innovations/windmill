@@ -26,6 +26,7 @@ sys.path.append(os.path.dirname(__file__))
 
 from base_worker import BaseWorker
 from core.image_store import is_valkey_image_store_enabled
+from core.postgres_connection import close_quietly, commit_if_needed, rollback_quietly
 
 MIN_COLORS_SIZE = (8, 8)
 
@@ -37,7 +38,7 @@ class Florence2GroundingWorker(BaseWorker):
         super().__init__('system.florence2_grounding')
 
 
-    def _declare_additional_queues(self, declare_with_dlq):
+    def _declare_additional_queues(self, declare_queue):
         """No additional queues."""
         return
 
@@ -69,7 +70,7 @@ class Florence2GroundingWorker(BaseWorker):
 
         try:
             if not self.ensure_database_connection():
-                self._safe_nack(ch, method.delivery_tag, requeue=False)
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Database unavailable")
                 return
 
@@ -99,8 +100,14 @@ class Florence2GroundingWorker(BaseWorker):
                 self.logger.error(
                     f"florence2_grounding: no image bytes in message for image {image_id}"
                 )
-                self._safe_nack(ch, method.delivery_tag, requeue=False)
-                self.job_failed("No image bytes")
+                self._ack_terminal_message_failure(
+                    ch,
+                    method.delivery_tag,
+                    image_id=image_id,
+                    reason="image_ref missing, expired, or otherwise unavailable",
+                    service='florence2_grounding',
+                    source_stage='image_transport_resolve',
+                )
                 return
 
             # Read nouns from noun_consensus at processing time, not from the
@@ -245,10 +252,7 @@ class Florence2GroundingWorker(BaseWorker):
 
         except Exception as e:
             if self.db_conn and previous_autocommit is False:
-                try:
-                    self.db_conn.rollback()
-                except Exception:
-                    pass
+                rollback_quietly(self.db_conn)
             self.logger.error(f"florence2_grounding: error processing message: {e}")
             self._safe_nack(ch, method.delivery_tag, requeue=True)
             self.job_failed(str(e))
@@ -282,14 +286,16 @@ class Florence2GroundingWorker(BaseWorker):
         total VLMs expected for the tier — not the number that have reported so far.
         This keeps the bar stable across progressive triggers.
         """
-        try:
+        def _run():
             cursor = self.db_conn.cursor()
-            cursor.execute(
-                "SELECT nouns FROM noun_consensus WHERE image_id = %s",
-                (image_id,),
-            )
-            row = cursor.fetchone()
-            cursor.close()
+            try:
+                cursor.execute(
+                    "SELECT nouns FROM noun_consensus WHERE image_id = %s",
+                    (image_id,),
+                )
+                row = cursor.fetchone()
+            finally:
+                cursor.close()
             if not row or not row[0]:
                 return []
             nouns_data = row[0]  # jsonb — already a list
@@ -304,31 +310,33 @@ class Florence2GroundingWorker(BaseWorker):
                 n['canonical'] for n in nouns_data
                 if n.get('vote_count', 0) >= min_votes
             ]
-        except Exception as e:
-            self.logger.warning(
-                f"florence2_grounding: could not fetch consensus nouns for image {image_id}: {e}"
-            )
-            return []
+        return self._retry_db_read_once(
+            operation_name=f"fetch consensus nouns for image {image_id}",
+            fn=_run,
+            default=[],
+        )
 
     def _fetch_previous_grounding_result(self, image_id: int) -> dict:
         """Return noun set and predictions from the most recent grounding result.
 
         Returns {'nouns': set(), 'predictions': []} if no prior result exists.
         """
-        try:
+        def _run():
             cursor = self.db_conn.cursor()
-            cursor.execute(
-                """
-                SELECT data->'metadata'->>'nouns_queried', data->'predictions'
-                FROM results
-                WHERE image_id = %s AND service = 'florence2_grounding'
-                ORDER BY result_created DESC
-                LIMIT 1
-                """,
-                (image_id,),
-            )
-            row = cursor.fetchone()
-            cursor.close()
+            try:
+                cursor.execute(
+                    """
+                    SELECT data->'metadata'->>'nouns_queried', data->'predictions'
+                    FROM results
+                    WHERE image_id = %s AND service = 'florence2_grounding'
+                    ORDER BY result_created DESC
+                    LIMIT 1
+                    """,
+                    (image_id,),
+                )
+                row = cursor.fetchone()
+            finally:
+                cursor.close()
             if not row or not row[0]:
                 return {'nouns': set(), 'predictions': []}
             predictions = row[1] if len(row) > 1 and row[1] else []
@@ -336,11 +344,11 @@ class Florence2GroundingWorker(BaseWorker):
                 'nouns': set(json.loads(row[0])),
                 'predictions': predictions,
             }
-        except Exception as e:
-            self.logger.warning(
-                f"florence2_grounding: could not fetch previous grounding result for image {image_id}: {e}"
-            )
-            return {'nouns': set(), 'predictions': []}
+        return self._retry_db_read_once(
+            operation_name=f"fetch previous grounding result for image {image_id}",
+            fn=_run,
+            default={'nouns': set(), 'predictions': []},
+        )
 
     def _call_florence2_grounding(self, image_bytes: bytes, prompt: str):
         """POST image + prompt to Florence-2 CAPTION_TO_PHRASE_GROUNDING."""
@@ -406,8 +414,8 @@ class Florence2GroundingWorker(BaseWorker):
                     }),
                 ),
             )
-            self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=True)
+            close_quietly(cursor)
         except Exception as e:
             self.logger.error(
                 f"florence2_grounding: failed to persist failed result for image {image_id}: {e}"
@@ -476,8 +484,8 @@ class Florence2GroundingWorker(BaseWorker):
                     }),
                 ),
             )
-            self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=True)
+            close_quietly(cursor)
             if validated_nouns:
                 self.logger.info(
                     f"florence2_grounding: validated {len(validated_nouns)} nouns "

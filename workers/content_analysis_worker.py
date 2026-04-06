@@ -16,6 +16,7 @@ import psycopg2
 import yaml
 from datetime import datetime
 from base_worker import BaseWorker
+from core.postgres_connection import close_quietly, commit_if_needed, rollback_quietly
 
 # Import our analysis utilities
 from utils.semantic_validation import (
@@ -23,8 +24,7 @@ from utils.semantic_validation import (
     validate_category_with_captions,
     infer_gender_from_anatomy,
     detect_gender_hallucination,
-    vote_on_gender,
-    classify_female_solo_nudity
+    vote_on_gender
 )
 from utils.spatial_analysis import (
     detect_person_containment,
@@ -33,7 +33,7 @@ from utils.spatial_analysis import (
 from utils.framing_analysis import classify_framing
 from utils.face_correlation import correlate_faces, get_face_gender_attribution
 
-ANALYSIS_VERSION = '1.4.5'  # Added content_flags based on noun extraction
+ANALYSIS_VERSION = '1.4.8'  # Added canonical category + scene summary payload
 
 _PERSON_EMOJIS = frozenset(['🧑', '👩', '🧒'])
 
@@ -114,6 +114,10 @@ class ContentAnalysisWorker(BaseWorker):
         super().__init__('system.content_analysis', env_file='.env')
 
         # Dual database connections for read/write separation
+        self.read_db = self._new_managed_db_connection(
+            autocommit=True,
+            label='read database',
+        )
         self.read_db_conn = None
 
         # Load content flagging config into memory once at startup
@@ -127,12 +131,6 @@ class ContentAnalysisWorker(BaseWorker):
 
     def connect_to_database(self):
         """Connect to PostgreSQL database with dual connections"""
-        if hasattr(self, 'read_db_conn') and self.read_db_conn:
-            try:
-                self.read_db_conn.close()
-            except Exception:
-                pass
-
         if not super().connect_to_database():
             return False
 
@@ -141,7 +139,7 @@ class ContentAnalysisWorker(BaseWorker):
             self.db_conn.autocommit = False
 
             # Create separate read connection for queries
-            self.read_db_conn = self._new_db_connection(autocommit=True)
+            self.read_db_conn = self.read_db.connect()
 
             return True
 
@@ -163,11 +161,6 @@ class ContentAnalysisWorker(BaseWorker):
             if not self.read_db_conn or self.read_db_conn.closed:
                 self.logger.warning("Read database connection is closed")
                 return self.connect_to_database()
-
-            # Validate read connection with test query
-            cursor = self.read_db_conn.cursor()
-            cursor.execute("SELECT 1")
-            cursor.close()
 
             return True
 
@@ -429,7 +422,7 @@ class ContentAnalysisWorker(BaseWorker):
         partial nudity, or context we didn't capture).
 
         Confidence thresholds:
-        - High (>0.9): Override to 'nsfw2_flagged' - NSFW2 is very confident
+        - High (>0.9): Override to 'suggestive' - NSFW2 is very confident
         - Medium (0.7-0.9): Override to 'suggestive' - likely suggestive content
         - Lower (0.5-0.7): Override to 'suggestive' if NudeNet found covered anatomy
                            (two weak signals together are meaningful); otherwise flag only
@@ -467,9 +460,9 @@ class ContentAnalysisWorker(BaseWorker):
         nsfw2_verdict = 'nsfw' if nsfw2_says_nsfw else 'sfw'
 
         # Determine agreement
-        # Our NSFW categories: sexually_explicit, softcore_pornography, simple_nudity
-        # Our SFW categories: sfw, breastfeeding
-        our_nsfw = scene_type in ['sexually_explicit', 'softcore_pornography', 'simple_nudity']
+        # Canonical content categories above sfw are treated as NSFW for correlation.
+        # Our SFW category: sfw
+        our_nsfw = scene_type in ['suggestive', 'nudity', 'softcore_pornography', 'sexually_explicit']
         agreement = our_nsfw == nsfw2_says_nsfw
 
         # Only consider overrides when we say SFW but NSFW2 says NSFW
@@ -486,13 +479,13 @@ class ContentAnalysisWorker(BaseWorker):
 
         # We classified as SFW but NSFW2 says NSFW - apply confidence thresholds
         if nsfw2_confidence > 0.9:
-            # High confidence: NSFW2 is very sure, override to nsfw2_flagged
+            # High confidence: NSFW2 is very sure this is at least suggestive.
             return {
                 'agreement': False,
                 'nsfw2_verdict': nsfw2_verdict,
                 'nsfw2_confidence': nsfw2_confidence,
                 'override_scene_type': True,
-                'new_scene_type': 'nsfw2_flagged',
+                'new_scene_type': 'suggestive',
                 'new_intimacy_level': 'suggestive',
                 'reasoning': 'nsfw2_high_confidence_override'
             }
@@ -648,6 +641,28 @@ class ContentAnalysisWorker(BaseWorker):
                 'reasoning': gender_vote['reasoning']
             }
 
+            if mixed_gender:
+                scene_gender_presentation = 'mixed'
+                scene_gender_confidence = max(
+                    gender_breakdown['confidence']['female'],
+                    gender_breakdown['confidence']['male']
+                )
+            elif gender_vote['gender'] in ['female', 'male']:
+                scene_gender_presentation = gender_vote['gender']
+                scene_gender_confidence = gender_vote['confidence']
+            else:
+                scene_gender_presentation = 'unknown'
+                scene_gender_confidence = 0.0
+
+            scene_summary = {
+                'people': person_bboxes_deduplicated,
+                'gender': {
+                    'presentation': scene_gender_presentation,
+                    'mixed': mixed_gender,
+                    'confidence': scene_gender_confidence
+                }
+            }
+
             # Person attributions using voted gender
             person_attributions = []
             if person_bboxes_deduplicated > 0:
@@ -678,6 +693,8 @@ class ContentAnalysisWorker(BaseWorker):
                 'image_id': image_id,
                 'version': ANALYSIS_VERSION,
                 'timestamp': datetime.now().isoformat(),
+                'category': scene_type,
+                'scene': scene_summary,
                 'anatomy_exposed': anatomy_exposed,
                 'gender_breakdown': gender_breakdown,
                 'person_attributions': person_attributions,
@@ -733,9 +750,8 @@ class ContentAnalysisWorker(BaseWorker):
                 processing_time
             ))
 
-            if commit:
-                self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=commit)
+            close_quietly(cursor)
 
             # Build log message from nested full_analysis structure
             full = analysis['full_analysis']
@@ -759,7 +775,7 @@ class ContentAnalysisWorker(BaseWorker):
 
         except Exception as e:
             self.logger.error(f"Error storing analysis: {e}")
-            self.db_conn.rollback()
+            rollback_quietly(self.db_conn)
             import traceback
             self.logger.error(traceback.format_exc())
             return False
@@ -797,8 +813,8 @@ class ContentAnalysisWorker(BaseWorker):
                     json.dumps(event_data),
                 ),
             )
-            self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=True)
+            close_quietly(cursor)
         except Exception as e:
             self.logger.error(
                 f"content_analysis: failed to persist terminal result for image {image_id}: {e}"
@@ -866,8 +882,8 @@ class ContentAnalysisWorker(BaseWorker):
                     }),
                 ),
             )
-            self.db_conn.commit()
-            cursor.close()
+            commit_if_needed(self.db_conn, force=True)
+            close_quietly(cursor)
 
             full = analysis['full_analysis']
             scene_type = full['activity_analysis']['scene_type']
@@ -898,10 +914,10 @@ class ContentAnalysisWorker(BaseWorker):
             # Ensure database connection is healthy before processing
             if not self.ensure_database_connection():
                 self.logger.error(
-                    "Database connection unavailable, rejecting message without requeue. "
+                    "Database connection unavailable, requeueing message. "
                     "Worker will retry after backoff delay."
                 )
-                self._safe_nack(ch, method.delivery_tag, requeue=False)
+                self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("Database unavailable")
                 return
 
@@ -1011,10 +1027,10 @@ class ContentAnalysisWorker(BaseWorker):
             self.logger.info(f"Successfully completed content analysis for image {image_id}")
 
         except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-            # Database connection errors - don't requeue to prevent CPU spin
+            # Database connection errors should be retried after reconnect.
             self.logger.error(f"Database error processing content analysis message: {e}")
-            self.logger.warning("Rejecting message without requeue due to database error")
-            self._safe_nack(ch, method.delivery_tag, requeue=False)
+            self.logger.warning("Requeueing message after database error")
+            self._safe_nack(ch, method.delivery_tag, requeue=True)
             self.job_failed(str(e))
         except Exception as e:
             # Other errors - requeue for retry

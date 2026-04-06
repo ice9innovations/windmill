@@ -187,7 +187,7 @@ After deployment, verify all of the following:
 
 - `images` accepts inserts
 - `results` rows are being written
-- `service_dispatch` moves through `pending -> complete/failed/dead-lettered`
+- `service_dispatch` moves through `pending -> complete/failed`
 - `worker_registry` heartbeats are fresh
 
 ### RabbitMQ
