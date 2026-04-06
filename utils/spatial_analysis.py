@@ -260,34 +260,14 @@ def detect_sexual_activities(anatomy_bboxes, person_bboxes, captions_text):
         for genital in all_genitals:
             overlap = detect_bbox_overlap(face, genital, iou_threshold=0.05, proximity_threshold=100)
             if overlap['overlaps']:
-                # Check for breastfeeding exception
-                if 'baby' not in captions_text and 'infant' not in captions_text and 'breastfeeding' not in captions_text:
-                    activities.append('oral_sex')
-                    spatial_relationships.append({
-                        'type': 'face_to_genital',
-                        'bbox1': face['label'],
-                        'bbox2': genital['label'],
-                        'iou': overlap['iou'],
-                        'proximity': overlap['proximity']
-                    })
-
-    # Breastfeeding detection (face-to-breast with baby/infant keywords)
-    # NOTE: breast_play detection removed - face-to-breast proximity is natural anatomy
-    # and creates false positives. Will re-add when pose service provides hand keypoints
-    # to detect actual hand-to-breast contact.
-    female_breasts = [d for d in anatomy_bboxes if 'FEMALE_BREAST' in d['label']]
-    for face in face_bboxes:
-        for breast in female_breasts:
-            overlap = detect_bbox_overlap(face, breast, iou_threshold=0.1, proximity_threshold=50)
-            if overlap['overlaps']:
-                # Only flag breastfeeding if keywords suggest it
-                if any(kw in captions_text for kw in ['baby', 'infant', 'breastfeeding', 'nursing']):
-                    activities.append('breastfeeding')
-                    spatial_relationships.append({
-                        'type': 'breastfeeding',
-                        'bbox1': face['label'],
-                        'bbox2': breast['label']
-                    })
+                activities.append('oral_sex')
+                spatial_relationships.append({
+                    'type': 'face_to_genital',
+                    'bbox1': face['label'],
+                    'bbox2': genital['label'],
+                    'iou': overlap['iou'],
+                    'proximity': overlap['proximity']
+                })
 
     # Threesome detection
     deduplicated_people_count = len(person_bboxes)
@@ -334,16 +314,11 @@ def detect_sexual_activities(anatomy_bboxes, person_bboxes, captions_text):
         intimacy_level = 'multiple_people'
 
     if activities:
-        # Has sexual activities detected
-        if 'breastfeeding' in activities:
-            scene_type = 'breastfeeding'
-            intimacy_level = 'non_sexual'
-        else:
-            # Any sexual activity (except breastfeeding) = sexually explicit
-            scene_type = 'sexually_explicit'
-            intimacy_level = 'explicit_sexual'
-            if deduplicated_people_count >= 3:
-                intimacy_level = 'group'
+        # Any detected sexual activity = sexually explicit
+        scene_type = 'sexually_explicit'
+        intimacy_level = 'explicit_sexual'
+        if deduplicated_people_count >= 3:
+            intimacy_level = 'group'
     elif not has_exposed_anatomy:
         # No exposed anatomy detected - not nudity
         scene_type = 'sfw'
@@ -353,8 +328,8 @@ def detect_sexual_activities(anatomy_bboxes, person_bboxes, captions_text):
         scene_type = 'softcore_pornography'
         # Keep solo/multiple_people from line 319
     else:
-        # Exposed breasts/buttocks but no genitalia = simple nudity
-        scene_type = 'simple_nudity'
+        # Exposed breasts/buttocks but no genitalia = nudity
+        scene_type = 'nudity'
         # Keep solo/multiple_people from line 319
 
     return {
@@ -363,4 +338,3 @@ def detect_sexual_activities(anatomy_bboxes, person_bboxes, captions_text):
         'scene_type': scene_type,
         'intimacy_level': intimacy_level
     }
-
