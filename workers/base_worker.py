@@ -783,6 +783,21 @@ class BaseWorker:
         if not response.ok:
             payload['metadata'].setdefault('terminal_http_error', True)
         return payload
+
+    def _extract_http_status(self, payload):
+        """Return integer HTTP status when present on a terminal payload."""
+        if not isinstance(payload, dict):
+            return None
+        metadata = payload.get('metadata')
+        if not isinstance(metadata, dict):
+            return None
+        http_status = metadata.get('http_status')
+        if http_status is None:
+            return None
+        try:
+            return int(http_status)
+        except (TypeError, ValueError):
+            return None
     
     def trigger_noun_consensus(self, image_id, message):
         """Trigger noun consensus for VLM services (async via background publish thread)"""
@@ -1295,8 +1310,8 @@ class BaseWorker:
             cursor.execute(
                 """
                 INSERT INTO results (
-                    image_id, service, source_trace_id, data, status, worker_id, processing_time
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    image_id, service, source_trace_id, data, status, http_status, worker_id, processing_time
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (image_id, service, source_trace_id)
                 WHERE source_trace_id IS NOT NULL
                 DO NOTHING
@@ -1307,6 +1322,7 @@ class BaseWorker:
                     source_trace_id,
                     json.dumps(payload),
                     status,
+                    self._extract_http_status(payload),
                     self.worker_id,
                     processing_time,
                 ),
@@ -1602,9 +1618,9 @@ class BaseWorker:
             cursor.execute("""
                 WITH upserted AS (
                     INSERT INTO results (
-                        image_id, service, source_trace_id, data, status, worker_id, processing_time
+                        image_id, service, source_trace_id, data, status, http_status, worker_id, processing_time
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (image_id, service, source_trace_id)
                     WHERE source_trace_id IS NOT NULL
                     DO NOTHING
@@ -1630,6 +1646,7 @@ class BaseWorker:
                 source_trace_id,
                 json.dumps(result),
                 result_status,
+                self._extract_http_status(result),
                 self.worker_id,
                 processing_time,
                 image_id,

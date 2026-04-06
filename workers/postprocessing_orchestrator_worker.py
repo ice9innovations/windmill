@@ -211,8 +211,8 @@ class PostprocessingOrchestratorWorker(BaseWorker):
             cursor.execute(
                 """
                 WITH inserted_result AS (
-                    INSERT INTO results (image_id, service, data, status, worker_id, processing_time)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    INSERT INTO results (image_id, service, data, status, http_status, worker_id, processing_time)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     RETURNING 1
                 )
                 INSERT INTO service_events (
@@ -225,6 +225,7 @@ class PostprocessingOrchestratorWorker(BaseWorker):
                     'postprocessing_orchestrator',
                     json.dumps(payload),
                     payload.get('status', 'success') or 'success',
+                    self._extract_http_status(payload),
                     self.worker_id,
                     processing_time,
                     image_id,

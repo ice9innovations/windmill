@@ -25,6 +25,8 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+
 from core.postgres_connection import PostgresConnectionConfig, create_connection
 from core.worker_registry import ManagedWorkerRegistry
 

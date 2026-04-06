@@ -388,8 +388,8 @@ class Florence2GroundingWorker(BaseWorker):
                 """
                 WITH inserted_result AS (
                     INSERT INTO results
-                        (image_id, service, data, status, worker_id, processing_time)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                        (image_id, service, data, status, http_status, worker_id, processing_time)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     RETURNING 1
                 )
                 INSERT INTO service_events (
@@ -402,6 +402,7 @@ class Florence2GroundingWorker(BaseWorker):
                     self._get_clean_service_name(),
                     json.dumps(result),
                     result.get('status', 'failed') or 'failed',
+                    self._extract_http_status(result),
                     self.worker_id,
                     processing_time,
                     image_id,
@@ -437,8 +438,8 @@ class Florence2GroundingWorker(BaseWorker):
                 """
                 WITH inserted_result AS (
                     INSERT INTO results
-                        (image_id, service, data, status, worker_id, processing_time)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                        (image_id, service, data, status, http_status, worker_id, processing_time)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     RETURNING 1
                 ),
                 updated_nouns AS (
@@ -468,6 +469,7 @@ class Florence2GroundingWorker(BaseWorker):
                     self._get_clean_service_name(),
                     json.dumps(result),
                     result.get('status', 'success') or 'success',
+                    self._extract_http_status(result),
                     self.worker_id,
                     processing_time,
                     validated_nouns,

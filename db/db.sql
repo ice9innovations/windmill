@@ -1,11 +1,12 @@
 -- Windmill Database Schema
 -- PostgreSQL reference schema for Animal Farm distributed ML processing pipeline
--- Last synced against live database: 2026-03-05
+-- Last synced against live database: 2026-04-06
 --
 -- !! WARNING: DO NOT RUN THIS FILE AGAINST A LIVE DATABASE !!
 -- The DROP TABLE statements below use CASCADE and will destroy all data.
--- This file is a reference document only. Apply schema changes as individual
--- ALTER TABLE migrations on the live database.
+-- This file is a reference document only. Apply schema changes as direct
+-- ALTER TABLE / CREATE INDEX changes on the live database, then fold them
+-- back into this file so it remains canonical.
 
 -- Enable pgvector extension for CLIP embedding storage and similarity search
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -66,9 +67,6 @@ CREATE TABLE results (
     result_id        BIGSERIAL PRIMARY KEY,
     image_id         BIGINT NOT NULL REFERENCES images(image_id),
     service          VARCHAR(255) NOT NULL,
-    -- Stable submission identity from the producer message. Used only for
-    -- primary-worker idempotency on retry after downstream publish failure.
-    source_trace_id  UUID,
     data             JSONB NOT NULL,
     worker_id        VARCHAR(50),
     worker_hostname  VARCHAR(100),
@@ -76,12 +74,17 @@ CREATE TABLE results (
     error_message    TEXT,
     retry_count      INTEGER DEFAULT 0,
     result_created   TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
-    processing_time  DOUBLE PRECISION
+    processing_time  DOUBLE PRECISION,
+    -- Stable submission identity from the producer message. Used only for
+    -- primary-worker idempotency on retry after downstream publish failure.
+    source_trace_id  UUID,
+    http_status      INTEGER
 );
 
 CREATE INDEX idx_results_created ON results(result_created);
 CREATE INDEX idx_results_image_service ON results(image_id, service);
 CREATE INDEX idx_results_status ON results(status);
+CREATE INDEX idx_results_http_status ON results(http_status);
 CREATE INDEX idx_results_worker ON results(worker_id);
 CREATE INDEX idx_results_source_trace_id ON results(source_trace_id);
 CREATE UNIQUE INDEX idx_results_primary_idempotency
@@ -110,8 +113,8 @@ CREATE INDEX idx_merged_boxes_worker ON merged_boxes(worker_id);
 -- merged_box_id is NULL for image-level postprocessing (e.g. caption scoring).
 CREATE TABLE postprocessing (
     post_id          BIGSERIAL PRIMARY KEY,
-    image_id         BIGINT NOT NULL REFERENCES images(image_id),
     merged_box_id    BIGINT REFERENCES merged_boxes(merged_id),
+    image_id         BIGINT NOT NULL REFERENCES images(image_id),
     service          VARCHAR(255) NOT NULL,
     data             JSONB,
     status           VARCHAR(20) NOT NULL,
@@ -194,13 +197,13 @@ CREATE INDEX idx_content_analysis_created ON content_analysis(created);
 CREATE TABLE IF NOT EXISTS noun_consensus (
     noun_consensus_id  BIGSERIAL PRIMARY KEY,
     image_id           BIGINT NOT NULL REFERENCES images(image_id),
-    nouns              JSONB NOT NULL DEFAULT '[]',   -- collapsed noun objects with sam3_validated flags
-    category_tally     JSONB NOT NULL DEFAULT '[]',   -- [{category, vote_count, services, nouns:[...]}]
+    nouns              JSONB NOT NULL,                -- collapsed noun objects with sam3_validated flags
     services_present   TEXT[] NOT NULL DEFAULT '{}',
     service_count      INTEGER NOT NULL DEFAULT 0,
-    processing_time    DOUBLE PRECISION,
     created_at         TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
     updated_at         TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+    category_tally     JSONB NOT NULL DEFAULT '[]',   -- [{category, vote_count, services, nouns:[...]}]
+    processing_time    DOUBLE PRECISION,
     CONSTRAINT noun_consensus_image_id_unique UNIQUE (image_id)
 );
 
@@ -305,6 +308,63 @@ CREATE INDEX IF NOT EXISTS idx_service_dispatch_pending_image_service_nullcluste
 CREATE INDEX IF NOT EXISTS idx_service_dispatch_pending_image_service_cluster
     ON service_dispatch(image_id, service, cluster_id)
     WHERE status = 'pending';
+
+
+-- ---------------------------------------------------------------------------
+-- SSE LISTEN/NOTIFY triggers
+-- ---------------------------------------------------------------------------
+
+-- These triggers fire pg_notify('ice9_result', image_id) whenever a result row
+-- is written, allowing stream consumers to wake up immediately rather than
+-- relying on polling alone.
+
+CREATE OR REPLACE FUNCTION notify_result_change()
+RETURNS TRIGGER AS $$
+BEGIN
+    PERFORM pg_notify('ice9_result', NEW.image_id::text);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS results_notify ON results;
+CREATE TRIGGER results_notify
+    AFTER INSERT ON results
+    FOR EACH ROW EXECUTE FUNCTION notify_result_change();
+
+DROP TRIGGER IF EXISTS content_analysis_notify ON content_analysis;
+CREATE TRIGGER content_analysis_notify
+    AFTER INSERT OR UPDATE ON content_analysis
+    FOR EACH ROW EXECUTE FUNCTION notify_result_change();
+
+DROP TRIGGER IF EXISTS noun_consensus_notify ON noun_consensus;
+CREATE TRIGGER noun_consensus_notify
+    AFTER INSERT OR UPDATE ON noun_consensus
+    FOR EACH ROW EXECUTE FUNCTION notify_result_change();
+
+DROP TRIGGER IF EXISTS verb_consensus_notify ON verb_consensus;
+CREATE TRIGGER verb_consensus_notify
+    AFTER INSERT OR UPDATE ON verb_consensus
+    FOR EACH ROW EXECUTE FUNCTION notify_result_change();
+
+DROP TRIGGER IF EXISTS caption_summary_notify ON caption_summary;
+CREATE TRIGGER caption_summary_notify
+    AFTER INSERT OR UPDATE ON caption_summary
+    FOR EACH ROW EXECUTE FUNCTION notify_result_change();
+
+DROP TRIGGER IF EXISTS merged_boxes_notify ON merged_boxes;
+CREATE TRIGGER merged_boxes_notify
+    AFTER INSERT ON merged_boxes
+    FOR EACH ROW EXECUTE FUNCTION notify_result_change();
+
+DROP TRIGGER IF EXISTS postprocessing_notify ON postprocessing;
+CREATE TRIGGER postprocessing_notify
+    AFTER INSERT ON postprocessing
+    FOR EACH ROW EXECUTE FUNCTION notify_result_change();
+
+DROP TRIGGER IF EXISTS rembg_results_notify ON rembg_results;
+CREATE TRIGGER rembg_results_notify
+    AFTER INSERT OR UPDATE ON rembg_results
+    FOR EACH ROW EXECUTE FUNCTION notify_result_change();
 
 
 -- ---------------------------------------------------------------------------

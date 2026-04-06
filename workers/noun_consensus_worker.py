@@ -474,10 +474,10 @@ class NounConsensusWorker(BaseWorker):
             cursor.execute(
                 """
                 WITH inserted_results AS (
-                    INSERT INTO results (image_id, service, data, status, worker_id, processing_time)
+                    INSERT INTO results (image_id, service, data, status, http_status, worker_id, processing_time)
                     VALUES
-                        (%s, %s, %s, %s, %s, %s),
-                        (%s, %s, %s, %s, %s, %s)
+                        (%s, %s, %s, %s, %s, %s, %s),
+                        (%s, %s, %s, %s, %s, %s, %s)
                     RETURNING 1
                 )
                 INSERT INTO service_events (
@@ -488,8 +488,8 @@ class NounConsensusWorker(BaseWorker):
                     (%s, %s, %s, %s, %s, %s)
                 """,
                 (
-                    image_id, 'noun_consensus', json.dumps(noun_payload), noun_payload.get('status', 'success') or 'success', self.worker_id, processing_time,
-                    image_id, 'verb_consensus', json.dumps(verb_payload), verb_payload.get('status', 'success') or 'success', self.worker_id, processing_time,
+                    image_id, 'noun_consensus', json.dumps(noun_payload), noun_payload.get('status', 'success') or 'success', self._extract_http_status(noun_payload), self.worker_id, processing_time,
+                    image_id, 'verb_consensus', json.dumps(verb_payload), verb_payload.get('status', 'success') or 'success', self._extract_http_status(verb_payload), self.worker_id, processing_time,
                     image_id, 'noun_consensus', 'completed', source_service, 'noun_consensus_run',
                     json.dumps({'services_present': noun_payload.get('services_present') or []}),
                     image_id, 'verb_consensus', 'completed', source_service, 'verb_consensus_run',
@@ -786,9 +786,9 @@ class NounConsensusWorker(BaseWorker):
                 """
                 WITH inserted_result AS (
                     INSERT INTO results (
-                        image_id, service, data, status, worker_id, processing_time
+                        image_id, service, data, status, http_status, worker_id, processing_time
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     RETURNING 1
                 )
                 INSERT INTO service_events (
@@ -801,6 +801,7 @@ class NounConsensusWorker(BaseWorker):
                     'noun_consensus',
                     json.dumps(payload),
                     payload.get('status', 'success') or 'success',
+                    self._extract_http_status(payload),
                     self.worker_id,
                     processing_time,
                     image_id,

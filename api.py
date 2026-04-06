@@ -381,29 +381,27 @@ def status(image_id):
 
         # Per-service completion status
         cur.execute(
-            """SELECT service, status, result_created, processing_time
+            """SELECT service, status, http_status, data, result_created, processing_time
                FROM results WHERE image_id = %s
                ORDER BY result_created""",
             (image_id,),
         )
         completed = {}
         for r in cur.fetchall():
+            data = r['data'] if isinstance(r['data'], dict) else {}
             completed[r['service']] = {
                 "status":          r['status'],
+                "http_status":     r['http_status'],
+                "error_message":   data.get('error_message') or data.get('error') or data.get('message'),
                 "result_created":  r['result_created'].isoformat() if r['result_created'] else None,
                 "processing_time": r['processing_time'],
             }
-
-        services_pending = [s for s in services_submitted if s not in completed]
-        total = len(services_submitted) if services_submitted else 0
-        done  = len(completed)
 
         results_data = fetch_results(cur, image_id)
 
         vlm_short_names = {k.split('.', 1)[1] for k in config.get_services_by_type('vlm')}
         vlm_services = [s for s in services_submitted if s in vlm_short_names]
 
-        primary_complete     = done == total and total > 0
         # Aggregate results (consensus, noun_consensus, etc.) live in
         # service_results after the fetch_results reshape — check both locations.
         _sr = results_data.get('service_results', {})
@@ -433,14 +431,7 @@ def status(image_id):
             for service, data in _sr.items()
             if (data.get('status') or 'success') != 'success'
         }
-        submitted_result_services = {
-            service for service in _sr.keys()
-            if service in services_submitted
-        }
         services_pending = sorted({
-            service for service in services_submitted
-            if service not in submitted_result_services
-        } | {
             row.get('service') for row in _current_sd
             if row.get('service') in services_submitted and row.get('status') == 'pending'
         })
@@ -456,6 +447,28 @@ def status(image_id):
                 if row.get('service') in services_submitted and row.get('status') in _failed_states
             },
         }
+        services_failed_details = {
+            service: {
+                'status': data.get('status'),
+                'http_status': data.get('http_status'),
+                'reason': (
+                    (data.get('data') or {}).get('error_message')
+                    or (data.get('data') or {}).get('error')
+                    or (data.get('data') or {}).get('message')
+                ),
+                'result_created': data.get('result_created'),
+            }
+            for service, data in _sr.items()
+            if service in services_submitted and (data.get('status') or 'success') != 'success'
+        }
+        for row in _current_sd:
+            if row.get('service') in services_submitted and row.get('status') in _failed_states:
+                services_failed_details.setdefault(row.get('service'), {
+                    'status': row.get('status'),
+                    'http_status': None,
+                    'reason': row.get('failed_reason'),
+                    'result_created': None,
+                })
         downstream_pending = sorted({
             row.get('service') for row in _current_sd
             if row.get('service') not in services_submitted and row.get('status') == 'pending'
@@ -479,6 +492,28 @@ def status(image_id):
             row.get('service') for row in _current_pp
             if row.get('event_type') == 'failed'
         })
+        downstream_failed_details = {
+            service: {
+                'status': data.get('status'),
+                'http_status': data.get('http_status'),
+                'reason': (
+                    (data.get('data') or {}).get('error_message')
+                    or (data.get('data') or {}).get('error')
+                    or (data.get('data') or {}).get('message')
+                ),
+                'result_created': data.get('result_created'),
+            }
+            for service, data in _sr.items()
+            if service not in services_submitted and (data.get('status') or 'success') != 'success'
+        }
+        for row in _current_sd:
+            if row.get('service') not in services_submitted and row.get('status') in _failed_states:
+                downstream_failed_details.setdefault(row.get('service'), {
+                    'status': row.get('status'),
+                    'http_status': None,
+                    'reason': row.get('failed_reason'),
+                    'result_created': None,
+                })
 
         service_events_pending = [
             row for row in _current_se
@@ -497,12 +532,26 @@ def status(image_id):
             if row.get('event_type') == 'failed'
         ]
 
+        dispatches_total = len(_sd)
+        dispatches_settled = len(dispatches_terminal)
+        primary_dispatches = [
+            row for row in _sd
+            if row.get('service') in services_submitted
+        ]
+        primary_dispatches_pending = [
+            row for row in primary_dispatches
+            if row.get('status') == 'pending'
+        ]
+        primary_complete = (
+            len(primary_dispatches) > 0 and len(primary_dispatches_pending) == 0
+        )
         is_complete = (
-            len(_sd) > 0
-            and len(dispatches_pending) == 0
+            dispatches_total > 0
+            and dispatches_settled == dispatches_total
             and len(service_events_pending) == 0
             and len(postprocessing_pending) == 0
         )
+        progress = f"{dispatches_settled}/{dispatches_total}" if dispatches_total > 0 else "0/0"
 
         return jsonify({
             "image_id":               image_id,
@@ -518,13 +567,15 @@ def status(image_id):
             "services_completed":     completed,
             "services_pending":       services_pending,
             "services_failed":        services_failed,
-            "progress":               f"{done}/{total}",
+            "services_failed_details": services_failed_details,
+            "progress":               progress,
             "is_complete":            is_complete,
             "primary_complete":       primary_complete,
             "downstream_pending":     downstream_pending,
             "downstream_failed":      downstream_failed,
-            "dispatches_total":       len(_sd),
-            "dispatches_terminal":    len(dispatches_terminal),
+            "downstream_failed_details": downstream_failed_details,
+            "dispatches_total":       dispatches_total,
+            "dispatches_terminal":    dispatches_settled,
             "dispatches_pending":     dispatches_pending,
             "dispatches_failed":      dispatches_failed,
             "postprocessing_events_total": len(results_data.get('postprocessing_events', [])),

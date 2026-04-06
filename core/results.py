@@ -26,7 +26,7 @@ def fetch_results(cur, image_id):
     """
     # Service results
     cur.execute(
-        """SELECT service, data, status, processing_time, result_created
+        """SELECT service, data, status, http_status, processing_time, result_created
            FROM results WHERE image_id = %s
            ORDER BY result_created""",
         (image_id,),
@@ -36,6 +36,7 @@ def fetch_results(cur, image_id):
         service_results[r['service']] = {
             "data":            r['data'],
             "status":          r['status'],
+            "http_status":     r['http_status'],
             "processing_time": r['processing_time'],
             "result_created":  r['result_created'].isoformat() if r['result_created'] else None,
         }

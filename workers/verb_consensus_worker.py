@@ -270,9 +270,9 @@ class VerbConsensusWorker(BaseWorker):
                 """
                 WITH inserted_result AS (
                     INSERT INTO results (
-                        image_id, service, data, status, worker_id, processing_time
+                        image_id, service, data, status, http_status, worker_id, processing_time
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     RETURNING 1
                 )
                 INSERT INTO service_events (
@@ -285,6 +285,7 @@ class VerbConsensusWorker(BaseWorker):
                     'verb_consensus',
                     json.dumps(payload),
                     payload.get('status', 'success') or 'success',
+                    self._extract_http_status(payload),
                     self.worker_id,
                     processing_time,
                     image_id,
