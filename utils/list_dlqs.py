@@ -23,7 +23,7 @@ def list_queues(channel):
     else:
         # Minimal set; users can set QUEUE_CATALOG for completeness.
         names = [
-            'queue_harmony', 'consensus',
+            'queue_harmony',
             'blip', 'clip', 'colors', 'detectron', 'metadata', 'ocr', 'nsfw', 'ollama', 'rtdetr', 'yolo_v8', 'yolo_365', 'yolo_oi7',
             'colors_post', 'face', 'pose'
         ]
@@ -75,5 +75,4 @@ def main() -> int:
 
 if __name__ == '__main__':
     sys.exit(main())
-
 

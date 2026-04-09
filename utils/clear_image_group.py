@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Clear all processing results for a specific image group.
-This deletes results, merged_boxes, consensus, and postprocessing for the group,
+This deletes results, merged_boxes, and postprocessing for the group,
 but keeps the images in the images table so they can be reprocessed.
 
 Usage:
@@ -62,14 +62,6 @@ def clear_image_group(image_group):
 
     cursor.execute("""
         SELECT COUNT(*)
-        FROM consensus c
-        JOIN images i ON c.image_id = i.image_id
-        WHERE i.image_group = %s
-    """, (image_group,))
-    consensus_count = cursor.fetchone()[0]
-
-    cursor.execute("""
-        SELECT COUNT(*)
         FROM postprocessing p
         JOIN images i ON p.image_id = i.image_id
         WHERE i.image_group = %s
@@ -79,11 +71,10 @@ def clear_image_group(image_group):
     print(f"Current data for group '{image_group}':")
     print(f"  Results: {results_count:,}")
     print(f"  Merged boxes: {merged_boxes_count:,}")
-    print(f"  Consensus: {consensus_count:,}")
     print(f"  Postprocessing: {postprocessing_count:,}")
     print()
 
-    if results_count == 0 and merged_boxes_count == 0 and consensus_count == 0 and postprocessing_count == 0:
+    if results_count == 0 and merged_boxes_count == 0 and postprocessing_count == 0:
         print("✅ No data to clear - group is already clean")
         cursor.close()
         conn.close()
@@ -101,7 +92,7 @@ def clear_image_group(image_group):
     print("🗑️  Clearing data...")
 
     # Delete in order respecting foreign keys
-    # postprocessing -> consensus -> merged_boxes -> results
+    # postprocessing -> merged_boxes -> results
 
     if postprocessing_count > 0:
         cursor.execute("""
@@ -112,16 +103,6 @@ def clear_image_group(image_group):
         """, (image_group,))
         deleted = cursor.rowcount
         print(f"  ✅ Deleted {deleted:,} postprocessing records")
-
-    if consensus_count > 0:
-        cursor.execute("""
-            DELETE FROM consensus c
-            USING images i
-            WHERE c.image_id = i.image_id
-            AND i.image_group = %s
-        """, (image_group,))
-        deleted = cursor.rowcount
-        print(f"  ✅ Deleted {deleted:,} consensus records")
 
     if merged_boxes_count > 0:
         cursor.execute("""
