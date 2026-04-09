@@ -19,7 +19,7 @@ import requests
 import yaml
 import re
 from PIL import Image
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from service_config import get_service_config
 
@@ -807,7 +807,7 @@ class BaseWorker:
         tier = message.get('tier', 'free')
         t0 = time.time()
         is_latest, current_count, expected_count, latest_service = (
-            self._is_latest_vlm_success_for_tier(
+            self._is_latest_vlm_terminal_for_tier(
                 image_id, tier, self._get_clean_service_name()
             )
         )
@@ -941,12 +941,13 @@ class BaseWorker:
             )
             return False, 0, 0
 
-    def _is_latest_vlm_success_for_tier(self, image_id, tier, current_service):
-        """Return whether the current service is the latest successful VLM result.
+    def _is_latest_vlm_terminal_for_tier(self, image_id, tier, current_service):
+        """Return whether the current service is the latest terminal VLM result.
 
-        This is stricter than mere completeness. It prevents multiple late VLMs
-        from all triggering the same final consensus work after they each observe
-        a complete set.
+        Terminal means a VLM has settled to either success or failed. This is
+        stricter than mere completeness. It prevents multiple late VLMs from
+        all triggering the same final consensus work after they each observe a
+        fully settled tier set.
         """
         try:
             vlm_services = self._tier_vlm_service_names(tier)
@@ -962,7 +963,7 @@ class BaseWorker:
                     FROM results
                     WHERE image_id = %s
                       AND service = ANY(%s::text[])
-                      AND status = 'success'
+                      AND status IN ('success', 'failed')
                 )
                 SELECT
                     (SELECT COUNT(DISTINCT service) FROM scoped) AS current_count,
@@ -982,7 +983,7 @@ class BaseWorker:
             return is_latest, current_count, expected_count, latest_service
         except Exception as e:
             self.logger.warning(
-                f"Failed latest-VLM check for image {image_id} tier={tier}: {e}"
+                f"Failed latest terminal VLM check for image {image_id} tier={tier}: {e}"
             )
             return False, 0, 0, None
 
@@ -1591,6 +1592,7 @@ class BaseWorker:
             request_started_at = time.time()
             result = self.post_image_bytes(image_bytes)
             request_duration = time.time() - request_started_at
+            request_completed_at = time.time()
             if not isinstance(result, dict):
                 self.logger.error(
                     f"{self.service_name} returned no terminal JSON result for image {image_id}"
@@ -1613,6 +1615,39 @@ class BaseWorker:
                 result.get('metadata') or {}
             ).get('processing_time')
             source_trace_id = trace_id if trace_id else None
+            service_name = self._get_clean_service_name()
+            lifecycle_source_service = message.get('service') or service_name
+
+            def _iso_utc(epoch_seconds):
+                return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).isoformat()
+
+            received_event_data = json.dumps({
+                'event_at': _iso_utc(worker_received_at),
+                'trace_id': trace_id,
+                'worker_id': self.worker_id,
+                'submitted_at': submitted_at,
+                'submitted_at_epoch': submitted_at_epoch,
+                'upstream_queue_wait_seconds': round(upstream_queue_wait, 6) if upstream_queue_wait is not None else None,
+                'image_fetch_duration_seconds': round(image_fetch_duration, 6),
+            })
+            started_event_data = json.dumps({
+                'event_at': _iso_utc(request_started_at),
+                'trace_id': trace_id,
+                'worker_id': self.worker_id,
+                'image_fetch_duration_seconds': round(image_fetch_duration, 6),
+            })
+            terminal_event_data = json.dumps({
+                'event_at': _iso_utc(request_completed_at),
+                'trace_id': trace_id,
+                'worker_id': self.worker_id,
+                'request_duration_seconds': round(request_duration, 6),
+                'image_fetch_duration_seconds': round(image_fetch_duration, 6),
+                'upstream_queue_wait_seconds': round(upstream_queue_wait, 6) if upstream_queue_wait is not None else None,
+                'http_status': self._extract_http_status(result),
+                'result_status': result_status,
+                'processing_time_seconds': processing_time,
+                'failed_reason': failed_reason,
+            })
             persist_started_at = time.time()
             cursor = self.db_conn.cursor()
             cursor.execute("""
@@ -1632,17 +1667,37 @@ class BaseWorker:
                     SELECT %s
                     WHERE %s IS NOT NULL
                       AND NOT EXISTS (SELECT 1 FROM upserted)
+                ),
+                updated_dispatch AS (
+                    UPDATE service_dispatch
+                       SET status = %s,
+                           failed_reason = %s
+                     WHERE image_id = (SELECT image_id FROM touched LIMIT 1)
+                       AND service = %s
+                       AND cluster_id IS NULL
+                       AND status = 'pending'
+                    RETURNING image_id
                 )
-                UPDATE service_dispatch
-                   SET status = %s,
-                       failed_reason = %s
-                 WHERE image_id = (SELECT image_id FROM touched LIMIT 1)
-                   AND service = %s
-                   AND cluster_id IS NULL
-                   AND status = 'pending'
+                INSERT INTO service_events (
+                    image_id, service, event_type, source_service, source_stage, data
+                )
+                SELECT
+                    upserted.image_id,
+                    %s,
+                    event_rows.event_type,
+                    %s,
+                    event_rows.source_stage,
+                    event_rows.data::jsonb
+                FROM upserted
+                CROSS JOIN (
+                    VALUES
+                        (%s, %s, %s),
+                        (%s, %s, %s),
+                        (%s, %s, %s)
+                ) AS event_rows(event_type, source_stage, data)
             """, (
                 image_id,
-                self._get_clean_service_name(),
+                service_name,
                 source_trace_id,
                 json.dumps(result),
                 result_status,
@@ -1653,7 +1708,18 @@ class BaseWorker:
                 source_trace_id,
                 'complete' if result_status == 'success' else 'failed',
                 None if result_status == 'success' else failed_reason,
-                self._get_clean_service_name(),
+                service_name,
+                service_name,
+                lifecycle_source_service,
+                'received',
+                'queue_consume',
+                received_event_data,
+                'started',
+                'service_request_started',
+                started_event_data,
+                'completed' if result_status == 'success' else 'failed',
+                'service_request_finished',
+                terminal_event_data,
             ))
             commit_if_needed(self.db_conn, force=True)
             persist_duration = time.time() - persist_started_at
@@ -1665,57 +1731,40 @@ class BaseWorker:
                     f"(status={result_status})"
                 )
 
-            if result_status != 'success':
-                self._safe_ack(ch, method.delivery_tag)
-                self.job_completed_successfully()
+            terminal_non_success = result_status != 'success'
+            if terminal_non_success:
                 self.logger.warning(
                     f"{self.service_name} returned terminal non-success for image {image_id}: "
                     f"{failed_reason or 'no reason provided'}"
                 )
-                timing = [
-                    f"{self.service_name} image={image_id}",
-                    f"parse={parse_duration:.3f}s",
-                    f"fetch={image_fetch_duration:.3f}s",
-                    f"request={request_duration:.3f}s",
-                    f"persist={persist_duration:.3f}s",
-                    (
-                        f"service_processing_time={processing_time:.3f}s"
-                        if processing_time is not None else
-                        "service_processing_time=None"
-                    ),
-                    f"total={time.time() - callback_started_at:.3f}s",
-                    "status=failed",
-                ]
-                if upstream_queue_wait is not None:
-                    timing.insert(1, f"from_submit={upstream_queue_wait:.3f}s")
-                self.logger.info(" ".join(timing))
-                return
 
             # In-place extrapolation hook: subclasses derive additional data
             # from the same result without a separate queue/worker
             poststore_started_at = time.time()
-            self.after_result_stored(image_id, result, message)
+            if not terminal_non_success:
+                self.after_result_stored(image_id, result, message)
 
             tier = message.get('tier', 'free')
             downstream_messages = []
-            postprocessing_messages = self._build_postprocessing_messages(
-                image_id=image_id,
-                message=message,
-                result=result,
-                tier=tier,
-                trace_id=trace_id,
-            )
+            if not terminal_non_success:
+                postprocessing_messages = self._build_postprocessing_messages(
+                    image_id=image_id,
+                    message=message,
+                    result=result,
+                    tier=tier,
+                    trace_id=trace_id,
+                )
 
-            if postprocessing_messages:
-                downstream_messages.extend(postprocessing_messages)
-                if trace_id:
-                    self.logger.info(
-                        f"[{trace_id}] queueing direct postprocessing from {self.service_name} for image {image_id}"
-                    )
+                if postprocessing_messages:
+                    downstream_messages.extend(postprocessing_messages)
+                    if trace_id:
+                        self.logger.info(
+                            f"[{trace_id}] queueing direct postprocessing from {self.service_name} for image {image_id}"
+                        )
 
             latest_check_started_at = time.time()
             vlm_tail_ready, current_vlm_count, expected_vlm_count, latest_vlm_service = (
-                self._is_latest_vlm_success_for_tier(
+                self._is_latest_vlm_terminal_for_tier(
                     image_id, tier, self._get_clean_service_name()
                 )
             )
