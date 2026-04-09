@@ -67,7 +67,9 @@ fi
 
 if [ -n "$QUEUE_HOST" ] && [ -n "$QUEUE_USER" ] && [ -n "$QUEUE_PASSWORD" ] && [ -f "$SCRIPT_DIR/utils/predeclare_queues.py" ]; then
   echo "Predeclaring RabbitMQ queues from service_config.yaml..."
-  "$SCRIPT_DIR/windmill_venv/bin/python" "$SCRIPT_DIR/utils/predeclare_queues.py"
+  if ! "$SCRIPT_DIR/windmill_venv/bin/python" "$SCRIPT_DIR/utils/predeclare_queues.py"; then
+    echo "WARNING: queue predeclaration failed; core install completed but RabbitMQ bootstrap was skipped."
+  fi
 else
   echo "Skipping queue predeclaration."
   echo "Requires QUEUE_HOST/QUEUE_USER/QUEUE_PASSWORD and utils/predeclare_queues.py."
