@@ -16,6 +16,7 @@ import sys
 import json
 import time
 import logging
+import subprocess
 from contextlib import contextmanager
 import psycopg2
 import pika
@@ -28,7 +29,7 @@ from core.postgres_connection import close_quietly, commit_if_needed, rollback_q
 from service_config import get_service_config
 from noun_utils import collapse_synonyms, warmup_wordnet, load_conceptnet, load_mwe, apply_mwe_normalization
 from noun_extractor import extract_nouns, categorize_nouns, extract_subject, extract_nouns_and_subject, warmup_noun_extractor
-from verb_utils import collapse_synonyms as collapse_verb_synonyms
+from verb_utils import collapse_synonyms as collapse_verb_synonyms, warmup_wordnet as warmup_verb_wordnet
 from verb_extractor import extract_verbs_and_svo, warmup_verb_extractor
 
 logger = logging.getLogger(__name__)
@@ -46,12 +47,63 @@ class NounConsensusWorker(BaseWorker):
 
     def __init__(self):
         super().__init__('system.noun_consensus')
-        warmup_wordnet()         # Load WordNet corpus
-        warmup_noun_extractor()  # Load spaCy en_core_web_lg
-        warmup_verb_extractor()  # Load spaCy en_core_web_lg
+        self._ensure_wordnet()
+        self._ensure_spacy_model()
         load_mwe()
         if self.connect_to_database():
             load_conceptnet(self.db_conn)
+
+    def _ensure_wordnet(self):
+        """Ensure WordNet exists before the worker starts."""
+        if warmup_wordnet() and warmup_verb_wordnet():
+            return
+
+        self.logger.warning(
+            "noun_consensus: WordNet unavailable at startup; attempting "
+            "automatic nltk download of wordnet"
+        )
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "nltk.downloader", "wordnet"],
+                check=True,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                "noun_consensus requires NLTK WordNet and the automatic "
+                f"download failed: {e}"
+            ) from e
+
+        if not (warmup_wordnet() and warmup_verb_wordnet()):
+            raise RuntimeError(
+                "noun_consensus requires NLTK WordNet, but it is still "
+                "unavailable after the automatic download attempt"
+            )
+
+    def _ensure_spacy_model(self):
+        """Ensure the shared spaCy model exists before the worker starts."""
+        if warmup_noun_extractor() and warmup_verb_extractor():
+            return
+
+        self.logger.warning(
+            "noun_consensus: spaCy model unavailable at startup; attempting "
+            "automatic download of en_core_web_lg"
+        )
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "spacy", "download", "en_core_web_lg"],
+                check=True,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                "noun_consensus requires spaCy model en_core_web_lg and the "
+                f"automatic download failed: {e}"
+            ) from e
+
+        if not (warmup_noun_extractor() and warmup_verb_extractor()):
+            raise RuntimeError(
+                "noun_consensus requires spaCy model en_core_web_lg, but it is "
+                "still unavailable after the automatic download attempt"
+            )
 
     def connect_to_database(self):
         """Connect with autocommit disabled so this worker can batch writes."""
@@ -576,6 +628,7 @@ class NounConsensusWorker(BaseWorker):
         service_subject_map = {}
         service_verb_map = {}
         service_svo_map = {}
+        cursor = None
         try:
             cursor = self.db_conn.cursor()
             cursor.execute(
@@ -590,10 +643,19 @@ class NounConsensusWorker(BaseWorker):
                 (image_id, VLM_SERVICES)
             )
             rows = cursor.fetchall()
-            cursor.close()
+        except Exception as e:
+            self.logger.error(f"noun_consensus: DB fetch error for image {image_id}: {e}")
+            raise
+        finally:
+            close_quietly(cursor)
 
-            for service, data in rows:
+        for service, data in rows:
+            try:
                 if not isinstance(data, dict):
+                    self.logger.warning(
+                        f"noun_consensus: skipping non-dict result payload "
+                        f"for image {image_id} service={service}: {type(data).__name__}"
+                    )
                     continue
                 # Skip blocked results — their sentinel text (e.g. "[NSFW — not sent to
                 # Gemini API]") is not a caption and would produce garbage nouns.
@@ -613,8 +675,11 @@ class NounConsensusWorker(BaseWorker):
                     service_verb_map[service] = verbs
                     service_svo_map[service] = svo_triples
                 service_subject_map[service] = subject
-        except Exception as e:
-            self.logger.error(f"noun_consensus: DB fetch error for image {image_id}: {e}")
+            except Exception as e:
+                self.logger.error(
+                    f"noun_consensus: feature extraction failed for image {image_id} "
+                    f"service={service}: {e}"
+                )
 
         return (
             service_noun_map,

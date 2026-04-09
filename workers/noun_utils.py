@@ -84,6 +84,7 @@ def load_mwe() -> int:
             response.raise_for_status()
             mwe_text = response.text.splitlines()
             try:
+                os.makedirs(os.path.dirname(_MWE_CACHE), exist_ok=True)
                 with open(_MWE_CACHE, 'w') as f:
                     f.write(response.text)
             except Exception as e:

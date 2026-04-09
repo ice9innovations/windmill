@@ -18,7 +18,13 @@ source "$SCRIPT_DIR/windmill_venv/bin/activate"
 pip install --upgrade pip
 pip install -r "$SCRIPT_DIR/requirements.txt"
 
-"$SCRIPT_DIR/windmill_venv/bin/python" -c "import nltk; nltk.download('punkt')"
+mkdir -p "$SCRIPT_DIR/config"
+
+echo "Installing NLTK corpora required by consensus workers..."
+"$SCRIPT_DIR/windmill_venv/bin/python" -m nltk.downloader punkt wordnet
+
+echo "Installing spaCy model required by consensus workers..."
+"$SCRIPT_DIR/windmill_venv/bin/python" -m spacy download en_core_web_lg
 
 if [ -f "$SCRIPT_DIR/.env" ]; then
   set +e
