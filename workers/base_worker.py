@@ -169,9 +169,9 @@ class BaseWorker:
         self.is_vlm = self.config.is_vlm_service(self.service_name)
         # Enable direct bbox postprocessing triggers for spatial services
         self.enable_triggers = self.is_spatial
-        # Enable noun and verb consensus for VLM services
+        # Enable noun consensus for VLM services. noun_consensus also persists
+        # the derived verb_consensus artifact.
         self.enable_noun_consensus = self.is_vlm
-        self.enable_verb_consensus = self.is_vlm
 
         # Performance configuration
         self.processing_delay = float(os.getenv('PROCESSING_DELAY', '0.0'))
@@ -427,8 +427,6 @@ class BaseWorker:
 
         if self.enable_noun_consensus:
             add_queue(self._get_queue_by_service_type('noun_consensus'))
-        if self.enable_verb_consensus:
-            add_queue(self._get_queue_by_service_type('verb_consensus'))
         if self.config.is_available_for_tier('system.postprocessing_orchestrator', 'free') \
                 or self.config.is_available_for_tier('system.postprocessing_orchestrator', 'paid') \
                 or self.config.is_available_for_tier('system.postprocessing_orchestrator', 'pro'):
@@ -462,8 +460,6 @@ class BaseWorker:
 
         if self.enable_noun_consensus:
             declare_shared_queue(self._sync_publish_channel, self._get_queue_by_service_type('noun_consensus'))
-        if self.enable_verb_consensus:
-            declare_shared_queue(self._sync_publish_channel, self._get_queue_by_service_type('verb_consensus'))
         self._declare_additional_queues(declare_shared_queue)
 
     def _publish_messages_sync_confirm(self, messages):
@@ -898,10 +894,6 @@ class BaseWorker:
         )
 
         self.logger.debug(f"Enqueued noun_consensus trigger for {self.service_name} image {image_id}")
-
-    def trigger_verb_consensus(self, image_id, message):
-        """Compatibility no-op: noun_consensus now produces verb consensus too."""
-        return
 
     def _tier_vlm_service_names(self, tier):
         """Return clean VLM primary service names configured for the tier."""

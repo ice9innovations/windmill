@@ -72,7 +72,6 @@ all:
             - registry_sweeper_worker
             - rembg_worker
             - sam3_worker
-            - verb_consensus_worker
 
     # All compute nodes
     windmill_workers:

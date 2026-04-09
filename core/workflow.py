@@ -35,8 +35,9 @@ WORKFLOW_STAGES = {
         'expected_when': ['has_vlm'],
         'triggered_by': [
             {
-                'source': 'primary.vlm',
-                'worker': 'workers/base_worker.py',
+                'source': 'system.noun_consensus',
+                'worker': 'workers/noun_consensus_worker.py',
+                'note': 'derived and persisted inside noun_consensus_worker; no dedicated verb_consensus worker',
             }
         ],
     },

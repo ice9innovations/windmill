@@ -29,9 +29,9 @@ Submit image
             │       └─→ [colors_post] [face] [pose]   ← postprocessing on each bbox
             │
             └─→ noun_consensus_worker → noun_consensus
+                    ├─→ verb_consensus
                     ├─→ florence2_grounding_worker → florence2_grounding
                     ├─→ sam3_worker → sam3_results
-                    ├─→ verb_consensus_worker → verb_consensus
                     └─→ caption_summary_worker → caption_summary
                                                     └─→ content_analysis_worker → content_analysis
 ```
@@ -388,7 +388,7 @@ Workers are stateless — any machine with `.env` credentials and a `*_worker.py
 ./windmill.sh start yolo_v8_worker harmony_worker face_worker pose_worker
 
 # Machine C: system workers
-./windmill.sh start noun_consensus_worker verb_consensus_worker caption_summary_worker
+./windmill.sh start noun_consensus_worker caption_summary_worker
 ```
 
 ---
@@ -405,8 +405,7 @@ workers/
   base_worker.py          BaseWorker — shared queue/DB/HTTP plumbing
   service_config.py       ServiceConfig class, get_service_config()
   harmony_worker.py       IoU clustering and postprocessing dispatch
-  noun_consensus_worker.py Noun extraction, category tally
-  verb_consensus_worker.py Verb/SVO extraction
+  noun_consensus_worker.py Noun extraction, verb/SVO extraction, category tally
   noun_extractor.py       spaCy-based noun/verb extraction
   noun_utils.py           ConceptNet synonym collapse
   caption_summary_worker.py LLM caption synthesis

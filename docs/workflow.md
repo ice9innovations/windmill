@@ -10,7 +10,7 @@ The runtime sources of truth remain:
 
 - [core/dispatch.py](/home/sd/windmill/core/dispatch.py) for expected downstream computation
 - [workers/base_worker.py](/home/sd/windmill/workers/base_worker.py) for primary downstream triggers
-- [workers/noun_consensus_worker.py](/home/sd/windmill/workers/noun_consensus_worker.py) for grounding and caption-summary triggers
+- [workers/noun_consensus_worker.py](/home/sd/windmill/workers/noun_consensus_worker.py) for verb-consensus production, grounding, and caption-summary triggers
 
 ## Primary Submission Contract
 
@@ -41,9 +41,9 @@ flowchart TD
     Spatial --> Pose[pose]
 
     VLM --> Noun[noun_consensus]
-    VLM --> Verb[verb_consensus]
 
     ConsensusEligible --> Consensus
+    Noun --> Verb[verb_consensus]
     Noun --> Grounding[florence2_grounding]
     Noun --> CaptionSummary[caption_summary]
     Grounding --> Sam3[sam3]
@@ -68,6 +68,7 @@ These conditions document what `compute_expected_downstream()` currently models.
 ## Important Nuances
 
 - `system.caption_summary`, etc. are full service identifiers, not names of a separate `system` tier.
+- `verb_consensus` remains a logical downstream artifact, but it is produced inside [workers/noun_consensus_worker.py](/home/sd/windmill/workers/noun_consensus_worker.py) rather than by a dedicated worker.
 - `noun_consensus` now delays `florence2_grounding` until the full tier VLM set has reported.
 - `caption_summary` is also delayed until the full tier VLM set has reported.
 - `content_analysis` is likewise delayed until the full tier VLM set has reported.

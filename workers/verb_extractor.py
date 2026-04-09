@@ -2,7 +2,7 @@
 """
 Verb Extractor - spaCy-based verb and SVO triple extraction from VLM captions.
 
-Used by verb_consensus_worker to extract verbs and SVO triples from raw captions
+Used by noun_consensus_worker to extract verbs and SVO triples from raw captions
 stored in the results table. Parallel to noun_extractor.py — extraction runs in
 the windmill layer, not in individual VLM services.
 

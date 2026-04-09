@@ -140,9 +140,8 @@ class GptNanoWorker(BaseWorker):
         )
 
     def _fire_downstream(self, image_id, message):
-        """Trigger noun_consensus and verb_consensus so the pipeline doesn't stall."""
+        """Trigger noun_consensus, which also produces verb_consensus."""
         self.trigger_noun_consensus(image_id, message)
-        self.trigger_verb_consensus(image_id, message)
 
 
 if __name__ == "__main__":

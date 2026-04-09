@@ -247,14 +247,6 @@ services:
         - premium
         - batch
 
-    verb_consensus:
-      queue_name: verb_consensus
-      service_type: verb_consensus
-      tier:
-        - basic
-        - premium
-        - batch
-
     postprocessing_orchestrator:
       queue_name: postprocessing_orchestrator
       service_type: postprocessing_orchestrator
