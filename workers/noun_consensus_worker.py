@@ -168,18 +168,15 @@ class NounConsensusWorker(BaseWorker):
             timing['collapse_verbs'] = time.time() - t0
 
             services_present = sorted(service_noun_map.keys())
+            processing_time = round(time.time() - start_time, 3)
             t0 = time.time()
             self._upsert_noun_consensus(
                 image_id, collapsed, services_present,
-                processing_time=round(time.time() - start_time, 3),
+                processing_time=processing_time,
                 category_tally=category_tally,
                 commit=False,
             )
             timing['upsert_noun_consensus'] = time.time() - t0
-
-            t0 = time.time()
-            commit_if_needed(self.db_conn, force=True)
-            timing['commit_consensus_artifact'] = time.time() - t0
 
             t0 = time.time()
             self._upsert_verb_consensus(
@@ -187,14 +184,10 @@ class NounConsensusWorker(BaseWorker):
                 collapsed_verbs,
                 service_svo_map,
                 services_present,
-                processing_time=round(time.time() - start_time, 3),
+                processing_time=processing_time,
                 commit=False,
             )
             timing['upsert_verb_consensus'] = time.time() - t0
-
-            t0 = time.time()
-            commit_if_needed(self.db_conn, force=True)
-            timing['commit_verb_consensus_artifact'] = time.time() - t0
 
             self.logger.info(
                 f"noun_consensus: image {image_id} - "
@@ -274,11 +267,10 @@ class NounConsensusWorker(BaseWorker):
                             sorted_nouns[0]['promoted'] = True
                             self._upsert_noun_consensus(
                                 image_id, collapsed, services_present,
-                                processing_time=round(time.time() - start_time, 3),
+                                processing_time=processing_time,
                                 category_tally=category_tally,
                                 commit=False,
                             )
-                            commit_if_needed(self.db_conn, force=True)
                             t0 = time.time()
                             should_trigger_grounding = self._should_trigger_florence2_grounding(image_id, [top])
                             timing['check_florence2_grounding'] = timing.get('check_florence2_grounding', 0.0) + (time.time() - t0)
@@ -291,17 +283,6 @@ class NounConsensusWorker(BaseWorker):
                                     f"for image {image_id} with noun={top}"
                                 )
                             timing['build_florence2_grounding'] = timing.get('build_florence2_grounding', 0.0) + (time.time() - t0)
-
-            t0 = time.time()
-            self._publish_nouns_ready(
-                image_id=image_id,
-                image_transport=image_transport,
-                tier=tier,
-                services_present=services_present,
-                consensus_nouns=consensus_nouns,
-                subject_noun=subject_noun,
-            )
-            timing['publish_nouns_ready'] = time.time() - t0
 
             t0 = time.time()
             self._persist_terminal_consensus_results(
@@ -328,10 +309,26 @@ class NounConsensusWorker(BaseWorker):
                         'services_present': services_present,
                     },
                 },
-                processing_time=round(time.time() - start_time, 3),
+                processing_time=processing_time,
                 source_service=triggering_service,
+                commit=False,
             )
             timing['persist_completion'] = time.time() - t0
+
+            t0 = time.time()
+            commit_if_needed(self.db_conn, force=True)
+            timing['commit_consensus_transaction'] = time.time() - t0
+
+            t0 = time.time()
+            self._publish_nouns_ready(
+                image_id=image_id,
+                image_transport=image_transport,
+                tier=tier,
+                services_present=services_present,
+                consensus_nouns=consensus_nouns,
+                subject_noun=subject_noun,
+            )
+            timing['publish_nouns_ready'] = time.time() - t0
 
             total_duration = time.time() - start_time
             slow_bits = " ".join(
@@ -468,6 +465,7 @@ class NounConsensusWorker(BaseWorker):
         verb_payload: dict,
         processing_time: float,
         source_service: str,
+        commit: bool = True,
     ):
         try:
             cursor = self.db_conn.cursor()
@@ -496,7 +494,7 @@ class NounConsensusWorker(BaseWorker):
                     json.dumps({'services_present': verb_payload.get('services_present') or []}),
                 ),
             )
-            commit_if_needed(self.db_conn, force=True)
+            commit_if_needed(self.db_conn, force=commit)
             close_quietly(cursor)
         except Exception as e:
             self.logger.error(
