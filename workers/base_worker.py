@@ -1576,6 +1576,7 @@ class BaseWorker:
             fetch_started_at = time.time()
             image_bytes = self.resolve_image_bytes(message)
             image_fetch_duration = time.time() - fetch_started_at
+            image_resolved_at = time.time()
             if image_bytes is None:
                 failure_reason = "image_ref missing, expired, or otherwise unavailable"
                 self._ack_terminal_message_failure(
@@ -1590,9 +1591,11 @@ class BaseWorker:
                 return
 
             request_started_at = time.time()
+            request_sent_at = request_started_at
             result = self.post_image_bytes(image_bytes)
             request_duration = time.time() - request_started_at
             request_completed_at = time.time()
+            response_received_at = request_completed_at
             if not isinstance(result, dict):
                 self.logger.error(
                     f"{self.service_name} returned no terminal JSON result for image {image_id}"
@@ -1635,6 +1638,24 @@ class BaseWorker:
                 'trace_id': trace_id,
                 'worker_id': self.worker_id,
                 'image_fetch_duration_seconds': round(image_fetch_duration, 6),
+            })
+            image_resolved_event_data = json.dumps({
+                'event_at': _iso_utc(image_resolved_at),
+                'trace_id': trace_id,
+                'worker_id': self.worker_id,
+                'image_fetch_duration_seconds': round(image_fetch_duration, 6),
+            })
+            request_sent_event_data = json.dumps({
+                'event_at': _iso_utc(request_sent_at),
+                'trace_id': trace_id,
+                'worker_id': self.worker_id,
+            })
+            response_received_event_data = json.dumps({
+                'event_at': _iso_utc(response_received_at),
+                'trace_id': trace_id,
+                'worker_id': self.worker_id,
+                'request_duration_seconds': round(request_duration, 6),
+                'http_status': self._extract_http_status(result),
             })
             terminal_event_data = json.dumps({
                 'event_at': _iso_utc(request_completed_at),
@@ -1693,6 +1714,9 @@ class BaseWorker:
                     VALUES
                         (%s, %s, %s),
                         (%s, %s, %s),
+                        (%s, %s, %s),
+                        (%s, %s, %s),
+                        (%s, %s, %s),
                         (%s, %s, %s)
                 ) AS event_rows(event_type, source_stage, data)
             """, (
@@ -1714,9 +1738,18 @@ class BaseWorker:
                 'received',
                 'queue_consume',
                 received_event_data,
+                'image_resolved',
+                'image_transport_resolved',
+                image_resolved_event_data,
                 'started',
                 'service_request_started',
                 started_event_data,
+                'request_sent',
+                'service_request_sent',
+                request_sent_event_data,
+                'response_received',
+                'service_response_received',
+                response_received_event_data,
                 'completed' if result_status == 'success' else 'failed',
                 'service_request_finished',
                 terminal_event_data,
