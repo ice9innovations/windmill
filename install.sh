@@ -21,10 +21,43 @@ pip install -r "$SCRIPT_DIR/requirements.txt"
 mkdir -p "$SCRIPT_DIR/config"
 
 echo "Installing NLTK corpora required by consensus workers..."
-"$SCRIPT_DIR/windmill_venv/bin/python" -m nltk.downloader punkt wordnet
+"$SCRIPT_DIR/windmill_venv/bin/python" - <<'PY'
+import nltk
+from nltk.data import find
+
+required = {
+    "punkt": "tokenizers/punkt",
+    "wordnet": "corpora/wordnet",
+}
+
+missing = []
+for name, path in required.items():
+    try:
+        find(path)
+        print(f"NLTK resource already installed: {name}")
+    except LookupError:
+        missing.append(name)
+
+if missing:
+    print(f"Downloading NLTK resources: {', '.join(missing)}")
+    for name in missing:
+        nltk.download(name)
+else:
+    print("All required NLTK resources already installed.")
+PY
 
 echo "Installing spaCy model required by consensus workers..."
-"$SCRIPT_DIR/windmill_venv/bin/python" -m spacy download en_core_web_lg
+"$SCRIPT_DIR/windmill_venv/bin/python" - <<'PY'
+import importlib.util
+import subprocess
+import sys
+
+if importlib.util.find_spec("en_core_web_lg") is not None:
+    print("spaCy model already installed: en_core_web_lg")
+else:
+    print("Downloading spaCy model: en_core_web_lg")
+    subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_lg"], check=True)
+PY
 
 if [ -f "$SCRIPT_DIR/.env" ]; then
   set +e
@@ -32,12 +65,13 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
   set -e
 fi
 
-if [ -n "$QUEUE_HOST" ] && [ -n "$QUEUE_USER" ] && [ -n "$QUEUE_PASSWORD" ]; then
+if [ -n "$QUEUE_HOST" ] && [ -n "$QUEUE_USER" ] && [ -n "$QUEUE_PASSWORD" ] && [ -f "$SCRIPT_DIR/utils/predeclare_queues.py" ]; then
   echo "Predeclaring RabbitMQ queues from service_config.yaml..."
   "$SCRIPT_DIR/windmill_venv/bin/python" "$SCRIPT_DIR/utils/predeclare_queues.py"
 else
-  echo "Skipping queue predeclaration (QUEUE_HOST/QUEUE_USER/QUEUE_PASSWORD not configured)."
-  echo "After filling in .env, run: $SCRIPT_DIR/windmill_venv/bin/python $SCRIPT_DIR/utils/predeclare_queues.py"
+  echo "Skipping queue predeclaration."
+  echo "Requires QUEUE_HOST/QUEUE_USER/QUEUE_PASSWORD and utils/predeclare_queues.py."
+  echo "When available, run: $SCRIPT_DIR/windmill_venv/bin/python $SCRIPT_DIR/utils/predeclare_queues.py"
 fi
 
 echo "Done. Run ./windmill.sh start to start workers."
