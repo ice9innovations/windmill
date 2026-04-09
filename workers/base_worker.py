@@ -1620,6 +1620,13 @@ class BaseWorker:
             source_trace_id = trace_id if trace_id else None
             service_name = self._get_clean_service_name()
             lifecycle_source_service = message.get('service') or service_name
+            if message.get('image_ref'):
+                image_transport_kind = 'image_ref'
+            elif message.get('image_data'):
+                image_transport_kind = 'inline_image_data'
+            else:
+                image_transport_kind = 'unknown'
+            image_store_mode = getattr(self.image_store_config, 'mode', None)
 
             def _iso_utc(epoch_seconds):
                 return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).isoformat()
@@ -1631,29 +1638,39 @@ class BaseWorker:
                 'submitted_at': submitted_at,
                 'submitted_at_epoch': submitted_at_epoch,
                 'upstream_queue_wait_seconds': round(upstream_queue_wait, 6) if upstream_queue_wait is not None else None,
+                'image_transport_kind': image_transport_kind,
+                'image_store_mode': image_store_mode,
                 'image_fetch_duration_seconds': round(image_fetch_duration, 6),
             })
             started_event_data = json.dumps({
                 'event_at': _iso_utc(request_started_at),
                 'trace_id': trace_id,
                 'worker_id': self.worker_id,
+                'image_transport_kind': image_transport_kind,
+                'image_store_mode': image_store_mode,
                 'image_fetch_duration_seconds': round(image_fetch_duration, 6),
             })
             image_resolved_event_data = json.dumps({
                 'event_at': _iso_utc(image_resolved_at),
                 'trace_id': trace_id,
                 'worker_id': self.worker_id,
+                'image_transport_kind': image_transport_kind,
+                'image_store_mode': image_store_mode,
                 'image_fetch_duration_seconds': round(image_fetch_duration, 6),
             })
             request_sent_event_data = json.dumps({
                 'event_at': _iso_utc(request_sent_at),
                 'trace_id': trace_id,
                 'worker_id': self.worker_id,
+                'image_transport_kind': image_transport_kind,
+                'image_store_mode': image_store_mode,
             })
             response_received_event_data = json.dumps({
                 'event_at': _iso_utc(response_received_at),
                 'trace_id': trace_id,
                 'worker_id': self.worker_id,
+                'image_transport_kind': image_transport_kind,
+                'image_store_mode': image_store_mode,
                 'request_duration_seconds': round(request_duration, 6),
                 'http_status': self._extract_http_status(result),
             })
@@ -1661,6 +1678,8 @@ class BaseWorker:
                 'event_at': _iso_utc(request_completed_at),
                 'trace_id': trace_id,
                 'worker_id': self.worker_id,
+                'image_transport_kind': image_transport_kind,
+                'image_store_mode': image_store_mode,
                 'request_duration_seconds': round(request_duration, 6),
                 'image_fetch_duration_seconds': round(image_fetch_duration, 6),
                 'upstream_queue_wait_seconds': round(upstream_queue_wait, 6) if upstream_queue_wait is not None else None,
