@@ -21,8 +21,8 @@ services:
       service_type: semantic, vlm
       consensus: true
       tier:
-        - basic
         - premium
+        - extra
 
     florence2:
       queue_name: florence2
@@ -32,9 +32,8 @@ services:
       service_type: semantic, vlm
       consensus: true
       tier:
-        - basic
         - premium
-        - batch
+        - extra
 
     colors:
       queue_name: colors
@@ -44,10 +43,10 @@ services:
       service_type: colors
       consensus: false
       tier:
-        - free
         - basic
         - premium
-        - batch
+        - extra
+        - cloud
 
     metadata:
       queue_name: metadata
@@ -56,10 +55,10 @@ services:
       endpoint: /analyze
       service_type: metadata
       tier:
-        - free
         - basic
         - premium
-        - batch
+        - extra
+        - cloud
 
     nsfw2:
       queue_name: nsfw2
@@ -68,10 +67,10 @@ services:
       endpoint: /analyze
       service_type: nsfw
       tier:
-        - free
         - basic
         - premium
-        - batch
+        - extra
+        - cloud
 
     ocr:
       queue_name: ocr
@@ -80,9 +79,9 @@ services:
       endpoint: /analyze
       service_type: specialized
       tier:
-        - basic
         - premium
-        - batch
+        - extra
+        - cloud
 
     qr:
       queue_name: qr
@@ -91,9 +90,9 @@ services:
       endpoint: /analyze
       service_type: specialized
       tier:
-        - basic
         - premium
-        - batch
+        - extra
+        - cloud
 
     nudenet:
       queue_name: nudenet
@@ -102,10 +101,10 @@ services:
       endpoint: /analyze
       service_type: specialized
       tier:
-        - free
         - basic
         - premium
-        - batch
+        - extra
+        - cloud
 
     moondream:
       queue_name: moondream
@@ -115,8 +114,8 @@ services:
       service_type: semantic, vlm
       consensus: true
       tier:
-        - basic
         - premium
+        - extra
 
     ollama:
       queue_name: ollama
@@ -126,8 +125,9 @@ services:
       service_type: semantic, vlm
       consensus: true
       tier:
-        - basic
         - premium
+        - extra
+
       # caption_scoring: true # all semantic services trigger caption scoring
 
     haiku:
@@ -138,8 +138,8 @@ services:
       service_type: semantic, vlm
       consensus: true
       tier:
-        - premium
-        - batch
+        - extra
+        - cloud
 
     gemini:
       queue_name: gemini
@@ -149,8 +149,8 @@ services:
       service_type: semantic, vlm
       consensus: true
       tier:
-        - premium
-        - batch
+        - extra
+        - cloud
 
     gpt_nano:
       queue_name: gpt_nano
@@ -160,8 +160,8 @@ services:
       service_type: semantic, vlm
       consensus: true
       tier:
-        - premium
-        - batch
+        - extra
+        - cloud
 
     xai:
       queue_name: xai
@@ -171,8 +171,8 @@ services:
       service_type: semantic, vlm
       consensus: true
       tier:
-        - premium
-        - batch
+        - extra
+        - cloud
 
     qwen:
       queue_name: qwen
@@ -182,8 +182,8 @@ services:
       service_type: semantic, vlm
       consensus: true
       tier:
-        - basic
         - premium
+        - extra
 
     yolo_v8:
       queue_name: yolo_v8
@@ -192,10 +192,10 @@ services:
       endpoint: /analyze
       service_type: spatial
       tier:
-        - free
         - basic
         - premium
-        - batch
+        - extra
+        - cloud
 
     face:
       queue_name: face
@@ -205,9 +205,9 @@ services:
       service_type: specialized
       consensus: false
       tier:
-        - basic
         - premium
-        - batch
+        - extra
+        - cloud
 
     pose:
       queue_name: pose
@@ -217,9 +217,9 @@ services:
       service_type: specialized
       consensus: false
       tier:
-        - basic
         - premium
-        - batch
+        - extra
+        - cloud
 
   postprocessing:
     {}
@@ -234,26 +234,26 @@ services:
       queue_name: content_analysis
       service_type: content_analysis
       tier:
-        - free
         - basic
         - premium
-        - batch
+        - extra
+        - cloud
 
     noun_consensus:
       queue_name: noun_consensus
       service_type: noun_consensus
       tier:
-        - basic
         - premium
-        - batch
+        - extra
+        - cloud
 
     postprocessing_orchestrator:
       queue_name: postprocessing_orchestrator
       service_type: postprocessing_orchestrator
       tier:
-        - basic
         - premium
-        - batch
+        - extra
+        - cloud
 
     florence2_grounding:
       queue_name: florence2_grounding
@@ -262,9 +262,9 @@ services:
       endpoint: /analyze
       service_type: grounding
       tier:
-        - basic
         - premium
-        - batch
+        - extra
+        - cloud
 
     caption_summary:
       queue_name: caption_summary
@@ -273,9 +273,9 @@ services:
       port: 7799
       endpoint: /summarize
       tier:
-        - basic
         - premium
-        - batch
+        - extra
+        - cloud
 
     rembg:
       queue_name: rembg
@@ -284,6 +284,7 @@ services:
       port: 7768
       endpoint: /analyze
       tier:
-        - basic
         - premium
-        - batch
+        - extra
+        - cloud
+
