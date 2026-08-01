@@ -169,15 +169,19 @@ class SingleFlightRelay:
         self._lock = threading.RLock()
         self._inflight: Dict[Tuple[str, str], InFlightFetch] = {}
         self._metrics = {
+            "requests": 0,
             "cache_hits": 0,
             "cache_misses": 0,
             "singleflight_waiters": 0,
+            "singleflight_coalesced": 0,
+            "upstream_fetches": 0,
             "upstream_errors": 0,
             "object_too_large": 0,
             "not_found": 0,
         }
 
     def get(self, kind: str, ref: str) -> Optional[bytes]:
+        self._inc("requests")
         key = (kind, ref)
         payload = self.cache.get(key)
         if payload is not None:
@@ -190,17 +194,18 @@ class SingleFlightRelay:
             )
             return payload
 
-        self._inc("cache_misses")
-        _json_log("cache_miss", kind=kind, ref_id=_ref_log_id(ref))
         with self._lock:
             flight = self._inflight.get(key)
             if flight is None:
                 flight = InFlightFetch(event=threading.Event())
                 self._inflight[key] = flight
                 leader = True
+                self._inc("cache_misses")
+                _json_log("cache_miss_leader", kind=kind, ref_id=_ref_log_id(ref))
             else:
                 leader = False
                 self._inc("singleflight_waiters")
+                self._inc("singleflight_coalesced")
                 _json_log("singleflight_waiter", kind=kind, ref_id=_ref_log_id(ref))
 
         if leader:
@@ -221,6 +226,7 @@ class SingleFlightRelay:
         error = None
         start = time.perf_counter()
         try:
+            self._inc("upstream_fetches")
             payload = self._fetch_upstream(kind, ref)
             duration = time.perf_counter() - start
             payload_size = len(payload) if payload is not None else 0

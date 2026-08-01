@@ -123,6 +123,12 @@ The effective relay cache TTL is capped at 80% of the backing Valkey image or
 crop TTL, so relay cache hits cannot keep serving bytes until the upstream ref
 has already expired.
 
+For a healthy simultaneous burst, `/metrics` should show one `cache_misses` /
+`upstream_fetches` leader for that ref and the rest as `singleflight_waiters`.
+For example, five concurrent service requests for one image should look like
+`requests=5`, `cache_misses=1`, `upstream_fetches=1`,
+`singleflight_waiters=4`.
+
 Roll out manually:
 
 1. Start the relay on Dorothy.
