@@ -19,6 +19,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, Optional, Tuple
 
+from dotenv import load_dotenv
 from flask import Flask, Response, abort, jsonify, request
 
 from core.image_store import get_bytes, get_image_store_config
@@ -243,6 +244,12 @@ class SingleFlightRelay:
                 self.cache.put(key, payload, ttl)
         except Exception as exc:
             self._inc("upstream_errors")
+            _json_log(
+                "upstream_error",
+                kind=kind,
+                ref_id=_ref_log_id(ref),
+                error=exc.__class__.__name__,
+            )
             error = exc
         finally:
             flight.payload = payload if error is None else None
@@ -370,6 +377,7 @@ def create_app(relay_config: Optional[RelayConfig] = None, relay: Optional[Singl
 
 
 def main() -> None:
+    load_dotenv(os.getenv("WINDMILL_ENV_FILE", ".env"), override=False)
     logging.basicConfig(
         level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper()),
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",

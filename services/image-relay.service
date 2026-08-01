@@ -1,0 +1,20 @@
+[Unit]
+Description=Windmill Image Relay Service
+After=network.target
+StartLimitBurst=3
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5
+User=sd
+Group=sd
+WorkingDirectory=/home/sd/windmill
+ExecStart=/home/sd/windmill/relay.sh
+EnvironmentFile=/home/sd/windmill/.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
