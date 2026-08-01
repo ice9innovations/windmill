@@ -9,14 +9,18 @@ from __future__ import annotations
 import os
 import uuid
 import logging
+import socket
+import hashlib
 from dataclasses import dataclass
 from threading import Lock
 from threading import Thread
 from threading import Event
-from typing import Optional
+from typing import Dict, Optional
+from urllib.parse import quote, urljoin
 import time
 
 import redis
+import requests
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
@@ -61,6 +65,9 @@ class ImageStoreConfig:
     socket_timeout_seconds: float
     health_check_interval_seconds: int
     keepalive_ping_seconds: int
+    relay_url: Optional[str]
+    relay_timeout_seconds: float
+    relay_fallback_direct: bool
     key_prefix: str = _DEFAULT_KEY_PREFIX
 
     @property
@@ -84,6 +91,9 @@ class ImageStoreConfig:
             socket_timeout_seconds=float(os.getenv("VALKEY_SOCKET_TIMEOUT_SECONDS", "3")),
             health_check_interval_seconds=_env_int("VALKEY_HEALTH_CHECK_INTERVAL_SECONDS", 30),
             keepalive_ping_seconds=_env_int("VALKEY_KEEPALIVE_PING_SECONDS", 15),
+            relay_url=(os.getenv("IMAGE_RELAY_URL") or "").strip().rstrip("/") or None,
+            relay_timeout_seconds=float(os.getenv("IMAGE_RELAY_TIMEOUT_SECONDS", "5")),
+            relay_fallback_direct=_env_bool("IMAGE_RELAY_FALLBACK_DIRECT", False),
         )
 
     def validate(self) -> None:
@@ -99,6 +109,8 @@ class ImageStoreConfig:
             raise ValueError("VALKEY_IMAGE_TTL_SECONDS must be a positive integer")
         if self.crop_ttl_seconds <= 0:
             raise ValueError("VALKEY_CROP_TTL_SECONDS must be a positive integer")
+        if self.relay_timeout_seconds <= 0:
+            raise ValueError("IMAGE_RELAY_TIMEOUT_SECONDS must be positive")
 
 
 def get_image_store_config() -> ImageStoreConfig:
@@ -237,15 +249,122 @@ def get_bytes(
     return payload
 
 
+def _ref_log_id(ref: str) -> str:
+    return hashlib.sha256(ref.encode("utf-8")).hexdigest()[:12]
+
+
+def _relay_headers(relay_attribution: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    headers = {
+        "X-Windmill-Hostname": socket.gethostname(),
+    }
+    for key, value in (relay_attribution or {}).items():
+        if value is None:
+            continue
+        safe_key = "".join(ch for ch in key if ch.isalnum() or ch in "-_")
+        if not safe_key:
+            continue
+        headers[f"X-Windmill-{safe_key}"] = str(value)[:200]
+    return headers
+
+
+def _get_bytes_via_relay(
+    ref: str,
+    *,
+    kind: str,
+    config: ImageStoreConfig,
+    log: Optional[logging.Logger] = None,
+    relay_attribution: Optional[Dict[str, str]] = None,
+) -> Optional[bytes]:
+    active_logger = log or logger
+    url = urljoin(f"{config.relay_url}/", f"image/{quote(ref, safe='')}?kind={quote(kind, safe='')}")
+    start = time.perf_counter()
+    response = requests.get(
+        url,
+        headers=_relay_headers(relay_attribution),
+        timeout=config.relay_timeout_seconds,
+    )
+    duration = time.perf_counter() - start
+    if response.status_code == 404:
+        active_logger.info(
+            "image_relay miss kind=%s ref_id=%s duration=%.3fs status=404",
+            kind,
+            _ref_log_id(ref),
+            duration,
+        )
+        return None
+    response.raise_for_status()
+    payload = response.content
+    active_logger.info(
+        "image_relay fetch kind=%s ref_id=%s duration=%.3fs bytes=%d status=%d",
+        kind,
+        _ref_log_id(ref),
+        duration,
+        len(payload),
+        response.status_code,
+    )
+    return payload
+
+
+def _get_bytes_with_optional_relay(
+    ref: str,
+    *,
+    kind: str,
+    refresh_ttl_s: Optional[int],
+    config: ImageStoreConfig,
+    log: Optional[logging.Logger] = None,
+    relay_attribution: Optional[Dict[str, str]] = None,
+) -> Optional[bytes]:
+    if not config.relay_url:
+        return get_bytes(ref, refresh_ttl_s=refresh_ttl_s, config=config, log=log)
+
+    active_logger = log or logger
+    try:
+        return _get_bytes_via_relay(
+            ref,
+            kind=kind,
+            config=config,
+            log=active_logger,
+            relay_attribution=relay_attribution,
+        )
+    except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+        active_logger.warning(
+            "image_relay failed kind=%s ref_id=%s error=%s fallback_direct=%s",
+            kind,
+            _ref_log_id(ref),
+            exc.__class__.__name__,
+            config.relay_fallback_direct,
+        )
+        if not config.relay_fallback_direct:
+            raise
+        fallback_start = time.perf_counter()
+        payload = get_bytes(ref, refresh_ttl_s=refresh_ttl_s, config=config, log=active_logger)
+        active_logger.warning(
+            "image_relay fallback_direct kind=%s ref_id=%s duration=%.3fs bytes=%d",
+            kind,
+            _ref_log_id(ref),
+            time.perf_counter() - fallback_start,
+            len(payload) if payload is not None else 0,
+        )
+        return payload
+
+
 def get_image(
     ref: str,
     refresh_ttl_s: Optional[int] = None,
     config: Optional[ImageStoreConfig] = None,
     log: Optional[logging.Logger] = None,
+    relay_attribution: Optional[Dict[str, str]] = None,
 ) -> Optional[bytes]:
     config = config or get_image_store_config()
     refresh_ttl_s = refresh_ttl_s or config.image_ttl_seconds
-    return get_bytes(ref, refresh_ttl_s=refresh_ttl_s, config=config, log=log)
+    return _get_bytes_with_optional_relay(
+        ref,
+        kind="image",
+        refresh_ttl_s=refresh_ttl_s,
+        config=config,
+        log=log,
+        relay_attribution=relay_attribution,
+    )
 
 
 def get_crop(
@@ -253,10 +372,18 @@ def get_crop(
     refresh_ttl_s: Optional[int] = None,
     config: Optional[ImageStoreConfig] = None,
     log: Optional[logging.Logger] = None,
+    relay_attribution: Optional[Dict[str, str]] = None,
 ) -> Optional[bytes]:
     config = config or get_image_store_config()
     refresh_ttl_s = refresh_ttl_s or config.crop_ttl_seconds
-    return get_bytes(ref, refresh_ttl_s=refresh_ttl_s, config=config, log=log)
+    return _get_bytes_with_optional_relay(
+        ref,
+        kind="crop",
+        refresh_ttl_s=refresh_ttl_s,
+        config=config,
+        log=log,
+        relay_attribution=relay_attribution,
+    )
 
 
 def touch(ref: str, ttl_s: int, config: Optional[ImageStoreConfig] = None) -> bool:

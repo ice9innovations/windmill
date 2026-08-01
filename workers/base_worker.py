@@ -266,7 +266,17 @@ class BaseWorker:
         image_ref = message.get('image_ref')
         if image_ref:
             fetch_started_at = time.time()
-            image_bytes = get_image(image_ref, config=self.image_store_config, log=self.logger)
+            image_bytes = get_image(
+                image_ref,
+                config=self.image_store_config,
+                log=self.logger,
+                relay_attribution={
+                    "Service": self.service_name,
+                    "Worker-Id": self.worker_id,
+                    "Image-Id": message.get("image_id"),
+                    "Trace-Id": message.get("trace_id"),
+                },
+            )
             fetch_duration = time.time() - fetch_started_at
             if image_bytes is not None:
                 if self.service_name == 'system.florence2_grounding':
@@ -307,7 +317,18 @@ class BaseWorker:
     def resolve_crop_bytes(self, message, required=True):
         crop_ref = message.get('crop_ref')
         if crop_ref:
-            crop_bytes = get_crop(crop_ref, config=self.image_store_config, log=self.logger)
+            crop_bytes = get_crop(
+                crop_ref,
+                config=self.image_store_config,
+                log=self.logger,
+                relay_attribution={
+                    "Service": self.service_name,
+                    "Worker-Id": self.worker_id,
+                    "Image-Id": message.get("image_id"),
+                    "Trace-Id": message.get("trace_id"),
+                    "Merged-Box-Id": message.get("merged_box_id"),
+                },
+            )
             if crop_bytes is not None:
                 return crop_bytes
             self.logger.error(
