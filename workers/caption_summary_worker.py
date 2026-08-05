@@ -41,6 +41,14 @@ logger = logging.getLogger(__name__)
 VLM_SERVICES = get_service_config().get_vlm_service_names()
 
 MIN_CAPTIONS = 2  # Skip synthesis if fewer than this many VLMs returned
+NSFW_PREFERRED_SERVICE = 'joycaption'
+NSFW_LABELS = frozenset({
+    'FEMALE_BREAST_EXPOSED',
+    'FEMALE_GENITALIA_EXPOSED',
+    'MALE_GENITALIA_EXPOSED',
+    'BUTTOCKS_EXPOSED',
+    'ANUS_EXPOSED',
+})
 
 
 def _extract_caption(data: dict) -> str:
@@ -56,6 +64,28 @@ def _extract_caption(data: dict) -> str:
     if predictions and isinstance(predictions[0], dict):
         return str(predictions[0].get('text', '')).strip()
     return ''
+
+
+def _nsfw2_flags_nsfw(data: dict) -> bool:
+    predictions = data.get('predictions', []) if isinstance(data, dict) else []
+    if not predictions or not isinstance(predictions[0], dict):
+        return False
+    return predictions[0].get('nsfw') is True
+
+
+def _nudenet_flags_nsfw(data: dict) -> bool:
+    predictions = data.get('predictions', []) if isinstance(data, dict) else []
+    return any(
+        isinstance(prediction, dict) and prediction.get('label') in NSFW_LABELS
+        for prediction in predictions
+    )
+
+
+def _select_preferred_caption_service(captions: dict, nsfw: bool) -> str:
+    """Return the preferred caption service for synthesis, when one applies."""
+    if nsfw and captions.get(NSFW_PREFERRED_SERVICE):
+        return NSFW_PREFERRED_SERVICE
+    return None
 
 
 class CaptionSummaryWorker(BaseWorker):
@@ -99,19 +129,27 @@ class CaptionSummaryWorker(BaseWorker):
             # Allows re-synthesis when stragglers (e.g. gpt_nano) arrive after first pass.
             cursor = self.db_conn.cursor()
             cursor.execute(
-                "SELECT service_count FROM caption_summary WHERE image_id = %s LIMIT 1",
+                "SELECT service_count, services_present FROM caption_summary WHERE image_id = %s LIMIT 1",
                 (image_id,)
             )
             row = cursor.fetchone()
             cursor.close()
             existing_count = row[0] if row else 0
+            existing_services = set(row[1] or []) if row else set()
 
             # Fetch VLM captions — tier-scoped
             t0 = time.time()
             captions = self._fetch_captions(image_id, tier_vlm_services)
             timing['fetch_captions'] = time.time() - t0
 
-            if len(captions) <= existing_count:
+            t0 = time.time()
+            nsfw = self._image_flags_nsfw(image_id)
+            timing['fetch_nsfw_flag'] = time.time() - t0
+            preferred_service = _select_preferred_caption_service(captions, nsfw)
+
+            if len(captions) <= existing_count and (
+                not preferred_service or preferred_service in existing_services
+            ):
                 previous_autocommit = self.db_conn.autocommit
                 self.db_conn.autocommit = False
                 self._persist_terminal_result(
@@ -125,6 +163,8 @@ class CaptionSummaryWorker(BaseWorker):
                             'reason': 'Already synthesized with current caption count',
                             'existing_count': existing_count,
                             'available_count': len(captions),
+                            'nsfw': nsfw,
+                            'preferred_service': preferred_service,
                             'processed_at': datetime.now().isoformat(),
                         },
                     },
@@ -139,7 +179,8 @@ class CaptionSummaryWorker(BaseWorker):
                 self._safe_ack(ch, method.delivery_tag)
                 return
 
-            if len(captions) < MIN_CAPTIONS:
+            min_captions = 1 if preferred_service else MIN_CAPTIONS
+            if len(captions) < min_captions:
                 previous_autocommit = self.db_conn.autocommit
                 self.db_conn.autocommit = False
                 self._persist_terminal_result(
@@ -150,18 +191,20 @@ class CaptionSummaryWorker(BaseWorker):
                         'summary_caption': None,
                         'metadata': {
                             'no_usable_data': True,
-                            'reason': f'Need at least {MIN_CAPTIONS} captions',
+                            'reason': f'Need at least {min_captions} captions',
                             'available_count': len(captions),
+                            'nsfw': nsfw,
+                            'preferred_service': preferred_service,
                             'processed_at': datetime.now().isoformat(),
                         },
                     },
                     processing_time=round(time.time() - start_time, 3),
                     event_type='completed',
-                    event_data={'reason': f'Need at least {MIN_CAPTIONS} captions'},
+                    event_data={'reason': f'Need at least {min_captions} captions'},
                 )
                 self.logger.info(
                     f"caption_summary: image {image_id} has {len(captions)} caption(s), "
-                    f"need {MIN_CAPTIONS} — skipping"
+                    f"need {min_captions} — skipping"
                 )
                 self._safe_ack(ch, method.delivery_tag)
                 return
@@ -176,7 +219,14 @@ class CaptionSummaryWorker(BaseWorker):
 
             # Call caption-synthesis service
             t0 = time.time()
-            synthesis_result = self._call_synthesis_service(captions, nouns, verbs, image_id)
+            synthesis_result = self._call_synthesis_service(
+                captions,
+                nouns,
+                verbs,
+                image_id,
+                preferred_caption_service=preferred_service,
+                nsfw=nsfw,
+            )
             timing['call_synthesis_service'] = time.time() - t0
             if synthesis_result is None:
                 self._safe_nack(ch, method.delivery_tag, requeue=True)
@@ -246,6 +296,11 @@ class CaptionSummaryWorker(BaseWorker):
                 model=synthesis_model,
                 services_present=services_present,
                 processing_time=round(time.time() - start_time, 3),
+                metadata={
+                    'nsfw': nsfw,
+                    'preferred_service': preferred_service,
+                    'available_services': sorted(captions.keys()),
+                },
             )
             timing['persist_success'] = time.time() - t0
             self._safe_ack(ch, method.delivery_tag)
@@ -324,6 +379,35 @@ class CaptionSummaryWorker(BaseWorker):
             self.logger.error(f"caption_summary: caption fetch error for image {image_id}: {e}")
         return captions
 
+    def _image_flags_nsfw(self, image_id: int) -> bool:
+        """Return True when stored NSFW classifiers mark the image as NSFW."""
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                SELECT service, data
+                FROM results
+                WHERE image_id = %s
+                  AND service = ANY(%s::text[])
+                  AND status = 'success'
+                """,
+                (image_id, ['nsfw2', 'nudenet'])
+            )
+            rows = cursor.fetchall()
+            cursor.close()
+        except Exception as e:
+            self.logger.error(f"caption_summary: NSFW flag fetch error for image {image_id}: {e}")
+            return False
+
+        for service, data in rows:
+            if not isinstance(data, dict):
+                continue
+            if service == 'nsfw2' and _nsfw2_flags_nsfw(data):
+                return True
+            if service == 'nudenet' and _nudenet_flags_nsfw(data):
+                return True
+        return False
+
     def _fetch_noun_consensus(self, image_id: int) -> list:
         """
         Return the nouns list from noun_consensus, or [] if not present.
@@ -367,13 +451,23 @@ class CaptionSummaryWorker(BaseWorker):
     # ------------------------------------------------------------------
 
     def _call_synthesis_service(
-        self, captions: dict, nouns: list, verbs: list, image_id: int
+        self,
+        captions: dict,
+        nouns: list,
+        verbs: list,
+        image_id: int,
+        preferred_caption_service: str = None,
+        nsfw: bool = False,
     ) -> dict:
         """POST captions and consensus data to the caption-synthesis AF service."""
+        payload = {"captions": captions, "nouns": nouns, "verbs": verbs}
+        if preferred_caption_service:
+            payload["preferred_caption_service"] = preferred_caption_service
+            payload["preference_reason"] = "nsfw" if nsfw else "configured"
         try:
             resp = requests.post(
                 self.synthesis_url,
-                json={"captions": captions, "nouns": nouns, "verbs": verbs},
+                json=payload,
                 timeout=90,
             )
             return self._coerce_terminal_http_response(resp, service='caption_summary')
@@ -446,6 +540,7 @@ class CaptionSummaryWorker(BaseWorker):
         model: str,
         services_present: list,
         processing_time: float,
+        metadata: dict = None,
     ):
         """Persist caption_summary row, terminal result, and event in one DB round trip."""
         try:
@@ -494,6 +589,7 @@ class CaptionSummaryWorker(BaseWorker):
                         'model': model,
                         'services_present': services_present,
                         'metadata': {
+                            **(metadata or {}),
                             'processed_at': datetime.now().isoformat(),
                         },
                     }),
