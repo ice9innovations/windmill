@@ -117,6 +117,17 @@ services:
         - premium
         - extra
 
+    joycaption:
+      queue_name: joycaption
+      host: localhost
+      port: 7798
+      endpoint: /analyze
+      service_type: semantic, vlm
+      consensus: true
+      tier:
+        - premium
+        - extra
+
     ollama:
       queue_name: ollama
       host: localhost
@@ -287,4 +298,3 @@ services:
         - premium
         - extra
         - cloud
-

@@ -200,7 +200,7 @@ class ContentAnalysisWorker(BaseWorker):
                 results.append({'service': service, 'data': data, 'status': status})
 
                 # Extract captions from all VLM services
-                if service in ['blip', 'ollama', 'cogvlm', 'haiku', 'moondream', 'qwen']:
+                if service in ['blip', 'ollama', 'cogvlm', 'haiku', 'joycaption', 'moondream', 'qwen']:
                     predictions = data.get('predictions', [])
                     for pred in predictions:
                         if 'text' in pred:
