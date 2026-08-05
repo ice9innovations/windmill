@@ -1210,6 +1210,7 @@ class BaseWorker:
             return {'insert': 0.0, 'commit': 0.0}
 
         try:
+            event_data = self._with_service_event_metadata(data)
             cursor = self.db_conn.cursor()
             insert_started_at = time.time()
             cursor.execute(
@@ -1228,7 +1229,7 @@ class BaseWorker:
                     event_type,
                     source_service,
                     source_stage,
-                    json.dumps(data) if data is not None else None,
+                    json.dumps(event_data),
                 ),
             )
             insert_duration = time.time() - insert_started_at
