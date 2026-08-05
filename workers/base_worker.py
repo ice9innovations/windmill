@@ -177,6 +177,32 @@ class BaseWorker:
         self.processing_delay = float(os.getenv('PROCESSING_DELAY', '0.0'))
         self.image_store_config = get_image_store_config()
 
+    def _service_event_metadata(self):
+        """Return worker placement metadata for per-request trace events."""
+        metadata = {
+            'worker_id': self.worker_id,
+            'worker_host': socket.gethostname(),
+            'worker_pid': os.getpid(),
+            'queue_name': self.queue_name,
+            'service_host': self.service_host,
+            'service_port': self.service_port,
+        }
+        cuda_visible_devices = os.getenv('CUDA_VISIBLE_DEVICES')
+        if cuda_visible_devices:
+            metadata['cuda_visible_devices'] = cuda_visible_devices
+            metadata['gpu_id'] = cuda_visible_devices
+        return metadata
+
+    def _with_service_event_metadata(self, data=None):
+        """Merge placement metadata into service_event JSON payload data."""
+        payload = {}
+        if isinstance(data, dict):
+            payload.update(data)
+        elif data is not None:
+            payload['value'] = data
+        payload.update(self._service_event_metadata())
+        return payload
+
     def _get_required(self, key):
         """Get required environment variable or raise error"""
         value = os.getenv(key)
@@ -1231,6 +1257,7 @@ class BaseWorker:
     ):
         """Append one image-level service event row. Best-effort and mutation-free."""
         try:
+            event_data = self._with_service_event_metadata(data)
             cursor = self.db_conn.cursor()
             insert_started_at = time.time()
             cursor.execute(
@@ -1246,7 +1273,7 @@ class BaseWorker:
                     event_type,
                     source_service,
                     source_stage,
-                    json.dumps(data) if data is not None else None,
+                    json.dumps(event_data),
                 ),
             )
             insert_duration = time.time() - insert_started_at
@@ -1271,13 +1298,14 @@ class BaseWorker:
             values_sql = ", ".join(["(%s, %s, %s, %s, %s, %s)"] * len(events))
             params = []
             for event in events:
+                event_data = self._with_service_event_metadata(event.get('data'))
                 params.extend([
                     event['image_id'],
                     event['service'],
                     event['event_type'],
                     event.get('source_service'),
                     event.get('source_stage'),
-                    json.dumps(event.get('data')) if event.get('data') is not None else None,
+                    json.dumps(event_data),
                 ])
 
             cursor = self.db_conn.cursor()
@@ -1644,53 +1672,47 @@ class BaseWorker:
             def _iso_utc(epoch_seconds):
                 return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).isoformat()
 
-            received_event_data = json.dumps({
+            received_event_data = json.dumps(self._with_service_event_metadata({
                 'event_at': _iso_utc(worker_received_at),
                 'trace_id': trace_id,
-                'worker_id': self.worker_id,
                 'submitted_at': submitted_at,
                 'submitted_at_epoch': submitted_at_epoch,
                 'upstream_queue_wait_seconds': round(upstream_queue_wait, 6) if upstream_queue_wait is not None else None,
                 'image_transport_kind': image_transport_kind,
                 'image_store_mode': image_store_mode,
                 'image_fetch_duration_seconds': round(image_fetch_duration, 6),
-            })
-            started_event_data = json.dumps({
+            }))
+            started_event_data = json.dumps(self._with_service_event_metadata({
                 'event_at': _iso_utc(request_started_at),
                 'trace_id': trace_id,
-                'worker_id': self.worker_id,
                 'image_transport_kind': image_transport_kind,
                 'image_store_mode': image_store_mode,
                 'image_fetch_duration_seconds': round(image_fetch_duration, 6),
-            })
-            image_resolved_event_data = json.dumps({
+            }))
+            image_resolved_event_data = json.dumps(self._with_service_event_metadata({
                 'event_at': _iso_utc(image_resolved_at),
                 'trace_id': trace_id,
-                'worker_id': self.worker_id,
                 'image_transport_kind': image_transport_kind,
                 'image_store_mode': image_store_mode,
                 'image_fetch_duration_seconds': round(image_fetch_duration, 6),
-            })
-            request_sent_event_data = json.dumps({
+            }))
+            request_sent_event_data = json.dumps(self._with_service_event_metadata({
                 'event_at': _iso_utc(request_sent_at),
                 'trace_id': trace_id,
-                'worker_id': self.worker_id,
                 'image_transport_kind': image_transport_kind,
                 'image_store_mode': image_store_mode,
-            })
-            response_received_event_data = json.dumps({
+            }))
+            response_received_event_data = json.dumps(self._with_service_event_metadata({
                 'event_at': _iso_utc(response_received_at),
                 'trace_id': trace_id,
-                'worker_id': self.worker_id,
                 'image_transport_kind': image_transport_kind,
                 'image_store_mode': image_store_mode,
                 'request_duration_seconds': round(request_duration, 6),
                 'http_status': self._extract_http_status(result),
-            })
-            terminal_event_data = json.dumps({
+            }))
+            terminal_event_data = json.dumps(self._with_service_event_metadata({
                 'event_at': _iso_utc(request_completed_at),
                 'trace_id': trace_id,
-                'worker_id': self.worker_id,
                 'image_transport_kind': image_transport_kind,
                 'image_store_mode': image_store_mode,
                 'request_duration_seconds': round(request_duration, 6),
@@ -1700,7 +1722,7 @@ class BaseWorker:
                 'result_status': result_status,
                 'processing_time_seconds': processing_time,
                 'failed_reason': failed_reason,
-            })
+            }))
             persist_started_at = time.time()
             cursor = self.db_conn.cursor()
             cursor.execute("""
