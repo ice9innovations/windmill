@@ -137,9 +137,43 @@ start_scheduler() {
         echo -e "${GREEN}✅ machine_scheduler_worker${NC} already running (PID: $pid)"
         return 0
     fi
+    rm -f "$SCHEDULER_STATUS_FILE"
     echo "  Starting machine scheduler with WINDMILL_WORKER_CAPACITY=$WINDMILL_WORKER_CAPACITY..."
     nohup python workers/machine_scheduler_worker.py >> logs/machine_scheduler_worker.log 2>&1 &
+    wait_for_scheduler_status
     echo -e "${GREEN}✅ Started machine scheduler${NC}"
+}
+
+wait_for_scheduler_status() {
+    if ! capacity_mode_enabled; then
+        return
+    fi
+    local attempts=0
+    while [ "$attempts" -lt 40 ]; do
+        if [ -f "$SCHEDULER_STATUS_FILE" ]; then
+            python - "$SCHEDULER_STATUS_FILE" <<'PY'
+import json
+import sys
+import time
+
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    age = time.time() - float(data.get("updated_at_epoch", 0) or 0)
+    if data.get("state") == "running" and age <= 5:
+        raise SystemExit(0)
+except Exception:
+    pass
+raise SystemExit(1)
+PY
+            if [ "$?" -eq 0 ]; then
+                return
+            fi
+        fi
+        sleep 0.25
+        attempts=$((attempts + 1))
+    done
+    echo -e "${YELLOW}  Scheduler started, but status is not fresh yet. Check logs/machine_scheduler_worker.log if this persists.${NC}"
 }
 
 start_all() {
@@ -179,6 +213,7 @@ stop_all() {
     if pkill -f "workers/machine_scheduler_worker.py" 2>/dev/null; then
         echo "  ✅ Stopped machine_scheduler_worker"
     fi
+    rm -f "$SCHEDULER_STATUS_FILE"
     
     # Stop each worker individually - now they can all be targeted precisely!
     for worker in $(get_all_workers); do
@@ -427,6 +462,7 @@ case "$ACTION" in
                 stop_all
                 sleep 2
                 start_all
+                wait_for_scheduler_status
                 echo ""
                 status_all
             else
@@ -443,6 +479,7 @@ case "$ACTION" in
             stop_all
             sleep 2
             start_all
+            wait_for_scheduler_status
             echo ""
             status_all
         fi
