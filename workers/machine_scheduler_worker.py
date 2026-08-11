@@ -91,6 +91,7 @@ class MachineScheduler:
         load_dotenv(REPO_ROOT / ".env")
         self.capacity = self._load_capacity()
         self.poll_interval = float(os.getenv("WINDMILL_SCHEDULER_POLL_INTERVAL", "0.25"))
+        self.consumer_priority = int(os.getenv("WINDMILL_SCHEDULER_CONSUMER_PRIORITY", "-10"))
         self.enabled_names = self._load_enabled_names()
         self.logger = self._setup_logging()
         self.slots = []
@@ -159,6 +160,7 @@ class MachineScheduler:
                     for name in self.enabled_names
                 ],
                 poll_interval=self.poll_interval,
+                consumer_priority=self.consumer_priority,
                 logger=self.logger,
             )
             for slot_id in range(self.capacity)
@@ -199,6 +201,7 @@ class MachineScheduler:
         payload = {
             "state": state,
             "capacity": self.capacity,
+            "consumer_priority": self.consumer_priority,
             "updated_at_epoch": time.time(),
             "enabled_workers": self.enabled_names,
             "managed": workers,
@@ -232,10 +235,11 @@ class MachineScheduler:
 
 
 class SchedulerSlot:
-    def __init__(self, *, slot_id, workers, poll_interval, logger):
+    def __init__(self, *, slot_id, workers, poll_interval, consumer_priority, logger):
         self.slot_id = slot_id
         self.workers = workers
         self.poll_interval = poll_interval
+        self.consumer_priority = consumer_priority
         self.logger = logger
         self.running = threading.Event()
         self.connection = None
@@ -319,6 +323,7 @@ class SchedulerSlot:
                 queue=worker.queue_name,
                 on_message_callback=self._build_callback(worker),
                 auto_ack=False,
+                arguments={"x-priority": self.consumer_priority},
             )
 
     def _build_callback(self, worker):
