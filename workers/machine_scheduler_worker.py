@@ -304,7 +304,10 @@ class SchedulerSlot:
                 pass
         connection_owner = self.workers[0]
         self.connection, self.channel = connection_owner._consume_queue.connect()
-        self.channel.basic_qos(prefetch_count=1)
+        # RabbitMQ applies prefetch per consumer by default. Each scheduler slot
+        # registers one consumer per eligible queue on the same channel, so use
+        # channel-wide QoS to keep the slot at one unacked delivery total.
+        self.channel.basic_qos(prefetch_count=1, global_qos=True)
         for worker in self.workers:
             worker.connection = self.connection
             worker.channel = self.channel
