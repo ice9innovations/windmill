@@ -9,6 +9,7 @@ one-process-per-worker behavior.
 """
 import importlib
 import inspect
+import json
 import logging
 import os
 import signal
@@ -30,6 +31,7 @@ from core.postgres_connection import close_quietly
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STATE_FILE = REPO_ROOT / ".windmill_state"
+SCHEDULER_STATUS_FILE = REPO_ROOT / ".windmill_scheduler_status"
 
 
 def _split_names(value):
@@ -169,6 +171,7 @@ class MachineScheduler:
         for slot in self.slots:
             slot.start()
         while self.running:
+            self._write_status("running")
             failed_slots = [slot for slot in self.slots if slot.failed_exception is not None]
             if failed_slots:
                 for slot in failed_slots:
@@ -182,8 +185,35 @@ class MachineScheduler:
             time.sleep(0.5)
         self.shutdown()
 
+    def _write_status(self, state):
+        workers = []
+        if self.slots:
+            workers = [
+                {
+                    "worker": _worker_module_name(worker.service_name.split(".", 1)[-1]),
+                    "service": worker.service_name,
+                    "queue": worker.queue_name,
+                }
+                for worker in self.slots[0].workers
+            ]
+        payload = {
+            "state": state,
+            "capacity": self.capacity,
+            "updated_at_epoch": time.time(),
+            "enabled_workers": self.enabled_names,
+            "managed": workers,
+            "slots": [slot.status() for slot in self.slots],
+        }
+        tmp_path = SCHEDULER_STATUS_FILE.with_suffix(".tmp")
+        try:
+            tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+            tmp_path.replace(SCHEDULER_STATUS_FILE)
+        except Exception as exc:
+            self.logger.warning("Failed to write scheduler status: %s", exc)
+
     def shutdown(self):
         self.logger.info("Stopping machine scheduler")
+        self._write_status("stopping")
         for slot in self.slots:
             slot.stop()
         for slot in self.slots:
@@ -197,6 +227,7 @@ class MachineScheduler:
             close_quietly(getattr(worker, "read_db_conn", None))
             close_quietly(worker.db_conn)
             worker._sync_publish_queue.close()
+        self._write_status("stopped")
         self.logger.info("Machine scheduler stopped")
 
 
@@ -210,6 +241,8 @@ class SchedulerSlot:
         self.connection = None
         self.channel = None
         self.failed_exception = None
+        self.current_job = None
+        self.status_lock = threading.Lock()
         self.thread = threading.Thread(
             target=self.run,
             daemon=True,
@@ -231,6 +264,21 @@ class SchedulerSlot:
 
     def is_alive(self):
         return self.thread.is_alive()
+
+    def status(self):
+        with self.status_lock:
+            current_job = dict(self.current_job) if self.current_job else None
+        return {
+            "slot": self.slot_id,
+            "state": "active" if current_job else "idle",
+            "current_job": current_job,
+            "alive": self.thread.is_alive(),
+            "failed": str(self.failed_exception) if self.failed_exception else None,
+        }
+
+    def _set_current_job(self, job):
+        with self.status_lock:
+            self.current_job = job
 
     def _connect_queue(self):
         if self.connection is not None:
@@ -283,7 +331,16 @@ class SchedulerSlot:
                             method.delivery_tag,
                         )
                         worker.channel = self.channel
-                        worker.process_message(self.channel, method, properties, body)
+                        self._set_current_job({
+                            "service": worker.service_name,
+                            "queue": worker.queue_name,
+                            "delivery_tag": method.delivery_tag,
+                            "started_at_epoch": time.time(),
+                        })
+                        try:
+                            worker.process_message(self.channel, method, properties, body)
+                        finally:
+                            self._set_current_job(None)
                         break
                     if not found:
                         time.sleep(self.poll_interval)
