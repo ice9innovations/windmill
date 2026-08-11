@@ -144,6 +144,22 @@ start_scheduler() {
     echo -e "${GREEN}✅ Started machine scheduler${NC}"
 }
 
+stop_scheduler() {
+    if pkill -f "workers/machine_scheduler_worker.py" 2>/dev/null; then
+        local attempts=0
+        while [ "$attempts" -lt 20 ]; do
+            if ! pgrep -f "workers/machine_scheduler_worker.py" >/dev/null 2>&1; then
+                rm -f "$SCHEDULER_STATUS_FILE"
+                return 0
+            fi
+            sleep 0.25
+            attempts=$((attempts + 1))
+        done
+        pkill -9 -f "workers/machine_scheduler_worker.py" 2>/dev/null
+        rm -f "$SCHEDULER_STATUS_FILE"
+    fi
+}
+
 wait_for_scheduler_status() {
     if ! capacity_mode_enabled; then
         return
@@ -210,10 +226,10 @@ start_all() {
 
 stop_all() {
     echo "🛑 Stopping all workers..."
-    if pkill -f "workers/machine_scheduler_worker.py" 2>/dev/null; then
+    if pgrep -f "workers/machine_scheduler_worker.py" >/dev/null 2>&1; then
+        stop_scheduler
         echo "  ✅ Stopped machine_scheduler_worker"
     fi
-    rm -f "$SCHEDULER_STATUS_FILE"
     
     # Stop each worker individually - now they can all be targeted precisely!
     for worker in $(get_all_workers); do
@@ -349,6 +365,19 @@ stop_worker() {
             ;;
     esac
     
+    local canonical=$(basename "$worker_file" ".py")
+
+    if capacity_mode_enabled; then
+        state_remove "$canonical"
+        echo "✅ Unregistered $canonical from machine_scheduler_worker"
+        if pgrep -f "workers/machine_scheduler_worker.py" >/dev/null 2>&1; then
+            echo "  Restarting machine scheduler to apply enabled-worker changes..."
+            stop_scheduler
+            start_scheduler
+        fi
+        return 0
+    fi
+
     local pids=$(pgrep -f "$worker_file")
     if [ -n "$pids" ]; then
         echo "  Stopping PIDs: $pids"
@@ -359,7 +388,6 @@ stop_worker() {
             kill -9 $remaining 2>/dev/null  # Force kill if still alive
             sleep 1
         fi
-        local canonical=$(basename "$worker_file" ".py")
         state_remove "$canonical"
         echo "✅ Stopped $worker"
         return 0
