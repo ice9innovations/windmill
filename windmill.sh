@@ -288,9 +288,8 @@ except Exception as exc:
 age = time.time() - float(data.get("updated_at_epoch", 0) or 0)
 state = data.get("state", "unknown")
 capacity = data.get("capacity", "unknown")
-consumer_priority = data.get("consumer_priority", "unknown")
 stale = " stale" if age > 10 else ""
-print(f"   scheduler: state={state} capacity={capacity} priority={consumer_priority} updated={age:.1f}s ago{stale}")
+print(f"   scheduler: state={state} capacity={capacity} updated={age:.1f}s ago{stale}")
 
 managed = data.get("managed") or []
 if managed:

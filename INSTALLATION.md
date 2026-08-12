@@ -83,7 +83,6 @@ LOG_LEVEL=INFO
 # machines to keep the normal independent-worker behavior.
 WINDMILL_WORKER_CAPACITY=
 WINDMILL_ENABLED_WORKERS=
-WINDMILL_SCHEDULER_CONSUMER_PRIORITY=-10
 ```
 
 Important notes:
@@ -92,7 +91,6 @@ Important notes:
 - `service_config.yaml` is separate from `.env`; it controls service endpoints and tier membership
 - set `WINDMILL_WORKER_CAPACITY=1` on Pi-class boxes, `2` on Jetsons that can handle two jobs, and leave it blank on desktops
 - `WINDMILL_ENABLED_WORKERS` is a comma-separated list of workers the capacity scheduler may run
-- `WINDMILL_SCHEDULER_CONSUMER_PRIORITY` should stay lower than normal workers so edge schedulers only claim work when higher-priority consumers are unavailable
 - producers must publish `trace_id`; Windmill uses it for primary-result idempotency
 - `IMAGE_STORE_MODE=inline` is the default and requires no extra infrastructure
 
