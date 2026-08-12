@@ -31,7 +31,6 @@ NC='\033[0m'
 # Per-machine state file — tracks which workers are enabled on this machine.
 # Managed automatically by start/stop; never committed to git.
 STATE_FILE=".windmill_state"
-SCHEDULER_STATUS_FILE=".windmill_scheduler_status"
 
 state_add() {
     local name="$1"
@@ -55,42 +54,6 @@ get_enabled_workers() {
     elif [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
         cat "$STATE_FILE"
     fi
-}
-
-normalize_worker_name() {
-    local worker="$1"
-    case "$worker" in
-        "caption_score")
-            worker="caption_score_worker"
-            ;;
-        "colors_post")
-            worker="colors_post_worker"
-            ;;
-        "face")
-            worker="face_worker"
-            ;;
-        "pose")
-            worker="pose_worker"
-            ;;
-    esac
-    if [[ "$worker" == *.py ]]; then
-        worker="$(basename "$worker" ".py")"
-    fi
-    if [[ "$worker" != *_worker ]]; then
-        worker="${worker}_worker"
-    fi
-    echo "$worker"
-}
-
-worker_enabled_for_scheduler() {
-    local target
-    target="$(normalize_worker_name "$1")"
-    for enabled_worker in $(get_enabled_workers); do
-        if [ "$(normalize_worker_name "$enabled_worker")" = "$target" ]; then
-            return 0
-        fi
-    done
-    return 1
 }
 
 bootstrap_state_from_running() {
@@ -202,85 +165,22 @@ stop_all() {
 status_all() {
     echo "📊 Worker Status:"
     echo "===================="
-    local scheduler_running=0
     if pgrep -f "workers/machine_scheduler_worker.py" >/dev/null 2>&1; then
-        scheduler_running=1
         local scheduler_pid=$(pgrep -f "workers/machine_scheduler_worker.py")
         echo -e "${GREEN}✅ machine_scheduler_worker${NC} (PID: $scheduler_pid, capacity: ${WINDMILL_WORKER_CAPACITY:-unset})"
-        print_scheduler_status
     else
         echo -e "${RED}❌ machine_scheduler_worker${NC} (not running, capacity: ${WINDMILL_WORKER_CAPACITY:-unset})"
-        if [ -f "$SCHEDULER_STATUS_FILE" ]; then
-            print_scheduler_status
-        fi
     fi
     
     # Check all workers - unified clean approach
     for worker in $(get_all_workers); do
-        if capacity_mode_enabled && worker_enabled_for_scheduler "$worker"; then
-            if [ "$scheduler_running" -eq 1 ]; then
-                echo -e "${GREEN}✅ $worker${NC} (managed by machine_scheduler_worker)"
-            else
-                echo -e "${YELLOW}⚠️  $worker${NC} (enabled for scheduler, scheduler not running)"
-            fi
-        elif pgrep -f "workers/${worker}.py" >/dev/null 2>&1; then
+        if pgrep -f "workers/${worker}.py" >/dev/null 2>&1; then
             local pid=$(pgrep -f "workers/${worker}.py")
             echo -e "${GREEN}✅ $worker${NC} (PID: $pid)"
         else
             echo -e "${RED}❌ $worker${NC} (not running)"
         fi
     done
-}
-
-print_scheduler_status() {
-    if [ ! -f "$SCHEDULER_STATUS_FILE" ]; then
-        echo "   scheduler status: not available yet"
-        return
-    fi
-    python - "$SCHEDULER_STATUS_FILE" <<'PY'
-import json
-import sys
-import time
-
-path = sys.argv[1]
-try:
-    with open(path) as f:
-        data = json.load(f)
-except Exception as exc:
-    print(f"   scheduler status: unreadable ({exc})")
-    raise SystemExit(0)
-
-age = time.time() - float(data.get("updated_at_epoch", 0) or 0)
-state = data.get("state", "unknown")
-capacity = data.get("capacity", "unknown")
-stale = " stale" if age > 10 else ""
-print(f"   scheduler: state={state} capacity={capacity} updated={age:.1f}s ago{stale}")
-
-managed = data.get("managed") or []
-if managed:
-    names = ", ".join(
-        f"{item.get('worker')}[{item.get('queue')}]"
-        for item in managed
-    )
-    print(f"   managed: {names}")
-else:
-    print("   managed: none")
-
-for slot in data.get("slots") or []:
-    slot_id = slot.get("slot")
-    failed = slot.get("failed")
-    job = slot.get("current_job")
-    if failed:
-        print(f"   slot {slot_id}: failed ({failed})")
-    elif job:
-        runtime = time.time() - float(job.get("started_at_epoch", time.time()))
-        print(
-            f"   slot {slot_id}: active "
-            f"{job.get('service')}[{job.get('queue')}] {runtime:.1f}s"
-        )
-    else:
-        print(f"   slot {slot_id}: idle")
-PY
 }
 
 stop_worker() {
