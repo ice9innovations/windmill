@@ -13,7 +13,7 @@ queue payloads.
 
 ```bash
 IMAGE_STORE_MODE=valkey
-VALKEY_HOST=images.ice9.ai
+VALKEY_HOST=valkey.example.com
 VALKEY_PORT=6379
 VALKEY_SSL=true
 VALKEY_USERNAME=windmill
@@ -45,7 +45,7 @@ IMAGE_RELAY_FALLBACK_DIRECT=false
 ## Smoke test from a Windmill node
 
 ```bash
-export REDISCLI_AUTH='your-secret'
+export REDISCLI_AUTH="$VALKEY_PASSWORD"
 valkey-cli --tls -h "$VALKEY_HOST" -p "$VALKEY_PORT" \
   --cacert "$VALKEY_CA_CERTS" \
   --user "$VALKEY_USERNAME" \
@@ -89,20 +89,21 @@ When `IMAGE_STORE_MODE=inline`:
   `VALKEY_KEEPALIVE_PING_SECONDS` is set, so infrequently used workers do not
   pay the first-request reconnect penalty as often
 - Same-site workers can read through a RAM-only relay by setting
-  `IMAGE_RELAY_URL`. Leave it unset for hosts at other sites, such as Boden.
+  `IMAGE_RELAY_URL`. Leave it unset for hosts at other sites.
 - A Valkey miss should be treated as an infrastructure problem, not a normal
   model failure
 
-## Dorothy LAN image relay
+## LAN image relay
 
-Start one relay on Dorothy with the normal Valkey credentials in its environment:
+Start one relay on the same LAN as latency-sensitive workers with the normal
+Valkey credentials in its environment:
 
 ```bash
 IMAGE_STORE_MODE=valkey \
-VALKEY_HOST=images.ice9.ai \
-IMAGE_RELAY_BIND_HOST=192.168.0.101 \
+VALKEY_HOST=valkey.example.com \
+IMAGE_RELAY_BIND_HOST=198.51.100.10 \
 IMAGE_RELAY_PORT=8787 \
-IMAGE_RELAY_ALLOWED_CIDRS=192.168.0.0/16 \
+IMAGE_RELAY_ALLOWED_CIDRS=198.51.100.0/24 \
 python image_relay.py
 ```
 
@@ -131,17 +132,17 @@ For example, five concurrent service requests for one image should look like
 
 Roll out manually:
 
-1. Start the relay on Dorothy.
-2. Verify health from Dorothy: `curl http://192.168.0.101:8787/healthz`.
-3. Verify LAN reachability from one Orin and confirm non-LAN hosts cannot reach it.
-4. Configure only one Orin worker first, preferably NSFW2:
-   `IMAGE_RELAY_URL=http://192.168.0.101:8787` and
+1. Start the relay on the LAN host.
+2. Verify health locally: `curl http://198.51.100.10:8787/healthz`.
+3. Verify LAN reachability from one worker and confirm non-LAN hosts cannot reach it.
+4. Configure only one same-LAN worker first, preferably NSFW2:
+   `IMAGE_RELAY_URL=http://198.51.100.10:8787` and
    `IMAGE_RELAY_FALLBACK_DIRECT=true`.
 5. Restart only that worker.
 6. Compare `/metrics`, relay logs, and existing
    `image_fetch_duration_seconds` event timings.
 7. Expand gradually to the remaining home-LAN workers.
-8. Leave Boden direct, or give Boden its own local relay later.
+8. Leave remote-site workers direct, or give each site its own local relay later.
 
 ## Current coverage
 
