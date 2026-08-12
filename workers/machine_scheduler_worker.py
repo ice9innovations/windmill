@@ -90,8 +90,9 @@ class MachineScheduler:
     def __init__(self):
         load_dotenv(REPO_ROOT / ".env")
         self.capacity = self._load_capacity()
-        self.poll_interval = float(os.getenv("WINDMILL_SCHEDULER_POLL_INTERVAL", "0.25"))
+        self.poll_interval = float(os.getenv("WINDMILL_SCHEDULER_POLL_INTERVAL", "0.02"))
         self.enabled_names = self._load_enabled_names()
+        self.queue_priority = _split_names(os.getenv("WINDMILL_SCHEDULER_QUEUE_PRIORITY", ""))
         self.logger = self._setup_logging()
         self.slots = []
         self.running = True
@@ -159,6 +160,7 @@ class MachineScheduler:
                     for name in self.enabled_names
                 ],
                 poll_interval=self.poll_interval,
+                queue_priority=self.queue_priority,
                 logger=self.logger,
             )
             for slot_id in range(self.capacity)
@@ -232,9 +234,9 @@ class MachineScheduler:
 
 
 class SchedulerSlot:
-    def __init__(self, *, slot_id, workers, poll_interval, logger):
+    def __init__(self, *, slot_id, workers, poll_interval, queue_priority, logger):
         self.slot_id = slot_id
-        self.workers = workers
+        self.workers = self._prioritize_workers(workers, queue_priority)
         self.poll_interval = poll_interval
         self.logger = logger
         self.running = threading.Event()
@@ -257,11 +259,6 @@ class SchedulerSlot:
 
     def stop(self):
         self.running.clear()
-        if self.connection is not None and not self.connection.is_closed:
-            try:
-                self.connection.add_callback_threadsafe(self._stop_consuming)
-            except Exception:
-                pass
 
     def join(self, timeout=None):
         if self.thread.is_alive():
@@ -285,12 +282,28 @@ class SchedulerSlot:
         with self.status_lock:
             self.current_job = job
 
-    def _stop_consuming(self):
-        try:
-            if self.channel is not None and self.channel.is_open:
-                self.channel.stop_consuming()
-        except Exception:
-            pass
+    def _prioritize_workers(self, workers, queue_priority):
+        if not queue_priority:
+            return list(workers)
+
+        priority = {}
+        for index, name in enumerate(queue_priority):
+            module_name = _worker_module_name(name)
+            short_name = module_name[:-7] if module_name.endswith("_worker") else module_name
+            priority[name] = index
+            priority[module_name] = index
+            priority[short_name] = index
+
+        def sort_key(worker):
+            module_name = _worker_module_name(worker.service_name.split(".", 1)[-1])
+            short_name = module_name[:-7] if module_name.endswith("_worker") else module_name
+            return min(
+                priority.get(worker.queue_name, 10_000),
+                priority.get(module_name, 10_000),
+                priority.get(short_name, 10_000),
+            )
+
+        return sorted(workers, key=sort_key)
 
     def _connect_queue(self):
         if self.connection is not None:
@@ -300,10 +313,6 @@ class SchedulerSlot:
                 pass
         connection_owner = self.workers[0]
         self.connection, self.channel = connection_owner._consume_queue.connect()
-        # RabbitMQ applies prefetch per consumer by default. Each scheduler slot
-        # registers one consumer per eligible queue on the same channel, so use
-        # channel-wide QoS to keep the slot at one unacked delivery total.
-        self.channel.basic_qos(prefetch_count=1, global_qos=True)
         for worker in self.workers:
             worker.connection = self.connection
             worker.channel = self.channel
@@ -318,14 +327,16 @@ class SchedulerSlot:
                 worker.queue_name,
                 worker.service_name,
             )
-            self.channel.basic_consume(
+
+    def _poll_once(self):
+        for worker in self.workers:
+            method, properties, body = self.channel.basic_get(
                 queue=worker.queue_name,
-                on_message_callback=self._build_callback(worker),
                 auto_ack=False,
             )
+            if method is None:
+                continue
 
-    def _build_callback(self, worker):
-        def callback(ch, method, properties, body):
             self.logger.info(
                 "Slot %s dispatching queue=%s service=%s delivery_tag=%s",
                 self.slot_id,
@@ -333,7 +344,7 @@ class SchedulerSlot:
                 worker.service_name,
                 method.delivery_tag,
             )
-            worker.channel = ch
+            worker.channel = self.channel
             self._set_current_job({
                 "service": worker.service_name,
                 "queue": worker.queue_name,
@@ -341,23 +352,30 @@ class SchedulerSlot:
                 "started_at_epoch": time.time(),
             })
             try:
-                worker.process_message(ch, method, properties, body)
+                worker.process_message(self.channel, method, properties, body)
             finally:
                 self._set_current_job(None)
-        return callback
+            return True
+        return False
 
-    def _consume_forever(self):
+    def _poll_forever(self):
         self._connect_queue()
-        self.logger.info("Slot %s waiting for RabbitMQ deliveries", self.slot_id)
-        self.channel.start_consuming()
+        self.logger.info(
+            "Slot %s polling RabbitMQ queues in order: %s",
+            self.slot_id,
+            ",".join(worker.queue_name for worker in self.workers),
+        )
+        while self.running.is_set():
+            if not self._poll_once():
+                time.sleep(self.poll_interval)
 
     def run(self):
         try:
             while self.running.is_set():
                 try:
-                    self._consume_forever()
+                    self._poll_forever()
                     if self.running.is_set():
-                        self.logger.warning("Slot %s consume loop stopped unexpectedly; reconnecting", self.slot_id)
+                        self.logger.warning("Slot %s polling loop stopped unexpectedly; reconnecting", self.slot_id)
                         time.sleep(2)
                 except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
                         pika.exceptions.StreamLostError) as exc:

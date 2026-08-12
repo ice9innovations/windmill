@@ -83,6 +83,8 @@ LOG_LEVEL=INFO
 # machines to keep the normal independent-worker behavior.
 WINDMILL_WORKER_CAPACITY=
 WINDMILL_ENABLED_WORKERS=
+WINDMILL_SCHEDULER_QUEUE_PRIORITY=
+WINDMILL_SCHEDULER_POLL_INTERVAL=0.02
 ```
 
 Important notes:
@@ -91,6 +93,7 @@ Important notes:
 - `service_config.yaml` is separate from `.env`; it controls service endpoints and tier membership
 - set `WINDMILL_WORKER_CAPACITY=1` on Pi-class boxes, `2` on Jetsons that can handle two jobs, and leave it blank on desktops
 - `WINDMILL_ENABLED_WORKERS` is a comma-separated list of workers the capacity scheduler may run
+- `WINDMILL_SCHEDULER_QUEUE_PRIORITY` is an optional comma-separated priority order used by capacity-mode slots when choosing the next queued job
 - producers must publish `trace_id`; Windmill uses it for primary-result idempotency
 - `IMAGE_STORE_MODE=inline` is the default and requires no extra infrastructure
 
