@@ -77,20 +77,12 @@ MAX_RETRIES=3
 RETRY_DELAY=5
 QUEUE_MESSAGE_TTL_MS=120000
 LOG_LEVEL=INFO
-
-# Optional edge-device scheduler. Set to the number of total concurrent
-# RabbitMQ tasks this box can safely run. Leave blank/unset on desktop/GPU
-# machines to keep the normal independent-worker behavior.
-WINDMILL_WORKER_CAPACITY=
-WINDMILL_ENABLED_WORKERS=
 ```
 
 Important notes:
 
 - the API and workers share the same queue and DB connectivity settings
 - `service_config.yaml` is separate from `.env`; it controls service endpoints and tier membership
-- set `WINDMILL_WORKER_CAPACITY=1` on Pi-class boxes, `2` on Jetsons that can handle two jobs, and leave it blank on desktops
-- `WINDMILL_ENABLED_WORKERS` is a comma-separated list of workers the capacity scheduler may run
 - producers must publish `trace_id`; Windmill uses it for primary-result idempotency
 - `IMAGE_STORE_MODE=inline` is the default and requires no extra infrastructure
 

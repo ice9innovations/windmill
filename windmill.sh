@@ -6,20 +6,6 @@ SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 cd "$SCRIPT_DIR"
 source windmill_venv/bin/activate
 
-load_dotenv_key() {
-    local key="$1"
-    if [ -f ".env" ]; then
-        grep -E "^${key}=" ".env" | tail -n 1 | cut -d= -f2-
-    fi
-}
-
-if [ -z "${WINDMILL_WORKER_CAPACITY+x}" ]; then
-    WINDMILL_WORKER_CAPACITY="$(load_dotenv_key "WINDMILL_WORKER_CAPACITY")"
-fi
-if [ -z "${WINDMILL_ENABLED_WORKERS+x}" ]; then
-    WINDMILL_ENABLED_WORKERS="$(load_dotenv_key "WINDMILL_ENABLED_WORKERS")"
-fi
-
 ACTION="$1"
 
 # Colors
@@ -49,9 +35,7 @@ state_remove() {
 }
 
 get_enabled_workers() {
-    if [ -n "$WINDMILL_ENABLED_WORKERS" ]; then
-        echo "$WINDMILL_ENABLED_WORKERS" | tr ',' '\n' | tr ' ' '\n' | sed '/^$/d'
-    elif [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
+    if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
         cat "$STATE_FILE"
     fi
 }
@@ -82,27 +66,11 @@ get_all_workers() {
             basename_file=$(basename "$worker_file" ".py")
             
             # Skip base classes and utilities
-            if [[ "$basename_file" != "base_worker" && "$basename_file" != "machine_scheduler_worker" && "$basename_file" != "postprocessing_worker" && "$basename_file" != "db_worker" && "$basename_file" != "service_config" ]]; then
+            if [[ "$basename_file" != "base_worker" && "$basename_file" != "postprocessing_worker" && "$basename_file" != "db_worker" && "$basename_file" != "service_config" ]]; then
                 echo "$basename_file"
             fi
         fi
     done | sort -u
-}
-
-capacity_mode_enabled() {
-    [ -n "${WINDMILL_WORKER_CAPACITY:-}" ]
-}
-
-start_scheduler() {
-    mkdir -p logs
-    if pgrep -f "workers/machine_scheduler_worker.py" >/dev/null 2>&1; then
-        local pid=$(pgrep -f "workers/machine_scheduler_worker.py")
-        echo -e "${GREEN}✅ machine_scheduler_worker${NC} already running (PID: $pid)"
-        return 0
-    fi
-    echo "  Starting machine scheduler with WINDMILL_WORKER_CAPACITY=$WINDMILL_WORKER_CAPACITY..."
-    nohup python workers/machine_scheduler_worker.py >> logs/machine_scheduler_worker.log 2>&1 &
-    echo -e "${GREEN}✅ Started machine scheduler${NC}"
 }
 
 start_all() {
@@ -118,13 +86,7 @@ start_all() {
 
     if [ -z "$enabled" ]; then
         echo -e "${YELLOW}⚠️  No enabled workers on this machine.${NC}"
-        echo "    Use './windmill.sh start <worker>' or WINDMILL_ENABLED_WORKERS to enable workers."
-        return
-    fi
-
-    if capacity_mode_enabled; then
-        echo "🚦 Capacity mode enabled; starting one machine scheduler."
-        start_scheduler
+        echo "    Use './windmill.sh start <worker>' to enable workers."
         return
     fi
 
@@ -139,9 +101,6 @@ start_all() {
 
 stop_all() {
     echo "🛑 Stopping all workers..."
-    if pkill -f "workers/machine_scheduler_worker.py" 2>/dev/null; then
-        echo "  ✅ Stopped machine_scheduler_worker"
-    fi
     
     # Stop each worker individually - now they can all be targeted precisely!
     for worker in $(get_all_workers); do
@@ -165,12 +124,6 @@ stop_all() {
 status_all() {
     echo "📊 Worker Status:"
     echo "===================="
-    if pgrep -f "workers/machine_scheduler_worker.py" >/dev/null 2>&1; then
-        local scheduler_pid=$(pgrep -f "workers/machine_scheduler_worker.py")
-        echo -e "${GREEN}✅ machine_scheduler_worker${NC} (PID: $scheduler_pid, capacity: ${WINDMILL_WORKER_CAPACITY:-unset})"
-    else
-        echo -e "${RED}❌ machine_scheduler_worker${NC} (not running, capacity: ${WINDMILL_WORKER_CAPACITY:-unset})"
-    fi
     
     # Check all workers - unified clean approach
     for worker in $(get_all_workers); do
@@ -275,12 +228,6 @@ start_worker() {
     local log_name=$(basename "$worker_file" ".py")
 
     state_add "$log_name"
-
-    if capacity_mode_enabled; then
-        echo "  Capacity mode enabled; registering $worker for scheduler."
-        start_scheduler
-        return 0
-    fi
 
     echo "  Starting $worker..."
     nohup python $worker_file >> logs/${log_name}.log 2>&1 &

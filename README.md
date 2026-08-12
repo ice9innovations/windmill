@@ -396,21 +396,6 @@ Workers are stateless — any machine with `.env` credentials and a `*_worker.py
 ./windmill.sh start noun_consensus_worker caption_summary_worker
 ```
 
-On constrained edge devices that should be eligible for many queues but accept
-only a fixed number of RabbitMQ tasks total, enable the machine scheduler in
-that box's `.env`:
-
-```bash
-WINDMILL_WORKER_CAPACITY=1
-WINDMILL_ENABLED_WORKERS=blip,qwen,ocr,colors,nsfw2
-```
-
-Use the hardware's real concurrency limit: for example `1` on Pi-class boxes
-and `2` on Jetsons that can safely run two jobs at once.
-
-Leave `WINDMILL_WORKER_CAPACITY` blank or unset on desktop/GPU boxes to keep the
-normal independent-worker behavior.
-
 ---
 
 ## Code Layout
@@ -423,7 +408,6 @@ core/
   results.py              All DB result queries
 workers/
   base_worker.py          BaseWorker — shared queue/DB/HTTP plumbing
-  machine_scheduler_worker.py Per-machine capacity scheduler for edge devices
   service_config.py       ServiceConfig class, get_service_config()
   harmony_worker.py       IoU clustering and postprocessing dispatch
   noun_consensus_worker.py Noun extraction, verb/SVO extraction, category tally
