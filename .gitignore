@@ -12,6 +12,7 @@ workers/mwe.txt
 config/mwe.txt
 .windmill_state
 ansible/inventory.yml
+internal/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
