@@ -13,6 +13,7 @@ import base64
 import io
 import threading
 import ssl
+from types import SimpleNamespace
 import pika
 import psycopg2
 import requests
@@ -25,8 +26,8 @@ from service_config import get_service_config
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from core.image_store import (
-    get_crop,
-    get_image,
+    get_crop_with_stats,
+    get_image_with_stats,
     get_image_store_config,
     is_valkey_image_store_enabled,
     ping as ping_image_store,
@@ -176,6 +177,8 @@ class BaseWorker:
         # Performance configuration
         self.processing_delay = float(os.getenv('PROCESSING_DELAY', '0.0'))
         self.image_store_config = get_image_store_config()
+        self._last_image_fetch_stats = None
+        self._last_crop_fetch_stats = None
 
     def _service_event_metadata(self):
         """Return worker placement metadata for per-request trace events."""
@@ -276,6 +279,28 @@ class BaseWorker:
             self.logger.error(f"Failed to decode {field_name}: {e}")
             return None
 
+    def _fetch_stats_event_data(self, stats):
+        if stats is None:
+            return {}
+        data = {
+            'image_fetch_transport': stats.transport,
+            'image_fetch_bytes': stats.bytes,
+            'image_fetch_found': stats.found,
+            'image_ref_id': stats.ref_id,
+            'image_fetch_transport_duration_seconds': round(stats.duration_seconds, 6),
+        }
+        if stats.relay_url:
+            data['image_relay_url'] = stats.relay_url
+        if stats.relay_duration_seconds is not None:
+            data['image_relay_duration_seconds'] = round(stats.relay_duration_seconds, 6)
+        if stats.direct_duration_seconds is not None:
+            data['image_direct_valkey_duration_seconds'] = round(stats.direct_duration_seconds, 6)
+        if stats.fallback_direct:
+            data['image_relay_fallback_direct'] = True
+        if stats.error:
+            data['image_fetch_error'] = stats.error
+        return data
+
     def _normalize_failed_reason(self, value):
         if value is None:
             return None
@@ -289,10 +314,11 @@ class BaseWorker:
         return str(value)[:1000]
 
     def resolve_image_bytes(self, message, required=True):
+        self._last_image_fetch_stats = None
         image_ref = message.get('image_ref')
         if image_ref:
             fetch_started_at = time.time()
-            image_bytes = get_image(
+            image_bytes, fetch_stats = get_image_with_stats(
                 image_ref,
                 config=self.image_store_config,
                 log=self.logger,
@@ -303,25 +329,40 @@ class BaseWorker:
                     "Trace-Id": message.get("trace_id"),
                 },
             )
+            self._last_image_fetch_stats = fetch_stats
             fetch_duration = time.time() - fetch_started_at
             if image_bytes is not None:
-                if self.service_name == 'system.florence2_grounding':
-                    self.logger.info(
-                        f"{self.service_name}: image_ref fetch image={message.get('image_id')} "
-                        f"duration={fetch_duration:.3f}s bytes={len(image_bytes)}"
-                    )
+                self.logger.info(
+                    f"{self.service_name}: image_ref fetch image={message.get('image_id')} "
+                    f"transport={fetch_stats.transport} duration={fetch_duration:.3f}s "
+                    f"bytes={len(image_bytes)} ref_id={fetch_stats.ref_id}"
+                )
                 return image_bytes
             self.logger.error(
                 f"{self.service_name}: image_ref missing or expired for image {message.get('image_id')}: "
-                f"{image_ref} (fetch_duration={fetch_duration:.3f}s)"
+                f"{image_ref} (fetch_duration={fetch_duration:.3f}s transport={fetch_stats.transport})"
             )
             if not required:
                 return None
 
         image_data = message.get('image_data')
         if image_data:
+            decode_started_at = time.time()
             image_bytes = self._decode_base64_field(image_data, 'image_data')
             if image_bytes is not None:
+                decode_duration = time.time() - decode_started_at
+                self._last_image_fetch_stats = SimpleNamespace(
+                    transport='inline_base64',
+                    duration_seconds=decode_duration,
+                    bytes=len(image_bytes),
+                    found=True,
+                    ref_id=None,
+                    relay_url=None,
+                    relay_duration_seconds=None,
+                    direct_duration_seconds=None,
+                    fallback_direct=False,
+                    error=None,
+                )
                 return image_bytes
 
         if required:
@@ -341,9 +382,10 @@ class BaseWorker:
         return base64.b64encode(image_bytes).decode('utf-8')
 
     def resolve_crop_bytes(self, message, required=True):
+        self._last_crop_fetch_stats = None
         crop_ref = message.get('crop_ref')
         if crop_ref:
-            crop_bytes = get_crop(
+            crop_bytes, fetch_stats = get_crop_with_stats(
                 crop_ref,
                 config=self.image_store_config,
                 log=self.logger,
@@ -355,6 +397,7 @@ class BaseWorker:
                     "Merged-Box-Id": message.get("merged_box_id"),
                 },
             )
+            self._last_crop_fetch_stats = fetch_stats
             if crop_bytes is not None:
                 return crop_bytes
             self.logger.error(
@@ -1669,6 +1712,7 @@ class BaseWorker:
             else:
                 image_transport_kind = 'unknown'
             image_store_mode = getattr(self.image_store_config, 'mode', None)
+            image_fetch_detail_data = self._fetch_stats_event_data(self._last_image_fetch_stats)
 
             def _iso_utc(epoch_seconds):
                 return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).isoformat()
@@ -1682,6 +1726,7 @@ class BaseWorker:
                 'image_transport_kind': image_transport_kind,
                 'image_store_mode': image_store_mode,
                 'image_fetch_duration_seconds': round(image_fetch_duration, 6),
+                **image_fetch_detail_data,
             }))
             started_event_data = json.dumps(self._with_service_event_metadata({
                 'event_at': _iso_utc(request_started_at),
@@ -1689,6 +1734,7 @@ class BaseWorker:
                 'image_transport_kind': image_transport_kind,
                 'image_store_mode': image_store_mode,
                 'image_fetch_duration_seconds': round(image_fetch_duration, 6),
+                **image_fetch_detail_data,
             }))
             image_resolved_event_data = json.dumps(self._with_service_event_metadata({
                 'event_at': _iso_utc(image_resolved_at),
@@ -1696,6 +1742,7 @@ class BaseWorker:
                 'image_transport_kind': image_transport_kind,
                 'image_store_mode': image_store_mode,
                 'image_fetch_duration_seconds': round(image_fetch_duration, 6),
+                **image_fetch_detail_data,
             }))
             request_sent_event_data = json.dumps(self._with_service_event_metadata({
                 'event_at': _iso_utc(request_sent_at),
@@ -1718,6 +1765,7 @@ class BaseWorker:
                 'image_store_mode': image_store_mode,
                 'request_duration_seconds': round(request_duration, 6),
                 'image_fetch_duration_seconds': round(image_fetch_duration, 6),
+                **image_fetch_detail_data,
                 'upstream_queue_wait_seconds': round(upstream_queue_wait, 6) if upstream_queue_wait is not None else None,
                 'http_status': self._extract_http_status(result),
                 'result_status': result_status,
@@ -1975,6 +2023,7 @@ class BaseWorker:
                 f"{self.service_name} image={image_id}",
                 f"parse={parse_duration:.3f}s",
                 f"fetch={image_fetch_duration:.3f}s",
+                f"fetch_transport={image_fetch_detail_data.get('image_fetch_transport', '-')}",
                 f"request={request_duration:.3f}s",
                 f"persist={persist_duration:.3f}s",
                 f"post_store={poststore_duration:.3f}s",

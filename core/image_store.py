@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from threading import Lock
 from threading import Thread
 from threading import Event
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from urllib.parse import quote, urljoin
 import time
 
@@ -111,6 +111,21 @@ class ImageStoreConfig:
             raise ValueError("VALKEY_CROP_TTL_SECONDS must be a positive integer")
         if self.relay_timeout_seconds <= 0:
             raise ValueError("IMAGE_RELAY_TIMEOUT_SECONDS must be positive")
+
+
+@dataclass(frozen=True)
+class ImageFetchStats:
+    kind: str
+    transport: str
+    duration_seconds: float
+    bytes: int
+    found: bool
+    ref_id: str
+    relay_url: Optional[str] = None
+    direct_duration_seconds: Optional[float] = None
+    relay_duration_seconds: Optional[float] = None
+    fallback_direct: bool = False
+    error: Optional[str] = None
 
 
 def get_image_store_config() -> ImageStoreConfig:
@@ -249,6 +264,28 @@ def get_bytes(
     return payload
 
 
+def get_bytes_with_stats(
+    ref: str,
+    refresh_ttl_s: Optional[int] = None,
+    config: Optional[ImageStoreConfig] = None,
+    log: Optional[logging.Logger] = None,
+    *,
+    kind: str = "bytes",
+) -> Tuple[Optional[bytes], ImageFetchStats]:
+    start = time.perf_counter()
+    payload = get_bytes(ref, refresh_ttl_s=refresh_ttl_s, config=config, log=log)
+    duration = time.perf_counter() - start
+    return payload, ImageFetchStats(
+        kind=kind,
+        transport="direct_valkey",
+        duration_seconds=duration,
+        direct_duration_seconds=duration,
+        bytes=len(payload) if payload is not None else 0,
+        found=payload is not None,
+        ref_id=_ref_log_id(ref),
+    )
+
+
 def _ref_log_id(ref: str) -> str:
     return hashlib.sha256(ref.encode("utf-8")).hexdigest()[:12]
 
@@ -305,6 +342,35 @@ def _get_bytes_via_relay(
     return payload
 
 
+def _get_bytes_via_relay_with_stats(
+    ref: str,
+    *,
+    kind: str,
+    config: ImageStoreConfig,
+    log: Optional[logging.Logger] = None,
+    relay_attribution: Optional[Dict[str, str]] = None,
+) -> Tuple[Optional[bytes], ImageFetchStats]:
+    start = time.perf_counter()
+    payload = _get_bytes_via_relay(
+        ref,
+        kind=kind,
+        config=config,
+        log=log,
+        relay_attribution=relay_attribution,
+    )
+    duration = time.perf_counter() - start
+    return payload, ImageFetchStats(
+        kind=kind,
+        transport="image_relay",
+        duration_seconds=duration,
+        relay_duration_seconds=duration,
+        bytes=len(payload) if payload is not None else 0,
+        found=payload is not None,
+        ref_id=_ref_log_id(ref),
+        relay_url=config.relay_url,
+    )
+
+
 def _get_bytes_with_optional_relay(
     ref: str,
     *,
@@ -348,6 +414,71 @@ def _get_bytes_with_optional_relay(
         return payload
 
 
+def _get_bytes_with_optional_relay_stats(
+    ref: str,
+    *,
+    kind: str,
+    refresh_ttl_s: Optional[int],
+    config: ImageStoreConfig,
+    log: Optional[logging.Logger] = None,
+    relay_attribution: Optional[Dict[str, str]] = None,
+) -> Tuple[Optional[bytes], ImageFetchStats]:
+    if not config.relay_url:
+        return get_bytes_with_stats(
+            ref,
+            refresh_ttl_s=refresh_ttl_s,
+            config=config,
+            log=log,
+            kind=kind,
+        )
+
+    active_logger = log or logger
+    relay_started = time.perf_counter()
+    try:
+        return _get_bytes_via_relay_with_stats(
+            ref,
+            kind=kind,
+            config=config,
+            log=active_logger,
+            relay_attribution=relay_attribution,
+        )
+    except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+        relay_duration = time.perf_counter() - relay_started
+        active_logger.warning(
+            "image_relay failed kind=%s ref_id=%s error=%s fallback_direct=%s",
+            kind,
+            _ref_log_id(ref),
+            exc.__class__.__name__,
+            config.relay_fallback_direct,
+        )
+        if not config.relay_fallback_direct:
+            raise
+        direct_started = time.perf_counter()
+        payload = get_bytes(ref, refresh_ttl_s=refresh_ttl_s, config=config, log=active_logger)
+        direct_duration = time.perf_counter() - direct_started
+        total_duration = relay_duration + direct_duration
+        active_logger.warning(
+            "image_relay fallback_direct kind=%s ref_id=%s duration=%.3fs bytes=%d",
+            kind,
+            _ref_log_id(ref),
+            direct_duration,
+            len(payload) if payload is not None else 0,
+        )
+        return payload, ImageFetchStats(
+            kind=kind,
+            transport="image_relay_fallback_direct",
+            duration_seconds=total_duration,
+            relay_duration_seconds=relay_duration,
+            direct_duration_seconds=direct_duration,
+            bytes=len(payload) if payload is not None else 0,
+            found=payload is not None,
+            ref_id=_ref_log_id(ref),
+            relay_url=config.relay_url,
+            fallback_direct=True,
+            error=exc.__class__.__name__,
+        )
+
+
 def get_image(
     ref: str,
     refresh_ttl_s: Optional[int] = None,
@@ -367,6 +498,25 @@ def get_image(
     )
 
 
+def get_image_with_stats(
+    ref: str,
+    refresh_ttl_s: Optional[int] = None,
+    config: Optional[ImageStoreConfig] = None,
+    log: Optional[logging.Logger] = None,
+    relay_attribution: Optional[Dict[str, str]] = None,
+) -> Tuple[Optional[bytes], ImageFetchStats]:
+    config = config or get_image_store_config()
+    refresh_ttl_s = refresh_ttl_s or config.image_ttl_seconds
+    return _get_bytes_with_optional_relay_stats(
+        ref,
+        kind="image",
+        refresh_ttl_s=refresh_ttl_s,
+        config=config,
+        log=log,
+        relay_attribution=relay_attribution,
+    )
+
+
 def get_crop(
     ref: str,
     refresh_ttl_s: Optional[int] = None,
@@ -377,6 +527,25 @@ def get_crop(
     config = config or get_image_store_config()
     refresh_ttl_s = refresh_ttl_s or config.crop_ttl_seconds
     return _get_bytes_with_optional_relay(
+        ref,
+        kind="crop",
+        refresh_ttl_s=refresh_ttl_s,
+        config=config,
+        log=log,
+        relay_attribution=relay_attribution,
+    )
+
+
+def get_crop_with_stats(
+    ref: str,
+    refresh_ttl_s: Optional[int] = None,
+    config: Optional[ImageStoreConfig] = None,
+    log: Optional[logging.Logger] = None,
+    relay_attribution: Optional[Dict[str, str]] = None,
+) -> Tuple[Optional[bytes], ImageFetchStats]:
+    config = config or get_image_store_config()
+    refresh_ttl_s = refresh_ttl_s or config.crop_ttl_seconds
+    return _get_bytes_with_optional_relay_stats(
         ref,
         kind="crop",
         refresh_ttl_s=refresh_ttl_s,
