@@ -1,0 +1,77 @@
+# moderation.yaml - Content flagging configuration
+#
+# Philosophy: Flag factual content presence without judgment.
+# Downstream consumers decide how to handle flags based on their policies.
+#
+# Matching: Triggers match complete noun tokens or simple plural forms.
+# Add compound terms explicitly when they should be flagged.
+# Examples: "gun" matches "gun" and "guns"; "bra" does not match "braid".
+
+flag_categories:
+  hate_symbols:
+    description: "Widely recognized hate symbols and extremist imagery"
+    triggers:
+      - nazi
+      - swastika
+      - kkk
+      - confederate flag
+
+  weapons:
+    description: "Weapons and armaments"
+    triggers:
+      - gun
+      - handgun
+      - gunfire
+      - rifle
+      - pistol
+      - knife
+      - knives
+      - sword
+      - weapon
+      - firearm
+      - blade
+
+  adult_content:
+    description: "Adult-oriented content (not explicit nudity)"
+    triggers:
+      - bikini
+      - swimsuit
+      - lingerie
+      - underwear
+      - bra
+      - thong
+
+  substances:
+    description: "Drugs, alcohol, and tobacco"
+    triggers:
+      - alcohol
+      - beer
+      - wine
+      - vodka
+      - whiskey
+      - cigarette
+      - cigar
+      - tobacco
+      - marijuana
+      - cannabis
+      - drug
+      - cocaine
+      - heroin
+
+# ============================================================================
+# OPTIONAL USER EXTENSIONS
+# ============================================================================
+# Add additional categories below as needed for your use case.
+# These are NOT enabled by default to avoid false equivalences or
+# inappropriate groupings of unrelated content.
+#
+# Example extension (uncomment and modify as needed):
+#
+# content_types:
+#   description: "Neutral content categorization for feed filtering"
+#   triggers:
+#     - protest
+#     - rally
+#     - demonstration
+#     - religious building
+#     - political event

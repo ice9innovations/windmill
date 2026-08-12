@@ -11,6 +11,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 import json
 import hashlib
+import re
 import time
 import psycopg2
 import yaml
@@ -33,13 +34,14 @@ from utils.spatial_analysis import (
 from utils.framing_analysis import classify_framing
 from utils.face_correlation import correlate_faces, get_face_gender_attribution
 
-ANALYSIS_VERSION = '1.4.8'  # Added canonical category + scene summary payload
+ANALYSIS_VERSION = '1.4.9'  # Tightened moderation flag matching
 
 _PERSON_EMOJIS = frozenset(['🧑', '👩', '🧒'])
+_WORD_RE = re.compile(r'[a-z0-9]+')
 
 
 def load_content_flags():
-    """Load content flagging configuration from YAML file.
+    """Load moderation flagging configuration from YAML file.
 
     Returns dict mapping category -> list of trigger words, or None on error.
     """
@@ -50,18 +52,48 @@ def load_content_flags():
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
 
-        # Extract just the triggers from each category
+        # Extract just the triggers from each category.
         flags = {}
         if config and 'flag_categories' in config:
             for category, data in config['flag_categories'].items():
-                if 'triggers' in data:
+                if isinstance(data, dict) and 'triggers' in data:
                     flags[category] = data['triggers']
 
         return flags
     except Exception as e:
         # Log error but don't crash - flagging is optional
-        print(f"Warning: Could not load content_flags.yaml: {e}")
+        print(f"Warning: Could not load moderation.yaml: {e}")
         return None
+
+
+def _plural_forms(word):
+    """Return simple English plural forms for noun trigger matching."""
+    forms = {word}
+    if word.endswith('y') and len(word) > 1 and word[-2] not in 'aeiou':
+        forms.add(f'{word[:-1]}ies')
+    elif word.endswith(('s', 'x', 'z', 'ch', 'sh')):
+        forms.add(f'{word}es')
+    else:
+        forms.add(f'{word}s')
+    return forms
+
+
+def _matches_content_trigger(canonical, trigger):
+    canonical_tokens = _WORD_RE.findall(canonical.lower())
+    trigger_tokens = _WORD_RE.findall(trigger.lower())
+
+    if not canonical_tokens or not trigger_tokens:
+        return False
+
+    if len(trigger_tokens) == 1:
+        forms = _plural_forms(trigger_tokens[0])
+        return any(token in forms for token in canonical_tokens)
+
+    trigger_length = len(trigger_tokens)
+    return any(
+        canonical_tokens[index:index + trigger_length] == trigger_tokens
+        for index in range(len(canonical_tokens) - trigger_length + 1)
+    )
 
 
 def check_content_flags(noun_consensus_data, flag_config):
@@ -91,11 +123,7 @@ def check_content_flags(noun_consensus_data, flag_config):
         # Check against all flag triggers
         for category, triggers in flag_config.items():
             for trigger in triggers:
-                trigger_lower = trigger.lower()
-
-                # Match if trigger appears in noun or noun contains trigger
-                # Examples: "gun" matches "gun", "guns", "handgun"
-                if trigger_lower in canonical or canonical in trigger_lower:
+                if _matches_content_trigger(canonical, trigger):
                     flags.append({
                         'category': category,
                         'value': canonical,
