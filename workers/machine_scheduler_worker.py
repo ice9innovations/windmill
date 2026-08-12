@@ -257,11 +257,6 @@ class SchedulerSlot:
 
     def stop(self):
         self.running.clear()
-        if self.connection is not None and not self.connection.is_closed:
-            try:
-                self.connection.add_callback_threadsafe(self._stop_consuming)
-            except Exception:
-                pass
 
     def join(self, timeout=None):
         if self.thread.is_alive():
@@ -284,13 +279,6 @@ class SchedulerSlot:
     def _set_current_job(self, job):
         with self.status_lock:
             self.current_job = job
-
-    def _stop_consuming(self):
-        try:
-            if self.channel is not None and self.channel.is_open:
-                self.channel.stop_consuming()
-        except Exception:
-            pass
 
     def _connect_queue(self):
         if self.connection is not None:
@@ -315,47 +303,47 @@ class SchedulerSlot:
                 worker.queue_name,
                 worker.service_name,
             )
-            self.channel.basic_consume(
-                queue=worker.queue_name,
-                on_message_callback=self._build_callback(worker),
-                auto_ack=False,
-            )
-
-    def _build_callback(self, worker):
-        def callback(ch, method, properties, body):
-            self.logger.info(
-                "Slot %s dispatching queue=%s service=%s delivery_tag=%s",
-                self.slot_id,
-                worker.queue_name,
-                worker.service_name,
-                method.delivery_tag,
-            )
-            worker.channel = ch
-            self._set_current_job({
-                "service": worker.service_name,
-                "queue": worker.queue_name,
-                "delivery_tag": method.delivery_tag,
-                "started_at_epoch": time.time(),
-            })
-            try:
-                worker.process_message(ch, method, properties, body)
-            finally:
-                self._set_current_job(None)
-        return callback
-
-    def _consume_forever(self):
-        self._connect_queue()
-        self.logger.info("Slot %s waiting for RabbitMQ deliveries", self.slot_id)
-        self.channel.start_consuming()
 
     def run(self):
         try:
+            next_index = 0
+            self._connect_queue()
             while self.running.is_set():
                 try:
-                    self._consume_forever()
-                    if self.running.is_set():
-                        self.logger.warning("Slot %s consume loop stopped unexpectedly; reconnecting", self.slot_id)
-                        time.sleep(2)
+                    worker_count = len(self.workers)
+                    found = False
+                    for offset in range(worker_count):
+                        index = (next_index + offset) % worker_count
+                        worker = self.workers[index]
+                        method, properties, body = self.channel.basic_get(
+                            queue=worker.queue_name,
+                            auto_ack=False,
+                        )
+                        if method is None:
+                            continue
+                        found = True
+                        next_index = (index + 1) % worker_count
+                        self.logger.info(
+                            "Slot %s dispatching queue=%s service=%s delivery_tag=%s",
+                            self.slot_id,
+                            worker.queue_name,
+                            worker.service_name,
+                            method.delivery_tag,
+                        )
+                        worker.channel = self.channel
+                        self._set_current_job({
+                            "service": worker.service_name,
+                            "queue": worker.queue_name,
+                            "delivery_tag": method.delivery_tag,
+                            "started_at_epoch": time.time(),
+                        })
+                        try:
+                            worker.process_message(self.channel, method, properties, body)
+                        finally:
+                            self._set_current_job(None)
+                        break
+                    if not found:
+                        time.sleep(self.poll_interval)
                 except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
                         pika.exceptions.StreamLostError) as exc:
                     if self.running.is_set():
