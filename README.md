@@ -403,17 +403,16 @@ that box's `.env`:
 ```bash
 WINDMILL_WORKER_CAPACITY=1
 WINDMILL_ENABLED_WORKERS=yolo_v8,nudenet,nsfw2,colors,metadata
-WINDMILL_SCHEDULER_QUEUE_PRIORITY=yolo_v8,nudenet,nsfw2,colors,metadata
 WINDMILL_SCHEDULER_POLL_INTERVAL=0.02
 ```
 
 Use the hardware's real concurrency limit: for example `1` on Pi-class boxes
 and `2` on Jetsons that can safely run two jobs at once.
 
-Capacity scheduler slots poll eligible queues only when a slot is free. Set
-`WINDMILL_SCHEDULER_QUEUE_PRIORITY` on constrained boxes to keep scarce or
-latency-sensitive queues ahead of cheaper fallback work. If unset, the scheduler
-uses `WINDMILL_ENABLED_WORKERS` order.
+Capacity scheduler slots poll eligible queues only when a slot is free. By
+default, known scarce/latency-sensitive queues are checked before cheaper
+fallback work. Set `WINDMILL_SCHEDULER_QUEUE_PRIORITY` only when a box needs a
+custom order.
 
 Leave `WINDMILL_WORKER_CAPACITY` blank or unset on desktop/GPU boxes to keep the
 normal independent-worker behavior.

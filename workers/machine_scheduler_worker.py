@@ -32,6 +32,16 @@ from core.postgres_connection import close_quietly
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STATE_FILE = REPO_ROOT / ".windmill_state"
 SCHEDULER_STATUS_FILE = REPO_ROOT / ".windmill_scheduler_status"
+DEFAULT_QUEUE_PRIORITY = [
+    "yolo_v8",
+    "nudenet",
+    "nsfw2",
+    "face",
+    "pose",
+    "colors",
+    "metadata",
+    "qr",
+]
 
 
 def _split_names(value):
@@ -92,7 +102,7 @@ class MachineScheduler:
         self.capacity = self._load_capacity()
         self.poll_interval = float(os.getenv("WINDMILL_SCHEDULER_POLL_INTERVAL", "0.02"))
         self.enabled_names = self._load_enabled_names()
-        self.queue_priority = _split_names(os.getenv("WINDMILL_SCHEDULER_QUEUE_PRIORITY", ""))
+        self.queue_priority = self._load_queue_priority()
         self.logger = self._setup_logging()
         self.slots = []
         self.running = True
@@ -122,6 +132,12 @@ class MachineScheduler:
         if names:
             return names
         return _state_worker_names()
+
+    def _load_queue_priority(self):
+        configured = _split_names(os.getenv("WINDMILL_SCHEDULER_QUEUE_PRIORITY", ""))
+        if configured:
+            return configured
+        return DEFAULT_QUEUE_PRIORITY
 
     def _handle_signal(self, _signum, _frame):
         self.running = False
