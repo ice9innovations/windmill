@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-Populate the images table from webp directory
+Populate the images table from a directory of WebP images.
 """
+import argparse
 import os
 import psycopg2
 from pathlib import Path
 from dotenv import load_dotenv
-
-# Note: images must be populated from a URL to support cloud deployments
-BASE_URL="http://192.168.0.121/coco/webp" # no trailing slash
 
 def connect_to_database():
     """Connect to PostgreSQL using .env credentials"""
@@ -40,7 +38,7 @@ def get_webp_files(webp_dir):
     print(f"📁 Found {len(webp_files)} webp files")
     return webp_files
 
-def populate_images_table(db_conn, webp_files):
+def populate_images_table(db_conn, webp_files, base_url, image_group):
     """Insert all images into the database"""
     cursor = db_conn.cursor()
     
@@ -60,8 +58,7 @@ def populate_images_table(db_conn, webp_files):
         for webp_file in batch:
             filename = webp_file.name
             local_path = str(webp_file)  # Local path (will be irrelevant for k1)
-            url = f"{BASE_URL}/{filename}"
-            image_group = "coco2017"
+            url = f"{base_url.rstrip('/')}/{filename}"
             
             values.append((filename, local_path, url, image_group))
         
@@ -90,14 +87,30 @@ def populate_images_table(db_conn, webp_files):
     final_count = cursor.fetchone()[0]
     print(f"📊 Total images in database: {final_count}")
 
+def parse_args():
+    load_dotenv()
+    parser = argparse.ArgumentParser(description="Populate images table from WebP files")
+    parser.add_argument("--webp-dir", default=os.getenv("WEBP_IMAGE_DIR"), help="Directory containing .webp files, or WEBP_IMAGE_DIR")
+    parser.add_argument("--base-url", default=os.getenv("WEBP_BASE_URL"), help="Public base URL for the files, or WEBP_BASE_URL")
+    parser.add_argument("--image-group", default=os.getenv("WEBP_IMAGE_GROUP", "coco2017"), help="images.image_group value")
+    args = parser.parse_args()
+    if not args.webp_dir:
+        parser.error("provide --webp-dir or WEBP_IMAGE_DIR")
+    if not args.base_url:
+        parser.error("provide --base-url or WEBP_BASE_URL")
+    return args
+
+
 def main():
-    webp_dir = "/home/sd/animal-farm/webp"
+    args = parse_args()
     
     print("🚀 Populating images table from webp directory")
-    print(f"📂 Source directory: {webp_dir}")
+    print(f"📂 Source directory: {args.webp_dir}")
+    print(f"🔗 Base URL: {args.base_url.rstrip('/')}")
+    print(f"🏷️  Image group: {args.image_group}")
     
     # Get webp files
-    webp_files = get_webp_files(webp_dir)
+    webp_files = get_webp_files(args.webp_dir)
     if not webp_files:
         return
     
@@ -110,7 +123,7 @@ def main():
         return
     
     # Populate table
-    populate_images_table(db_conn, webp_files)
+    populate_images_table(db_conn, webp_files, args.base_url, args.image_group)
     
     # Close connection
     db_conn.close()

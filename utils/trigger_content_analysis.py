@@ -137,8 +137,7 @@ def main():
 
     print("\nContent analysis messages published!")
     print("Start the content_analysis_worker to process them:")
-    print("  cd /home/sd/windmill/workers")
-    print("  python content_analysis_worker.py")
+    print("  python workers/content_analysis_worker.py")
 
     return 0
 

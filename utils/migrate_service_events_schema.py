@@ -13,13 +13,23 @@ import psycopg2
 from dotenv import load_dotenv
 
 
+def required_env(primary_key, fallback_key=None):
+    value = os.getenv(primary_key)
+    if not value and fallback_key:
+        value = os.getenv(fallback_key)
+    if not value:
+        names = primary_key if not fallback_key else f"{primary_key} or {fallback_key}"
+        raise ValueError(f"Required environment variable {names} not set")
+    return value
+
+
 def main():
     load_dotenv(".env")
     conn = psycopg2.connect(
-        dbname=os.getenv("DB_NAME", os.getenv("POSTGRES_DB", "windmill")),
-        user=os.getenv("DB_USER", os.getenv("POSTGRES_USER", "postgres")),
-        password=os.getenv("DB_PASSWORD", os.getenv("POSTGRES_PASSWORD", "postgres")),
-        host=os.getenv("DB_HOST", os.getenv("POSTGRES_HOST", "192.168.50.90")),
+        dbname=required_env("DB_NAME", "POSTGRES_DB"),
+        user=required_env("DB_USER", "POSTGRES_USER"),
+        password=required_env("DB_PASSWORD", "POSTGRES_PASSWORD"),
+        host=required_env("DB_HOST", "POSTGRES_HOST"),
         port=os.getenv("DB_PORT", os.getenv("POSTGRES_PORT", "5432")),
         sslmode=os.getenv("DB_SSLMODE"),
         connect_timeout=10,
