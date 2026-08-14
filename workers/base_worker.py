@@ -11,7 +11,6 @@ import logging
 import socket
 import base64
 import io
-import threading
 import ssl
 from types import SimpleNamespace
 import pika
@@ -160,6 +159,7 @@ class BaseWorker:
         self.request_timeout = int(os.getenv('REQUEST_TIMEOUT', '30'))
         self.max_retries = int(os.getenv('MAX_RETRIES', '3'))
         self.retry_delay = int(os.getenv('RETRY_DELAY', '5'))
+        self.vlm_final_wait_seconds = float(os.getenv('VLM_FINAL_WAIT_SECONDS', '5'))
         
         # Post-processing triggers - use new config loader methods
         self.bbox_services = self.config.get_spatial_services()
@@ -892,9 +892,9 @@ class BaseWorker:
         trigger_started_at = time.time()
         tier = message.get('tier', 'free')
         t0 = time.time()
-        is_latest, current_count, expected_count, latest_service = (
+        is_latest, current_count, expected_count, latest_service, wait_timed_out = (
             self._is_latest_vlm_terminal_for_tier(
-                image_id, tier, self._get_clean_service_name()
+                image_id, tier, self._get_clean_service_name(), message.get('submitted_at_epoch')
             )
         )
         latest_check_duration = time.time() - t0
@@ -936,6 +936,9 @@ class BaseWorker:
             'tier': tier,
             'submitted_at_epoch': message.get('submitted_at_epoch'),
             'consensus_enqueued_at_epoch': time.time(),
+            'vlm_wait_timed_out': wait_timed_out,
+            'current_vlm_count': current_count,
+            'expected_vlm_count': expected_count,
         }
         noun_consensus_message.update(self._image_transport_fields(message))
 
@@ -955,6 +958,9 @@ class BaseWorker:
                 'services_present': sorted(self._tier_vlm_service_names(tier)),
                 'source_service': self._get_clean_service_name(),
                 'submitted_at_epoch': message.get('submitted_at_epoch'),
+                'vlm_wait_timed_out': wait_timed_out,
+                'current_vlm_count': current_count,
+                'expected_vlm_count': expected_count,
             }
 
         t0 = time.time()
@@ -995,10 +1001,51 @@ class BaseWorker:
                 names.append(full_name.split('.', 1)[1])
         return names
 
+    def _available_tier_vlm_service_names(self, tier):
+        """Return tier VLMs with a fresh online worker, falling back to all tier VLMs.
+
+        Some services are single-host. If that host is down, the service can stay
+        in service_config while being unavailable in worker_registry; final VLM
+        fanout should not wait on that unavailable service.
+        """
+        vlm_services = self._tier_vlm_service_names(tier)
+        if not vlm_services:
+            return []
+
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                SELECT DISTINCT service
+                FROM worker_registry
+                WHERE service = ANY(%s::text[])
+                  AND status = 'online'
+                  AND last_heartbeat >= NOW() - (%s * INTERVAL '1 second')
+                """,
+                (vlm_services, self._heartbeat_interval * 3),
+            )
+            online = {row[0] for row in cursor.fetchall()}
+            cursor.close()
+            available = [service for service in vlm_services if service in online]
+            if available:
+                missing = sorted(set(vlm_services) - set(available))
+                if missing:
+                    self.logger.info(
+                        f"VLM availability tier={tier}: excluding unavailable "
+                        f"service(s): {', '.join(missing)}"
+                    )
+                return available
+        except Exception as e:
+            self.logger.warning(
+                f"Failed VLM availability check for tier={tier}; using configured set: {e}"
+            )
+
+        return vlm_services
+
     def _is_vlm_set_complete_for_tier(self, image_id, tier):
         """Return (ready, current_count, expected_count) for tier VLM completion."""
         try:
-            vlm_services = self._tier_vlm_service_names(tier)
+            vlm_services = self._available_tier_vlm_service_names(tier)
             expected_count = len(vlm_services)
             if expected_count == 0:
                 return False, 0, 0
@@ -1023,19 +1070,23 @@ class BaseWorker:
             )
             return False, 0, 0
 
-    def _is_latest_vlm_terminal_for_tier(self, image_id, tier, current_service):
-        """Return whether the current service is the latest terminal VLM result.
+    def _is_latest_vlm_terminal_for_tier(
+        self, image_id, tier, current_service, submitted_at_epoch=None
+    ):
+        """Return whether the current service should trigger final VLM fanout.
 
         Terminal means a VLM has settled to either success or failed. This is
         stricter than mere completeness. It prevents multiple late VLMs from
         all triggering the same final consensus work after they each observe a
-        fully settled tier set.
+        fully settled tier set. Once the submission age exceeds
+        VLM_FINAL_WAIT_SECONDS, the latest terminal VLM can trigger with the
+        partial set that has returned so far.
         """
         try:
-            vlm_services = self._tier_vlm_service_names(tier)
+            vlm_services = self._available_tier_vlm_service_names(tier)
             expected_count = len(vlm_services)
             if expected_count == 0:
-                return False, 0, 0, None
+                return False, 0, 0, None, False
 
             cursor = self.db_conn.cursor()
             cursor.execute(
@@ -1058,16 +1109,25 @@ class BaseWorker:
 
             current_count = row[0] or 0
             latest_service = row[1]
+            wait_timed_out = self._vlm_final_wait_timed_out(submitted_at_epoch)
             is_latest = (
-                current_count >= expected_count and
+                (current_count >= expected_count or wait_timed_out) and
                 latest_service == current_service
             )
-            return is_latest, current_count, expected_count, latest_service
+            return is_latest, current_count, expected_count, latest_service, wait_timed_out
         except Exception as e:
             self.logger.warning(
                 f"Failed latest terminal VLM check for image {image_id} tier={tier}: {e}"
             )
-            return False, 0, 0, None
+            return False, 0, 0, None, False
+
+    def _vlm_final_wait_timed_out(self, submitted_at_epoch):
+        if submitted_at_epoch is None or self.vlm_final_wait_seconds <= 0:
+            return False
+        try:
+            return (time.time() - float(submitted_at_epoch)) >= self.vlm_final_wait_seconds
+        except (TypeError, ValueError):
+            return False
 
     def _should_enqueue_final_consensus_service(self, image_id, service):
         """Return True when noun/verb consensus has not already been enqueued/completed."""
@@ -1899,9 +1959,15 @@ class BaseWorker:
                         )
 
             latest_check_started_at = time.time()
-            vlm_tail_ready, current_vlm_count, expected_vlm_count, latest_vlm_service = (
+            (
+                vlm_tail_ready,
+                current_vlm_count,
+                expected_vlm_count,
+                latest_vlm_service,
+                vlm_wait_timed_out,
+            ) = (
                 self._is_latest_vlm_terminal_for_tier(
-                    image_id, tier, self._get_clean_service_name()
+                    image_id, tier, self._get_clean_service_name(), message.get('submitted_at_epoch')
                 )
             )
             latest_check_duration = time.time() - latest_check_started_at
@@ -1934,6 +2000,9 @@ class BaseWorker:
                     'tier': tier,
                     'submitted_at_epoch': message.get('submitted_at_epoch'),
                     'consensus_enqueued_at_epoch': time.time(),
+                    'vlm_wait_timed_out': vlm_wait_timed_out,
+                    'current_vlm_count': current_vlm_count,
+                    'expected_vlm_count': expected_vlm_count,
                 }
                 noun_consensus_message.update(self._image_transport_fields(message))
                 downstream_messages.append((
@@ -1967,6 +2036,9 @@ class BaseWorker:
                     'services_present': sorted(self._tier_vlm_service_names(tier)),
                     'source_service': self._get_clean_service_name(),
                     'submitted_at_epoch': message.get('submitted_at_epoch'),
+                    'vlm_wait_timed_out': vlm_wait_timed_out,
+                    'current_vlm_count': current_vlm_count,
+                    'expected_vlm_count': expected_vlm_count,
                 }
                 downstream_messages.append((
                     self._get_queue_by_service_type('postprocessing_orchestrator'),
@@ -2072,7 +2144,11 @@ class BaseWorker:
                 self.logger.info("Interrupted during startup, exiting")
                 sys.exit(0)
             self.logger.warning(f"Database connection failed at startup, retrying in {startup_delay}s...")
-            time.sleep(startup_delay)
+            try:
+                time.sleep(startup_delay)
+            except KeyboardInterrupt:
+                self.logger.info("Interrupted during startup, exiting")
+                sys.exit(0)
             startup_delay = min(startup_delay * 2, self.max_db_backoff_delay)
 
         startup_delay = 5
@@ -2084,7 +2160,11 @@ class BaseWorker:
                 self.logger.info("Interrupted during startup, exiting")
                 sys.exit(0)
             self.logger.warning(f"Image store connection failed at startup, retrying in {startup_delay}s...")
-            time.sleep(startup_delay)
+            try:
+                time.sleep(startup_delay)
+            except KeyboardInterrupt:
+                self.logger.info("Interrupted during startup, exiting")
+                sys.exit(0)
             startup_delay = min(startup_delay * 2, self.max_db_backoff_delay)
 
         startup_delay = 5
@@ -2096,7 +2176,11 @@ class BaseWorker:
                 self.logger.info("Interrupted during startup, exiting")
                 sys.exit(0)
             self.logger.warning(f"Queue connection failed at startup, retrying in {startup_delay}s...")
-            time.sleep(startup_delay)
+            try:
+                time.sleep(startup_delay)
+            except KeyboardInterrupt:
+                self.logger.info("Interrupted during startup, exiting")
+                sys.exit(0)
             startup_delay = min(startup_delay * 2, self.max_db_backoff_delay)
 
         # Start background publish thread

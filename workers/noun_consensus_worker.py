@@ -134,6 +134,7 @@ class NounConsensusWorker(BaseWorker):
             tier = message.get('tier', 'free')
             submitted_at_epoch = message.get('submitted_at_epoch')
             consensus_enqueued_at_epoch = message.get('consensus_enqueued_at_epoch')
+            vlm_wait_timed_out = bool(message.get('vlm_wait_timed_out'))
             queue_wait = None
             if consensus_enqueued_at_epoch is not None:
                 try:
@@ -262,79 +263,84 @@ class NounConsensusWorker(BaseWorker):
             grounding_noun_count = 0
             consensus_nouns = []
 
-            # Trigger grounding only once the tier's full VLM set has reported.
-            # Progressive partial noun sets are too expensive to ground and were
-            # causing obvious wasted tail latency.
-            if image_transport:
-                tier_vlm_count = self._expected_tier_vlm_count(tier) or len(service_noun_map)
-                current_vlm_count = len(services_present)
-                if current_vlm_count < tier_vlm_count:
-                    self.logger.debug(
-                        f"noun_consensus: delaying Florence-2 grounding for image {image_id} "
-                        f"until full VLM set arrives ({current_vlm_count}/{tier_vlm_count})"
-                    )
+            # Trigger grounding once the full tier VLM set has reported, or once
+            # the upstream VLM wait budget expired and we are intentionally using
+            # the partial set that returned in time. This decision must not depend
+            # on transport metadata; grounding should be enqueued and allowed to
+            # report a terminal failure if image bytes are unavailable.
+            tier_vlm_count = self._expected_tier_vlm_count(tier) or len(service_noun_map)
+            current_vlm_count = len(services_present)
+            if current_vlm_count < tier_vlm_count and not vlm_wait_timed_out:
+                self.logger.debug(
+                    f"noun_consensus: delaying Florence-2 grounding for image {image_id} "
+                    f"until full VLM set arrives ({current_vlm_count}/{tier_vlm_count})"
+                )
+            else:
+                effective_vlm_count = current_vlm_count if vlm_wait_timed_out else tier_vlm_count
+                min_votes = max(2, (effective_vlm_count + 1) // 2)
+                self.logger.debug(
+                    f"noun_consensus: grounding threshold for image {image_id}: "
+                    f">= {min_votes} votes "
+                    f"(available={current_vlm_count}, tier={tier_vlm_count}, "
+                    f"timed_out={vlm_wait_timed_out})"
+                )
+                consensus_nouns = [
+                    n['canonical'] for n in collapsed
+                    if n.get('vote_count', 0) >= min_votes
+                ]
+                grounding_noun_count = len(consensus_nouns)
+                if consensus_nouns:
+                    t0 = time.time()
+                    should_trigger_grounding = self._should_trigger_florence2_grounding(image_id, consensus_nouns)
+                    timing['check_florence2_grounding'] = timing.get('check_florence2_grounding', 0.0) + (time.time() - t0)
+                    t0 = time.time()
+                    if not should_trigger_grounding:
+                        self.logger.debug(
+                            f"noun_consensus: skipping duplicate Florence-2 grounding trigger "
+                            f"for image {image_id} with nouns={sorted(consensus_nouns)}"
+                        )
+                        consensus_nouns = []
+                        grounding_noun_count = 0
+                    timing['build_florence2_grounding'] = timing.get('build_florence2_grounding', 0.0) + (time.time() - t0)
                 else:
-                    min_votes = max(2, (tier_vlm_count + 1) // 2)
-                    self.logger.debug(
-                        f"noun_consensus: grounding threshold for image {image_id}: "
-                        f">= {min_votes} votes (tier has {tier_vlm_count} VLMs)"
+                    # No consensus reached; promote the top noun if it's a clear
+                    # leader (strictly ahead of second place). Fires only when the
+                    # final full-tier path produced nothing, so grounding isn't
+                    # flooded with low-confidence partial hits.
+                    sorted_nouns = sorted(
+                        collapsed, key=lambda n: n.get('confidence', 0), reverse=True
                     )
-                    consensus_nouns = [
-                        n['canonical'] for n in collapsed
-                        if n.get('vote_count', 0) >= min_votes
-                    ]
-                    grounding_noun_count = len(consensus_nouns)
-                    if consensus_nouns:
+                    if (len(sorted_nouns) >= 2
+                            and sorted_nouns[0].get('confidence', 0)
+                            > sorted_nouns[1].get('confidence', 0)):
+                        top = sorted_nouns[0]['canonical']
+                        grounding_noun_count = 1
+                        self.logger.info(
+                            f"noun_consensus: no consensus for image {image_id} - "
+                            f"promoting clear leader '{top}' to grounding"
+                        )
+                        # Mark the promoted noun in the stored data so the read
+                        # layer can surface it in nouns (not just nouns_all).
+                        sorted_nouns[0]['promoted'] = True
+                        self._upsert_noun_consensus(
+                            image_id, collapsed, services_present,
+                            processing_time=processing_time,
+                            category_tally=category_tally,
+                            commit=False,
+                        )
                         t0 = time.time()
-                        should_trigger_grounding = self._should_trigger_florence2_grounding(image_id, consensus_nouns)
+                        should_trigger_grounding = self._should_trigger_florence2_grounding(image_id, [top])
                         timing['check_florence2_grounding'] = timing.get('check_florence2_grounding', 0.0) + (time.time() - t0)
                         t0 = time.time()
                         if should_trigger_grounding:
-                            pass
+                            consensus_nouns = [top]
                         else:
+                            grounding_noun_count = 0
                             self.logger.debug(
-                                f"noun_consensus: skipping duplicate Florence-2 grounding trigger "
-                                f"for image {image_id} with nouns={sorted(consensus_nouns)}"
+                                f"noun_consensus: skipping duplicate promoted Florence-2 grounding trigger "
+                                f"for image {image_id} with noun={top}"
                             )
                         timing['build_florence2_grounding'] = timing.get('build_florence2_grounding', 0.0) + (time.time() - t0)
-                    else:
-                        # No consensus reached — promote the top noun if it's a clear
-                        # leader (strictly ahead of second place). Fires only when the
-                        # final full-tier path produced nothing, so grounding isn't
-                        # flooded with low-confidence partial hits.
-                        sorted_nouns = sorted(
-                            collapsed, key=lambda n: n.get('confidence', 0), reverse=True
-                        )
-                        if (len(sorted_nouns) >= 2
-                                and sorted_nouns[0].get('confidence', 0)
-                                > sorted_nouns[1].get('confidence', 0)):
-                            top = sorted_nouns[0]['canonical']
-                            grounding_noun_count = 1
-                            self.logger.info(
-                                f"noun_consensus: no consensus for image {image_id} — "
-                                f"promoting clear leader '{top}' to grounding"
-                            )
-                            # Mark the promoted noun in the stored data so the read
-                            # layer can surface it in nouns (not just nouns_all).
-                            sorted_nouns[0]['promoted'] = True
-                            self._upsert_noun_consensus(
-                                image_id, collapsed, services_present,
-                                processing_time=processing_time,
-                                category_tally=category_tally,
-                                commit=False,
-                            )
-                            t0 = time.time()
-                            should_trigger_grounding = self._should_trigger_florence2_grounding(image_id, [top])
-                            timing['check_florence2_grounding'] = timing.get('check_florence2_grounding', 0.0) + (time.time() - t0)
-                            t0 = time.time()
-                            if should_trigger_grounding:
-                                consensus_nouns = [top]
-                            else:
-                                self.logger.debug(
-                                    f"noun_consensus: skipping duplicate promoted Florence-2 grounding trigger "
-                                    f"for image {image_id} with noun={top}"
-                                )
-                            timing['build_florence2_grounding'] = timing.get('build_florence2_grounding', 0.0) + (time.time() - t0)
 
             t0 = time.time()
             self._persist_terminal_consensus_results(
@@ -348,6 +354,7 @@ class NounConsensusWorker(BaseWorker):
                     'metadata': {
                         'processed_at': datetime.now().isoformat(),
                         'services_present': services_present,
+                        'vlm_wait_timed_out': vlm_wait_timed_out,
                     },
                 },
                 verb_payload={
@@ -359,6 +366,7 @@ class NounConsensusWorker(BaseWorker):
                     'metadata': {
                         'processed_at': datetime.now().isoformat(),
                         'services_present': services_present,
+                        'vlm_wait_timed_out': vlm_wait_timed_out,
                     },
                 },
                 processing_time=processing_time,
@@ -379,6 +387,7 @@ class NounConsensusWorker(BaseWorker):
                 services_present=services_present,
                 consensus_nouns=consensus_nouns,
                 subject_noun=subject_noun,
+                vlm_wait_timed_out=vlm_wait_timed_out,
             )
             timing['publish_nouns_ready'] = time.time() - t0
 
@@ -440,12 +449,38 @@ class NounConsensusWorker(BaseWorker):
             return 0
 
     def _expected_tier_vlm_count(self, tier: str) -> int:
-        """Return the number of VLM services configured for the given tier."""
-        return len([
+        """Return the number of currently available VLM services for the tier."""
+        tier_vlms = [
             name for name in self.config.get_services_by_tier(tier)
             if name.startswith('primary.')
             and name.split('.', 1)[1] in VLM_SERVICES
-        ])
+        ]
+        vlm_services = [name.split('.', 1)[1] for name in tier_vlms]
+        if not vlm_services:
+            return 0
+
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                SELECT DISTINCT service
+                FROM worker_registry
+                WHERE service = ANY(%s::text[])
+                  AND status = 'online'
+                  AND last_heartbeat >= NOW() - (%s * INTERVAL '1 second')
+                """,
+                (vlm_services, self._heartbeat_interval * 3),
+            )
+            online = {row[0] for row in cursor.fetchall()}
+            cursor.close()
+            available = [service for service in vlm_services if service in online]
+            return len(available) or len(vlm_services)
+        except Exception as e:
+            self.logger.warning(
+                f"noun_consensus: VLM availability check failed for tier={tier}; "
+                f"using configured set: {e}"
+            )
+            return len(vlm_services)
 
     def _publish_nouns_ready(
         self,
@@ -455,6 +490,7 @@ class NounConsensusWorker(BaseWorker):
         services_present: list,
         consensus_nouns: list,
         subject_noun: str = None,
+        vlm_wait_timed_out: bool = False,
     ):
         if not self.config.is_available_for_tier('system.postprocessing_orchestrator', tier):
             return
@@ -467,6 +503,7 @@ class NounConsensusWorker(BaseWorker):
                 'services_present': sorted(services_present or []),
                 'consensus_nouns': list(consensus_nouns or []),
                 'subject_noun': subject_noun,
+                'vlm_wait_timed_out': vlm_wait_timed_out,
                 **(image_transport or {}),
             }),
         )

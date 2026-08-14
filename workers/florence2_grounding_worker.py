@@ -113,9 +113,9 @@ class Florence2GroundingWorker(BaseWorker):
             # Read nouns from noun_consensus at processing time, not from the
             # message. By the time this job is picked up, more VLMs will have
             # reported than when the dispatch was created, so the DB gives a
-            # fresher (and usually complete) noun set. This also means we never
-            # run with more nouns than we need to — the threshold is re-applied
-            # against the tier's expected VLM count at this moment.
+            # fresher noun set. This also means we never run with more nouns than
+            # we need to; the threshold is re-applied against the available VLM
+            # count at this moment.
             t0 = time.time()
             nouns = self._fetch_consensus_nouns(image_id, tier)
             stage_timings['fetch_nouns'] = time.time() - t0
@@ -124,16 +124,14 @@ class Florence2GroundingWorker(BaseWorker):
                 self.logger.info(
                     f"florence2_grounding: no consensus nouns for image {image_id}, skipping"
                 )
-                self._record_service_event(
+                self._persist_skipped_grounding_result(
                     image_id=image_id,
-                    service='florence2_grounding',
-                    event_type='completed',
-                    source_service='noun_consensus',
+                    reason='No consensus nouns available at processing time',
+                    processing_time=round(time.time() - start_time, 3),
                     source_stage='grounding_run',
-                    data={'reason': 'No consensus nouns available at processing time'},
-                    commit=True,
                 )
                 self._safe_ack(ch, method.delivery_tag)
+                self.job_completed_successfully()
                 return
 
             # Dedup: skip if already grounded with this exact noun set
@@ -145,19 +143,19 @@ class Florence2GroundingWorker(BaseWorker):
                     f"with same {len(nouns)} nouns, skipping model run"
                 )
                 previous_predictions = previous_result['predictions']
-                self._record_service_event(
+                self._persist_skipped_grounding_result(
                     image_id=image_id,
-                    service='florence2_grounding',
-                    event_type='completed',
-                    source_service='noun_consensus',
+                    reason='Reused previous grounding result for identical noun set',
+                    processing_time=round(time.time() - start_time, 3),
                     source_stage='grounding_reuse',
-                    data={
+                    extra_metadata={
                         'reused_previous_result': True,
                         'prediction_count': len(previous_predictions),
+                        'nouns_queried': nouns,
                     },
-                    commit=True,
                 )
                 self._safe_ack(ch, method.delivery_tag)
+                self.job_completed_successfully()
                 return
 
             prompt = self._build_grounding_prompt(nouns)
@@ -281,10 +279,9 @@ class Florence2GroundingWorker(BaseWorker):
         """Return consensus nouns from noun_consensus at processing time.
 
         Reads the current DB state rather than using nouns baked into the queue
-        message. Applies the same majority-vote threshold as noun_consensus_worker:
-        min_votes = max(2, ceil(tier_vlm_count / 2)), where tier_vlm_count is the
-        total VLMs expected for the tier — not the number that have reported so far.
-        This keeps the bar stable across progressive triggers.
+        message. Applies the same majority-vote threshold as noun_consensus_worker
+        against the currently available VLM set, so offline workers do not keep
+        grounding from running after noun consensus has advanced.
         """
         def _run():
             cursor = self.db_conn.cursor()
@@ -299,12 +296,7 @@ class Florence2GroundingWorker(BaseWorker):
             if not row or not row[0]:
                 return []
             nouns_data = row[0]  # jsonb — already a list
-            vlm_names = set(self.config.get_vlm_service_names())
-            tier_vlm_count = len([
-                name for name in self.config.get_services_by_tier(tier)
-                if name.startswith('primary.')
-                and name.split('.', 1)[1] in vlm_names
-            ]) or 1
+            tier_vlm_count = len(self._available_tier_vlm_service_names(tier)) or 1
             min_votes = max(2, (tier_vlm_count + 1) // 2)
             return [
                 n['canonical'] for n in nouns_data
@@ -420,6 +412,65 @@ class Florence2GroundingWorker(BaseWorker):
         except Exception as e:
             self.logger.error(
                 f"florence2_grounding: failed to persist failed result for image {image_id}: {e}"
+            )
+            raise
+
+    def _persist_skipped_grounding_result(
+        self,
+        image_id: int,
+        reason: str,
+        processing_time: float,
+        source_stage: str,
+        extra_metadata: dict = None,
+    ):
+        """Persist a terminal success for grounding jobs that intentionally skip the model."""
+        metadata = {
+            'skipped_model_run': True,
+            'reason': reason,
+            **(extra_metadata or {}),
+        }
+        result = {
+            'service': 'florence2_grounding',
+            'status': 'success',
+            'predictions': [],
+            'metadata': metadata,
+        }
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                WITH inserted_result AS (
+                    INSERT INTO results
+                        (image_id, service, data, status, http_status, worker_id, processing_time)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING 1
+                )
+                INSERT INTO service_events (
+                    image_id, service, event_type, source_service, source_stage, data
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    image_id,
+                    self._get_clean_service_name(),
+                    json.dumps(result),
+                    'success',
+                    200,
+                    self.worker_id,
+                    processing_time,
+                    image_id,
+                    'florence2_grounding',
+                    'completed',
+                    'noun_consensus',
+                    source_stage,
+                    json.dumps(metadata),
+                ),
+            )
+            commit_if_needed(self.db_conn, force=True)
+            close_quietly(cursor)
+        except Exception as e:
+            self.logger.error(
+                f"florence2_grounding: failed to persist skipped result for image {image_id}: {e}"
             )
             raise
 

@@ -69,9 +69,10 @@ These conditions document what `compute_expected_downstream()` currently models.
 
 - `system.caption_summary`, etc. are full service identifiers, not names of a separate `system` tier.
 - `verb_consensus` remains a logical downstream artifact, but it is produced inside [workers/noun_consensus_worker.py](../workers/noun_consensus_worker.py) rather than by a dedicated worker.
-- `noun_consensus` now delays `florence2_grounding` until the full tier VLM set has reported.
-- `caption_summary` is also delayed until the full tier VLM set has reported.
-- `content_analysis` is likewise delayed until the full tier VLM set has reported.
+- `noun_consensus` delays `florence2_grounding` until the full tier VLM set has reported, or until `VLM_FINAL_WAIT_SECONDS` elapses.
+- `caption_summary` is also delayed until the full tier VLM set has reported, or until `VLM_FINAL_WAIT_SECONDS` elapses.
+- `content_analysis` is likewise delayed until the full tier VLM set has reported, or until `VLM_FINAL_WAIT_SECONDS` elapses.
+- VLMs with no fresh online worker in `worker_registry` are excluded from the wait set, so a single-host VLM outage does not block downstream stages.
 - `rembg` is producer-triggered rather than worker-triggered in the current deployment model, but it is still part of the expected downstream product set.
 - `colors_post` is declared in the postprocessing area of the config, but it is not currently dispatched in the active harmony code path.
 

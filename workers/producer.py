@@ -338,6 +338,8 @@ class GenericProducer:
             processed_images += 1
             # Create a trace id for this image's batch of jobs
             trace_id = str(uuid.uuid4())
+            submitted_at = datetime.utcnow()
+            submitted_at_epoch = time.time()
             jobs_this_image = 0
             
             # Submit jobs for this image to all services
@@ -351,6 +353,8 @@ class GenericProducer:
                     job_data['service_name'] = service_name
                     job_data['queue_name'] = queue_name
                     job_data['tier'] = tier
+                    job_data['submitted_at'] = submitted_at.isoformat()
+                    job_data['submitted_at_epoch'] = submitted_at_epoch
                     
                     if self.submit_job(queue_name, job_data):
                         submitted_jobs += 1

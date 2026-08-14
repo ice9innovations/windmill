@@ -101,21 +101,34 @@ start_all() {
 
 stop_all() {
     echo "🛑 Stopping all workers..."
+    local stopped_any=0
     
     # Stop each worker individually - now they can all be targeted precisely!
     for worker in $(get_all_workers); do
         if pkill -f "workers/${worker}.py" 2>/dev/null; then
             echo "  ✅ Stopped $worker"
+            stopped_any=1
         fi
     done
     
-    # Wait and verify everything is dead
-    sleep 1
+    # Wait for clean SIGTERM shutdown. Workers mark themselves offline and close
+    # DB/RabbitMQ connections; starting the next fleet before that finishes can
+    # exhaust PostgreSQL connection slots.
+    if [ "$stopped_any" -eq 1 ]; then
+        for _ in {1..20}; do
+            remaining=$(ps aux | grep "python workers" | grep -v grep | wc -l)
+            if [ "$remaining" -eq 0 ]; then
+                break
+            fi
+            sleep 1
+        done
+    fi
+
     remaining=$(ps aux | grep "python workers" | grep -v grep | wc -l)
     if [ "$remaining" -gt 0 ]; then
         echo "  ⚠️  Force killing remaining $remaining processes..."
         pkill -9 -f "python workers/" 2>/dev/null
-        sleep 1
+        sleep 3
     fi
     
     echo -e "${GREEN}✅ All workers stopped${NC}"
@@ -227,10 +240,16 @@ start_worker() {
     # Extract actual worker name from file path for consistent logging
     local log_name=$(basename "$worker_file" ".py")
 
+    if pgrep -f "$worker_file" >/dev/null 2>&1; then
+        echo "  $worker is already running"
+        state_add "$log_name"
+        return 0
+    fi
+
     state_add "$log_name"
 
     echo "  Starting $worker..."
-    nohup python $worker_file >> logs/${log_name}.log 2>&1 &
+    nohup setsid python "$worker_file" >> "logs/${log_name}.log" 2>&1 < /dev/null &
     echo "✅ Started $worker"
 }
 

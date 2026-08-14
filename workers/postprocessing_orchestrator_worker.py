@@ -87,13 +87,28 @@ class PostprocessingOrchestratorWorker(BaseWorker):
                 image_transport = self._image_transport_fields(message)
                 consensus_nouns = list(message.get('consensus_nouns') or [])
                 subject_noun = message.get('subject_noun')
+                if not consensus_nouns:
+                    consensus_nouns = self._fetch_grounding_nouns_from_consensus(image_id)
+                    if consensus_nouns:
+                        self.logger.info(
+                            f"postprocessing_orchestrator: image {image_id} recovered "
+                            f"{len(consensus_nouns)} grounding nouns from noun_consensus"
+                        )
 
                 t0 = time.time()
-                if (
-                    consensus_nouns
-                    and self.config.is_available_for_tier('primary.florence2', tier)
-                    and self._should_trigger_grounding(image_id, consensus_nouns)
-                ):
+                grounding_available = self.config.is_available_for_tier('primary.florence2', tier)
+                should_trigger_grounding = False
+                grounding_skip_reason = None
+                if not consensus_nouns:
+                    grounding_skip_reason = 'no_consensus_nouns'
+                elif not grounding_available:
+                    grounding_skip_reason = f'florence2_unavailable_for_tier:{tier}'
+                else:
+                    should_trigger_grounding = self._should_trigger_grounding(image_id, consensus_nouns)
+                    if not should_trigger_grounding:
+                        grounding_skip_reason = 'duplicate_noun_set'
+
+                if should_trigger_grounding:
                     self._enqueue_publish(
                         self._get_queue_by_service_type('grounding'),
                         json.dumps({
@@ -106,6 +121,12 @@ class PostprocessingOrchestratorWorker(BaseWorker):
                         }),
                     )
                     triggered.append('florence2_grounding')
+                else:
+                    self.logger.info(
+                        f"postprocessing_orchestrator: image {image_id} "
+                        f"skipped florence2_grounding reason={grounding_skip_reason} "
+                        f"nouns={len(consensus_nouns)} tier={tier}"
+                    )
 
                 if (
                     self.config.is_available_for_tier('system.caption_summary', tier)
@@ -174,6 +195,34 @@ class PostprocessingOrchestratorWorker(BaseWorker):
                 (image_id, service),
             )
             return cursor.fetchone() is not None
+        finally:
+            cursor.close()
+
+    def _fetch_grounding_nouns_from_consensus(self, image_id: int) -> list:
+        cursor = self.db_conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT nouns, service_count
+                FROM noun_consensus
+                WHERE image_id = %s
+                """,
+                (image_id,),
+            )
+            row = cursor.fetchone()
+            if not row or not row[0]:
+                return []
+            nouns_data = row[0]
+            service_count = row[1] or 0
+            min_votes = max(2, (service_count + 1) // 2) if service_count else 2
+            return [
+                n.get('canonical') for n in nouns_data
+                if n.get('canonical')
+                and (
+                    n.get('promoted', False)
+                    or n.get('vote_count', 0) >= min_votes
+                )
+            ]
         finally:
             cursor.close()
 
