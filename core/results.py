@@ -89,7 +89,14 @@ def fetch_results(cur, image_id):
     noun_consensus     = None
     if noun_consensus_row:
         all_nouns       = noun_consensus_row['nouns'] or []
-        consensus_nouns = [n for n in all_nouns if n.get('confidence', 0) > 0.5 or n.get('promoted', False)]
+        consensus_nouns = [
+            n for n in all_nouns
+            if (
+                n.get('confidence', 0) > 0.5
+                or n.get('promoted', False)
+                or n.get('grounding_validated', False)
+            )
+        ]
         noun_consensus  = {
             "metadata":         {"processing_time": noun_consensus_row['processing_time']},
             "nouns":            consensus_nouns,
