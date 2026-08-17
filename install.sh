@@ -13,6 +13,7 @@ set -e
 
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 SYSTEMD_MODE="${WINDMILL_SYSTEMD_MODE:-all}"
+STOP_RUNNING_SERVICES="${WINDMILL_STOP_RUNNING_SERVICES:-true}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -28,9 +29,13 @@ while [ "$#" -gt 0 ]; do
       SYSTEMD_MODE="none"
       shift
       ;;
+    --no-stop)
+      STOP_RUNNING_SERVICES="false"
+      shift
+      ;;
     -h|--help)
       cat <<USAGE
-Usage: bash install.sh [--systemd all|workers|api|none]
+Usage: bash install.sh [--systemd all|workers|api|none] [--no-stop]
        bash install.sh --no-systemd
 
 Installs Windmill dependencies into windmill_venv.
@@ -40,6 +45,9 @@ Systemd mode defaults to: \${WINDMILL_SYSTEMD_MODE:-all}
   workers  Install only the worker monitor
   api      Install only the API service
   none     Skip systemd service installation
+
+By default, running services/workers are stopped before rebuilding windmill_venv.
+Use --no-stop only when you know Windmill is already stopped.
 USAGE
       exit 0
       ;;
@@ -58,6 +66,24 @@ case "$SYSTEMD_MODE" in
     exit 1
     ;;
 esac
+
+stop_running_windmill() {
+  if [ "$STOP_RUNNING_SERVICES" != "true" ]; then
+    return
+  fi
+
+  echo "Stopping running Windmill services before rebuilding windmill_venv..."
+  if command -v systemctl >/dev/null 2>&1; then
+    sudo systemctl stop windmill-workers.service 2>/dev/null || true
+    sudo systemctl stop windmill.service 2>/dev/null || true
+  fi
+
+  if [ -x "$SCRIPT_DIR/windmill.sh" ]; then
+    "$SCRIPT_DIR/windmill.sh" stop all || true
+  fi
+}
+
+stop_running_windmill
 
 rm -rf "$SCRIPT_DIR/windmill_venv"
 python3.11 -m venv "$SCRIPT_DIR/windmill_venv"
