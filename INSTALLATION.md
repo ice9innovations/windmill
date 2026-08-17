@@ -190,23 +190,39 @@ At minimum:
 
 ## 7. Start Windmill
 
-### Local worker control
+The installer can install systemd units rendered for the current checkout path
+and user:
+
+```bash
+bash install.sh
+```
+
+By default this installs both the API service and the worker monitor. To install
+only one side:
+
+```bash
+bash install.sh --systemd workers
+bash install.sh --systemd api
+```
+
+To skip systemd entirely:
+
+```bash
+bash install.sh --no-systemd
+```
+
+Verify systemd services with:
+
+```bash
+systemctl status windmill
+systemctl status windmill-workers
+```
+
+For manual local control:
 
 ```bash
 ./windmill.sh start
 ./windmill.sh status
-```
-
-### Local API
-
-```bash
-python api.py
-```
-
-If you run the API under systemd, verify with:
-
-```bash
-systemctl status windmill-api
 ```
 
 ## 8. Submit A Test Image

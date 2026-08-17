@@ -3,13 +3,61 @@
 # Run once before first use. Requires Python 3.11.
 #
 # Usage:
-#   bash install.sh
+#   bash install.sh [--systemd all|workers|api|none]
+#   bash install.sh --no-systemd
 #
-# After install, start workers with:
-#   ./windmill.sh start
+# By default, installs both API and worker-monitor systemd units rendered for
+# the current checkout path/user. Set WINDMILL_SYSTEMD_MODE or pass --systemd
+# to install a narrower unit set.
 set -e
 
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+SYSTEMD_MODE="${WINDMILL_SYSTEMD_MODE:-all}"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --systemd)
+      if [ "$#" -lt 2 ]; then
+        echo "ERROR: --systemd requires one of: all, workers, api, none" >&2
+        exit 1
+      fi
+      SYSTEMD_MODE="$2"
+      shift 2
+      ;;
+    --no-systemd)
+      SYSTEMD_MODE="none"
+      shift
+      ;;
+    -h|--help)
+      cat <<USAGE
+Usage: bash install.sh [--systemd all|workers|api|none]
+       bash install.sh --no-systemd
+
+Installs Windmill dependencies into windmill_venv.
+
+Systemd mode defaults to: \${WINDMILL_SYSTEMD_MODE:-all}
+  all      Install API and worker-monitor services
+  workers  Install only the worker monitor
+  api      Install only the API service
+  none     Skip systemd service installation
+USAGE
+      exit 0
+      ;;
+    *)
+      echo "ERROR: unknown option '$1'" >&2
+      exit 1
+      ;;
+  esac
+done
+
+case "$SYSTEMD_MODE" in
+  all|workers|api|none)
+    ;;
+  *)
+    echo "ERROR: invalid systemd mode '$SYSTEMD_MODE'. Use all, workers, api, or none." >&2
+    exit 1
+    ;;
+esac
 
 rm -rf "$SCRIPT_DIR/windmill_venv"
 python3.11 -m venv "$SCRIPT_DIR/windmill_venv"
@@ -76,4 +124,17 @@ else
   echo "When available, run: $SCRIPT_DIR/windmill_venv/bin/python $SCRIPT_DIR/utils/predeclare_queues.py"
 fi
 
-echo "Done. Run ./windmill.sh start to start workers."
+if [ "$SYSTEMD_MODE" != "none" ]; then
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "Installing systemd services (mode=$SYSTEMD_MODE)..."
+    "$SCRIPT_DIR/install-systemd.sh" "$SYSTEMD_MODE"
+  else
+    echo "Skipping systemd service installation because systemctl is not available."
+    echo "Run ./windmill.sh start to start workers manually."
+  fi
+else
+  echo "Skipping systemd service installation."
+  echo "Run ./windmill.sh start to start workers manually."
+fi
+
+echo "Done."
