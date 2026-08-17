@@ -361,6 +361,8 @@ case "$ACTION" in
         fi
         ;;
     stop)
+        monitor_pause_start
+        trap monitor_pause_stop EXIT
         if [ -n "$2" ]; then
             # Stop individual worker: ./windmill.sh stop blip
             if [ "$2" = "all" ]; then
@@ -374,6 +376,8 @@ case "$ACTION" in
             # Stop all workers
             stop_all
         fi
+        monitor_pause_stop
+        trap - EXIT
         ;;
     restart)
         monitor_pause_start
