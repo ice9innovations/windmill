@@ -19,6 +19,7 @@ NC='\033[0m'
 STATE_FILE=".windmill_state"
 MAINTENANCE_FILE=".windmill_maintenance"
 MAINTENANCE_TTL_SECONDS=300
+PRESERVE_STATE_ON_STOP="${WINDMILL_PRESERVE_STATE_ON_STOP:-false}"
 
 state_add() {
     local name="$1"
@@ -40,6 +41,19 @@ get_enabled_workers() {
     if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
         cat "$STATE_FILE"
     fi
+}
+
+is_enabled_worker() {
+    local name="$1"
+    [ -f "$STATE_FILE" ] && grep -qx "$name" "$STATE_FILE"
+}
+
+remaining_worker_processes() {
+    pgrep -af "python workers/" 2>/dev/null || true
+}
+
+remaining_worker_count() {
+    remaining_worker_processes | sed '/^$/d' | wc -l
 }
 
 monitor_pause_start() {
@@ -132,6 +146,7 @@ start_all() {
 }
 
 stop_all() {
+    local preserve_state="${1:-false}"
     echo "🛑 Stopping all workers..."
     local stopped_any=0
     
@@ -148,7 +163,7 @@ stop_all() {
     # exhaust PostgreSQL connection slots.
     if [ "$stopped_any" -eq 1 ]; then
         for _ in {1..20}; do
-            remaining=$(ps aux | grep "python workers" | grep -v grep | wc -l)
+            remaining=$(remaining_worker_count)
             if [ "$remaining" -eq 0 ]; then
                 break
             fi
@@ -156,27 +171,72 @@ stop_all() {
         done
     fi
 
-    remaining=$(ps aux | grep "python workers" | grep -v grep | wc -l)
+    remaining=$(remaining_worker_count)
     if [ "$remaining" -gt 0 ]; then
         echo "  ⚠️  Force killing remaining $remaining processes..."
+        remaining_worker_processes | sed 's/^/    /'
         pkill -9 -f "python workers/" 2>/dev/null
         sleep 3
+    fi
+
+    if [ "$preserve_state" != "true" ]; then
+        : > "$STATE_FILE"
     fi
     
     echo -e "${GREEN}✅ All workers stopped${NC}"
 }
 
 status_all() {
-    echo "📊 Worker Status:"
-    echo "===================="
+    echo "📊 Enabled Worker Status:"
+    echo "========================="
+
+    local enabled
+    enabled=$(get_enabled_workers)
+    if [ -z "$enabled" ]; then
+        echo -e "${YELLOW}⚠️  No enabled workers on this machine.${NC}"
+    else
+        for worker in $enabled; do
+            if pgrep -f "workers/${worker}.py" >/dev/null 2>&1; then
+                local pid=$(pgrep -f "workers/${worker}.py")
+                echo -e "${GREEN}✅ $worker${NC} (PID: $pid)"
+            else
+                echo -e "${RED}❌ $worker${NC} (enabled, not running)"
+            fi
+        done
+    fi
+
+    local unexpected_running=0
+    for worker in $(get_all_workers); do
+        if ! is_enabled_worker "$worker" && pgrep -f "workers/${worker}.py" >/dev/null 2>&1; then
+            if [ "$unexpected_running" -eq 0 ]; then
+                echo ""
+                echo "Unexpected running workers:"
+            fi
+            local pid=$(pgrep -f "workers/${worker}.py")
+            echo -e "${YELLOW}⚠️  $worker${NC} (PID: $pid, not enabled)"
+            unexpected_running=$((unexpected_running + 1))
+        fi
+    done
+}
+
+status_full() {
+    echo "📊 All Worker Status:"
+    echo "====================="
     
-    # Check all workers - unified clean approach
     for worker in $(get_all_workers); do
         if pgrep -f "workers/${worker}.py" >/dev/null 2>&1; then
             local pid=$(pgrep -f "workers/${worker}.py")
-            echo -e "${GREEN}✅ $worker${NC} (PID: $pid)"
+            if is_enabled_worker "$worker"; then
+                echo -e "${GREEN}✅ $worker${NC} (PID: $pid, enabled)"
+            else
+                echo -e "${YELLOW}⚠️  $worker${NC} (PID: $pid, not enabled)"
+            fi
         else
-            echo -e "${RED}❌ $worker${NC} (not running)"
+            if is_enabled_worker "$worker"; then
+                echo -e "${RED}❌ $worker${NC} (enabled, not running)"
+            else
+                echo "· $worker (not enabled)"
+            fi
         fi
     done
 }
@@ -367,14 +427,14 @@ case "$ACTION" in
             # Stop individual worker: ./windmill.sh stop blip
             if [ "$2" = "all" ]; then
                 echo "🛑 Stopping all workers..."
-                stop_all
+                stop_all "$PRESERVE_STATE_ON_STOP"
             else
                 echo "🛑 Stopping $2..."
                 stop_worker "$2"
             fi
         else
             # Stop all workers
-            stop_all
+            stop_all "$PRESERVE_STATE_ON_STOP"
         fi
         monitor_pause_stop
         trap - EXIT
@@ -386,7 +446,7 @@ case "$ACTION" in
             # Restart individual worker: ./windmill.sh restart ollama
             if [ "$2" = "all" ]; then
                 echo "🔄 Restarting all workers..."
-                stop_all
+                stop_all true
                 sleep 2
                 start_all
                 echo ""
@@ -402,7 +462,7 @@ case "$ACTION" in
         else
             # Restart all workers
             echo "🔄 Restarting all workers..."
-            stop_all
+            stop_all true
             sleep 2
             start_all
             echo ""
@@ -414,6 +474,9 @@ case "$ACTION" in
     status)
         status_all
         ;;
+    status-full)
+        status_full
+        ;;
     monitor-once)
         monitor_once
         ;;
@@ -421,7 +484,7 @@ case "$ACTION" in
         monitor_loop "$@"
         ;;
     *)
-        echo "Usage: $0 {start [worker]|stop [worker]|restart [worker]|status|monitor [seconds]|monitor-once}"
+        echo "Usage: $0 {start [worker]|stop [worker]|restart [worker]|status|status-full|monitor [seconds]|monitor-once}"
         echo ""
         echo "Examples:"
         echo "  $0 start          # Start all workers"
@@ -430,7 +493,8 @@ case "$ACTION" in
         echo "  $0 stop ollama    # Stop just the ollama worker"
         echo "  $0 restart        # Restart all workers"
         echo "  $0 restart ollama # Restart just the ollama worker"
-        echo "  $0 status         # Show status of all workers"
+        echo "  $0 status         # Show enabled worker status"
+        echo "  $0 status-full    # Show every installed worker"
         echo "  $0 monitor        # Keep enabled workers running"
         echo "  $0 monitor-once   # Start any missing enabled workers once"
         exit 1

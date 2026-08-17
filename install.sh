@@ -110,7 +110,7 @@ stop_running_windmill() {
   fi
 
   if [ -x "$SCRIPT_DIR/windmill.sh" ]; then
-    "$SCRIPT_DIR/windmill.sh" stop all || true
+    WINDMILL_PRESERVE_STATE_ON_STOP=true "$SCRIPT_DIR/windmill.sh" stop all || true
   fi
 }
 
