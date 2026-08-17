@@ -211,6 +211,13 @@ To skip systemd entirely:
 bash install.sh --no-systemd
 ```
 
+The installer uses `python3.11` when available and falls back to `python3`.
+Override the interpreter explicitly when needed:
+
+```bash
+PYTHON=python3 bash install.sh
+```
+
 Verify systemd services with:
 
 ```bash

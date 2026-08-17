@@ -1,6 +1,7 @@
 #!/bin/bash
 # Install Windmill worker dependencies into windmill_venv.
-# Run once before first use. Requires Python 3.11.
+# Run once before first use. Uses PYTHON if set, otherwise python3.11 when
+# available, otherwise python3.
 #
 # Usage:
 #   bash install.sh [--systemd all|workers|api|none]
@@ -48,6 +49,9 @@ Systemd mode defaults to: \${WINDMILL_SYSTEMD_MODE:-all}
 
 By default, running services/workers are stopped before rebuilding windmill_venv.
 Use --no-stop only when you know Windmill is already stopped.
+
+Python interpreter defaults to python3.11 when available, otherwise python3.
+Override with PYTHON=/path/to/python.
 USAGE
       exit 0
       ;;
@@ -66,6 +70,33 @@ case "$SYSTEMD_MODE" in
     exit 1
     ;;
 esac
+
+select_python() {
+  if [ -n "${PYTHON:-}" ]; then
+    if command -v "$PYTHON" >/dev/null 2>&1; then
+      command -v "$PYTHON"
+      return
+    fi
+    echo "ERROR: PYTHON is set to '$PYTHON' but it is not executable." >&2
+    exit 1
+  fi
+
+  if command -v python3.11 >/dev/null 2>&1; then
+    command -v python3.11
+    return
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return
+  fi
+
+  echo "ERROR: no Python interpreter found. Install python3 or set PYTHON=/path/to/python." >&2
+  exit 1
+}
+
+PYTHON_BIN="$(select_python)"
+echo "Using Python interpreter: $PYTHON_BIN ($("$PYTHON_BIN" --version 2>&1))"
 
 stop_running_windmill() {
   if [ "$STOP_RUNNING_SERVICES" != "true" ]; then
@@ -86,7 +117,7 @@ stop_running_windmill() {
 stop_running_windmill
 
 rm -rf "$SCRIPT_DIR/windmill_venv"
-python3.11 -m venv "$SCRIPT_DIR/windmill_venv"
+"$PYTHON_BIN" -m venv "$SCRIPT_DIR/windmill_venv"
 source "$SCRIPT_DIR/windmill_venv/bin/activate"
 
 pip install --upgrade pip
