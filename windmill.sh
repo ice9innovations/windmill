@@ -17,6 +17,8 @@ NC='\033[0m'
 # Per-machine state file — tracks which workers are enabled on this machine.
 # Managed automatically by start/stop; never committed to git.
 STATE_FILE=".windmill_state"
+MAINTENANCE_FILE=".windmill_maintenance"
+MAINTENANCE_TTL_SECONDS=300
 
 state_add() {
     local name="$1"
@@ -38,6 +40,36 @@ get_enabled_workers() {
     if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
         cat "$STATE_FILE"
     fi
+}
+
+monitor_pause_start() {
+    date +%s > "$MAINTENANCE_FILE"
+}
+
+monitor_pause_stop() {
+    rm -f "$MAINTENANCE_FILE"
+}
+
+monitor_is_paused() {
+    if [ ! -f "$MAINTENANCE_FILE" ]; then
+        return 1
+    fi
+
+    local started
+    local now
+    started=$(cat "$MAINTENANCE_FILE" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    if ! [[ "$started" =~ ^[0-9]+$ ]]; then
+        rm -f "$MAINTENANCE_FILE"
+        return 1
+    fi
+    if [ $((now - started)) -lt "$MAINTENANCE_TTL_SECONDS" ]; then
+        return 0
+    fi
+
+    echo -e "${YELLOW}⚠️  Clearing stale Windmill maintenance pause.${NC}"
+    rm -f "$MAINTENANCE_FILE"
+    return 1
 }
 
 bootstrap_state_from_running() {
@@ -256,6 +288,11 @@ start_worker() {
 monitor_once() {
     mkdir -p logs
 
+    if monitor_is_paused; then
+        echo -e "${YELLOW}⏸️  Windmill maintenance pause active; skipping worker monitor pass.${NC}"
+        return 0
+    fi
+
     if [ ! -f "$STATE_FILE" ]; then
         bootstrap_state_from_running
     fi
@@ -339,6 +376,8 @@ case "$ACTION" in
         fi
         ;;
     restart)
+        monitor_pause_start
+        trap monitor_pause_stop EXIT
         if [ -n "$2" ]; then
             # Restart individual worker: ./windmill.sh restart ollama
             if [ "$2" = "all" ]; then
@@ -365,6 +404,8 @@ case "$ACTION" in
             echo ""
             status_all
         fi
+        monitor_pause_stop
+        trap - EXIT
         ;;
     status)
         status_all

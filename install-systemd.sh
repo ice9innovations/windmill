@@ -67,11 +67,13 @@ fi
 sudo systemctl daemon-reload
 
 if [ "$MODE" = "workers" ] || [ "$MODE" = "all" ]; then
-    sudo systemctl enable --now windmill-workers.service
+    sudo systemctl enable windmill-workers.service
+    sudo systemctl restart windmill-workers.service
 fi
 
 if [ "$MODE" = "api" ] || [ "$MODE" = "all" ]; then
-    sudo systemctl enable --now windmill.service
+    sudo systemctl enable windmill.service
+    sudo systemctl restart windmill.service
 fi
 
 echo "Installed Windmill systemd mode=${MODE} user=${SERVICE_USER} dir=${SCRIPT_DIR}"
