@@ -9,10 +9,17 @@ which words are being tagged incorrectly by spaCy's en_core_web_sm model.
 import spacy
 from collections import defaultdict
 
-# Load spaCy model
-print("Loading spaCy en_core_web_sm model...")
-nlp = spacy.load("en_core_web_sm")
-print("✓ Model loaded\n")
+_NLP = None
+
+
+def get_nlp():
+    """Load spaCy only when running the audit script."""
+    global _NLP
+    if _NLP is None:
+        print("Loading spaCy en_core_web_sm model...")
+        _NLP = spacy.load("en_core_web_sm")
+        print("✓ Model loaded\n")
+    return _NLP
 
 # Test words organized by category
 TEST_WORDS = {
@@ -49,11 +56,12 @@ TEST_CONTEXTS = [
 ]
 
 
-def test_word_classification(word, contexts):
+def classify_word_pos(word, contexts):
     """Test if word is correctly tagged as NOUN in various contexts.
 
     Returns dict with POS tags found across contexts.
     """
+    nlp = get_nlp()
     pos_tags = defaultdict(int)
     deps = defaultdict(int)
 
@@ -93,7 +101,7 @@ def main():
         misclassified_in_category = []
 
         for word in words:
-            results = test_word_classification(word, TEST_CONTEXTS)
+            results = classify_word_pos(word, TEST_CONTEXTS)
 
             if results['is_misclassified']:
                 misclassified_in_category.append(word)
