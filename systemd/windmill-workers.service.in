@@ -5,12 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=sd
-WorkingDirectory=/home/sd/windmill
-ExecStart=/home/sd/windmill/windmill.sh monitor 30
+User=__WINDMILL_USER__
+WorkingDirectory=__WINDMILL_DIR__
+ExecStart=__WINDMILL_DIR__/windmill.sh monitor 30
 Restart=always
 RestartSec=10
-EnvironmentFile=/home/sd/windmill/.env
+EnvironmentFile=__WINDMILL_DIR__/.env
 
 [Install]
 WantedBy=multi-user.target
