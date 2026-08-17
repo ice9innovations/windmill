@@ -8,6 +8,7 @@ on hot-path worker code to create downstream queues.
 
 import os
 import sys
+import time
 
 from dotenv import load_dotenv
 import pika
@@ -28,8 +29,11 @@ def build_queue_config() -> RabbitMQConnectionConfig:
         raise ValueError("Missing QUEUE_HOST/QUEUE_USER/QUEUE_PASSWORD")
 
     port = int(os.getenv("QUEUE_PORT", "5672"))
-    use_ssl = os.getenv("QUEUE_USE_SSL", "false").lower() in {"1", "true", "yes", "on"}
-    server_hostname = os.getenv("QUEUE_SSL_SERVER_HOSTNAME") or None
+    use_ssl = (
+        os.getenv("QUEUE_SSL", os.getenv("QUEUE_USE_SSL", "false")).lower()
+        in {"1", "true", "yes", "on"}
+    )
+    server_hostname = os.getenv("QUEUE_SSL_SERVER_HOSTNAME") or host
     return RabbitMQConnectionConfig(
         host=host,
         port=port,
@@ -63,13 +67,33 @@ def main() -> int:
     load_dotenv()
     config = ServiceConfig(os.path.join(ROOT, "service_config.yaml"))
     queue_config = build_queue_config()
-    params = queue_config.build_params()
+    params = queue_config.build_params(
+        connection_attempts=int(os.getenv("QUEUE_CONNECTION_ATTEMPTS", "10")),
+        retry_delay=int(os.getenv("QUEUE_CONNECTION_RETRY_DELAY_SECONDS", "5")),
+        socket_timeout=int(os.getenv("QUEUE_SOCKET_TIMEOUT_SECONDS", "30")),
+    )
 
     ttl_ms = queue_message_ttl_ms()
     queue_names = gather_queue_names(config)
     declared = 0
 
-    connection = pika.BlockingConnection(params)
+    connection = None
+    attempts = int(os.getenv("QUEUE_PREDECLARE_ATTEMPTS", "3"))
+    for attempt in range(1, attempts + 1):
+        try:
+            connection = pika.BlockingConnection(params)
+            break
+        except Exception as exc:
+            if attempt >= attempts:
+                raise
+            delay = min(5 * attempt, 15)
+            print(
+                f"RabbitMQ predeclare connection failed "
+                f"(attempt {attempt}/{attempts}): {exc}; retrying in {delay}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
     channel = connection.channel()
     try:
         for queue_name in queue_names:
