@@ -1,5 +1,5 @@
 [Unit]
-Description=Windmill API
+Description=Windmill worker monitor
 After=network-online.target
 Wants=network-online.target
 
@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=sd
 WorkingDirectory=/home/sd/windmill
-ExecStart=/home/sd/windmill/windmill_venv/bin/python api.py
+ExecStart=/home/sd/windmill/windmill.sh monitor 30
 Restart=always
 RestartSec=10
 EnvironmentFile=/home/sd/windmill/.env

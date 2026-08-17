@@ -253,6 +253,59 @@ start_worker() {
     echo "✅ Started $worker"
 }
 
+monitor_once() {
+    mkdir -p logs
+
+    if [ ! -f "$STATE_FILE" ]; then
+        bootstrap_state_from_running
+    fi
+
+    local enabled
+    enabled=$(get_enabled_workers)
+    if [ -z "$enabled" ]; then
+        echo -e "${YELLOW}⚠️  No enabled workers on this machine.${NC}"
+        return 0
+    fi
+
+    local restarted=0
+    for worker in $enabled; do
+        local worker_file=""
+        if [ -f "workers/${worker}.py" ]; then
+            worker_file="workers/${worker}.py"
+        elif [ -f "workers/${worker}_worker.py" ]; then
+            worker_file="workers/${worker}_worker.py"
+        else
+            echo -e "${YELLOW}⚠️  Skipping unknown enabled worker '$worker'${NC}"
+            continue
+        fi
+
+        if ! pgrep -f "$worker_file" >/dev/null 2>&1; then
+            echo -e "${YELLOW}⚠️  $worker is not running; starting it...${NC}"
+            start_worker "$worker"
+            restarted=$((restarted + 1))
+        fi
+    done
+
+    if [ "$restarted" -eq 0 ]; then
+        echo -e "${GREEN}✅ All enabled workers are running${NC}"
+    else
+        echo -e "${GREEN}✅ Restarted $restarted missing worker(s)${NC}"
+    fi
+}
+
+monitor_loop() {
+    local interval="${2:-30}"
+    if ! [[ "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -lt 5 ]; then
+        interval=30
+    fi
+
+    echo "👀 Monitoring enabled workers every ${interval}s. Press CTRL+C to exit."
+    while true; do
+        monitor_once
+        sleep "$interval"
+    done
+}
+
 case "$ACTION" in
     start)
         if [ -n "$2" ]; then
@@ -316,8 +369,14 @@ case "$ACTION" in
     status)
         status_all
         ;;
+    monitor-once)
+        monitor_once
+        ;;
+    monitor)
+        monitor_loop "$@"
+        ;;
     *)
-        echo "Usage: $0 {start [worker]|stop [worker]|restart [worker]|status}"
+        echo "Usage: $0 {start [worker]|stop [worker]|restart [worker]|status|monitor [seconds]|monitor-once}"
         echo ""
         echo "Examples:"
         echo "  $0 start          # Start all workers"
@@ -327,6 +386,8 @@ case "$ACTION" in
         echo "  $0 restart        # Restart all workers"
         echo "  $0 restart ollama # Restart just the ollama worker"
         echo "  $0 status         # Show status of all workers"
+        echo "  $0 monitor        # Keep enabled workers running"
+        echo "  $0 monitor-once   # Start any missing enabled workers once"
         exit 1
         ;;
 esac

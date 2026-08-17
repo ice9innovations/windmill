@@ -673,6 +673,21 @@ class BaseWorker:
                 f"Channel dead during nack (broker will redeliver unacked message): {e}"
             )
 
+    def _is_recoverable_queue_error(self, exc):
+        """Return True for network/broker errors that should reconnect the consumer."""
+        recoverable_types = (
+            pika.exceptions.AMQPConnectionError,
+            pika.exceptions.AMQPChannelError,
+            pika.exceptions.StreamLostError,
+            pika.exceptions.ConnectionClosed,
+            pika.exceptions.ChannelClosed,
+            OSError,
+            socket.gaierror,
+            socket.timeout,
+            ssl.SSLError,
+        )
+        return isinstance(exc, recoverable_types)
+
     def _is_dispatch_terminal(self, image_id, service=None, cluster_id=None):
         """Return True when the newest matching service_dispatch row is not pending."""
         service = service or self._get_clean_service_name()
@@ -2320,8 +2335,10 @@ class BaseWorker:
                 self._async_publisher.stop(join_timeout=10)
                 self._stop_registry()
                 break
-            except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError,
-                    pika.exceptions.StreamLostError) as e:
+            except Exception as e:
+                if not self._is_recoverable_queue_error(e):
+                    self.logger.error("Unexpected consume loop failure", exc_info=True)
+                    raise
                 self.logger.warning(f"Queue connection lost: {e}. Reconnecting...")
                 time.sleep(self.retry_delay)
                 if not self.connect_to_queue():

@@ -112,36 +112,61 @@ class DbWorker(ABC):
     def _handle_sigterm(self, signum, frame):
         raise KeyboardInterrupt("SIGTERM received")
 
+    def _connect_with_retry(self):
+        delay = 5
+        while not self.stop_event.is_set():
+            try:
+                return self._db_connect(autocommit=True)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                self.logger.error(f"Database connection failed: {e}")
+                self.logger.warning(f"Retrying database connection in {delay}s")
+                self.stop_event.wait(delay)
+                delay = min(delay * 2, 60)
+        return None
+
     def run(self):
         signal.signal(signal.SIGTERM, self._handle_sigterm)
         self.on_startup()
 
-        try:
-            conn = self._db_connect(autocommit=True)
-        except Exception as e:
-            self.logger.error(f"Failed to connect to database: {e}")
-            sys.exit(1)
+        conn = self._connect_with_retry()
+        if conn is None:
+            return
 
         try:
             self.registry.start(conn)
             self.logger.info(f"Registered in worker registry ({self.host})")
         except Exception as e:
             self.logger.error(f"Failed to register in worker registry: {e}")
-            sys.exit(1)
+            close_conn = conn
+            try:
+                close_conn.close()
+            except Exception:
+                pass
+            conn = self._connect_with_retry()
+            if conn is None:
+                return
+            self.registry.start(conn)
+            self.logger.info(f"Registered in worker registry ({self.host})")
 
         try:
             self.on_connected(conn)
             self.logger.info("Running. Press CTRL+C to exit.")
             while not self.stop_event.is_set():
+                if conn is None or getattr(conn, 'closed', 1) != 0:
+                    conn = self._connect_with_retry()
+                    if conn is None:
+                        break
                 try:
                     self.run_iteration(conn)
                 except Exception as e:
                     self.on_iteration_error(e)
                     try:
                         conn.close()
-                        conn = self._db_connect(autocommit=True)
                     except Exception:
                         pass
+                    conn = self._connect_with_retry()
                 self.stop_event.wait(self.interval_seconds)
         except KeyboardInterrupt:
             self.logger.info("Stopping...")

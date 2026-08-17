@@ -113,6 +113,8 @@ class ManagedWorkerRegistry:
         try:
             while not self._stop_event.wait(self.heartbeat_interval):
                 try:
+                    if conn is None:
+                        conn = self.connection_factory(autocommit=True)
                     cursor = conn.cursor()
                     cursor.execute(
                         "UPDATE worker_registry SET last_heartbeat = NOW() WHERE worker_id = %s",
