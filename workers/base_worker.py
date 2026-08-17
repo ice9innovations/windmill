@@ -1121,6 +1121,65 @@ class BaseWorker:
             )
             return False, 0, 0, None, False
 
+    def _is_primary_dispatch_set_terminal(self, image_id):
+        """Return whether every submitted primary service has settled terminally."""
+        terminal_statuses = ('complete', 'failed', 'dead-lettered', 'dead_lettered')
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                WITH submitted AS (
+                    SELECT unnest(services_submitted) AS service
+                    FROM images
+                    WHERE image_id = %s
+                ),
+                latest_dispatch AS (
+                    SELECT DISTINCT ON (service)
+                        service, status, dispatch_id
+                    FROM service_dispatch
+                    WHERE image_id = %s
+                      AND cluster_id IS NULL
+                    ORDER BY service, dispatch_id DESC
+                ),
+                scoped AS (
+                    SELECT
+                        submitted.service,
+                        latest_dispatch.status,
+                        latest_dispatch.dispatch_id
+                    FROM submitted
+                    LEFT JOIN latest_dispatch USING (service)
+                )
+                SELECT
+                    COUNT(*) AS expected_count,
+                    COUNT(*) FILTER (WHERE status = ANY(%s::text[])) AS terminal_count,
+                    (
+                        SELECT service
+                        FROM scoped
+                        WHERE status = ANY(%s::text[])
+                        ORDER BY dispatch_id DESC
+                        LIMIT 1
+                    ) AS latest_terminal_service
+                FROM scoped
+                """,
+                (image_id, image_id, list(terminal_statuses), list(terminal_statuses)),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            expected_count = row[0] or 0
+            terminal_count = row[1] or 0
+            latest_service = row[2]
+            return (
+                expected_count > 0 and terminal_count >= expected_count,
+                terminal_count,
+                expected_count,
+                latest_service,
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"Failed primary dispatch completeness check for image {image_id}: {e}"
+            )
+            return False, 0, 0, None
+
     def _vlm_final_wait_timed_out(self, submitted_at_epoch):
         if submitted_at_epoch is None or self.vlm_final_wait_seconds <= 0:
             return False
@@ -1152,6 +1211,35 @@ class BaseWorker:
         except Exception as e:
             self.logger.warning(
                 f"Failed duplicate-consensus trigger check for image {image_id} service={service}: {e}"
+            )
+            return True
+
+    def _should_enqueue_postprocessing_task(self, image_id, task_type):
+        """Return True when this postprocessing task type has not already been enqueued."""
+        source_stage = f"{task_type}_trigger"
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                SELECT event_type
+                FROM service_events
+                WHERE image_id = %s
+                  AND service = 'postprocessing_orchestrator'
+                  AND source_stage = %s
+                ORDER BY event_id DESC
+                LIMIT 1
+                """,
+                (image_id, source_stage),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            if not row:
+                return True
+            return row[0] == 'failed'
+        except Exception as e:
+            self.logger.warning(
+                f"Failed postprocessing task trigger check for image {image_id} "
+                f"task={task_type}: {e}"
             )
             return True
 
@@ -2019,8 +2107,23 @@ class BaseWorker:
             orchestrator_duplicate_check_duration = 0.0
             enqueued_postprocessing_orchestrator = False
             should_enqueue_postprocessing_orchestrator = False
-            if self.config.is_available_for_tier('system.postprocessing_orchestrator', tier) and vlm_tail_ready:
-                should_enqueue_postprocessing_orchestrator = True
+            primary_check_started_at = time.time()
+            (
+                primary_complete_ready,
+                current_primary_count,
+                expected_primary_count,
+                latest_primary_service,
+            ) = self._is_primary_dispatch_set_terminal(image_id)
+            primary_check_duration = time.time() - primary_check_started_at
+            if (
+                self.config.is_available_for_tier('system.postprocessing_orchestrator', tier)
+                and primary_complete_ready
+            ):
+                t0 = time.time()
+                should_enqueue_postprocessing_orchestrator = (
+                    self._should_enqueue_postprocessing_task(image_id, 'primary_complete')
+                )
+                orchestrator_duplicate_check_duration = time.time() - t0
             if should_enqueue_postprocessing_orchestrator:
                 pending_consensus_events.append({
                     'image_id': image_id,
@@ -2037,8 +2140,8 @@ class BaseWorker:
                     'source_service': self._get_clean_service_name(),
                     'submitted_at_epoch': message.get('submitted_at_epoch'),
                     'vlm_wait_timed_out': vlm_wait_timed_out,
-                    'current_vlm_count': current_vlm_count,
-                    'expected_vlm_count': expected_vlm_count,
+                    'current_primary_count': current_primary_count,
+                    'expected_primary_count': expected_primary_count,
                 }
                 downstream_messages.append((
                     self._get_queue_by_service_type('postprocessing_orchestrator'),
@@ -2048,7 +2151,9 @@ class BaseWorker:
             elif self.config.is_available_for_tier('system.postprocessing_orchestrator', tier):
                 self.logger.debug(
                     f"Skipping postprocessing_orchestrator enqueue for {self.service_name} image {image_id}: "
-                    f"latest={latest_vlm_service!r} ({current_vlm_count}/{expected_vlm_count})"
+                    f"primary_complete={primary_complete_ready} "
+                    f"latest={latest_primary_service!r} "
+                    f"({current_primary_count}/{expected_primary_count})"
                 )
             if pending_consensus_events:
                 event_timings = self._record_service_events_batch(
@@ -2076,7 +2181,8 @@ class BaseWorker:
                 self.logger.info(
                     f"consensus_handoff service=postprocessing_orchestrator image={image_id} "
                     f"publisher={self._get_clean_service_name()} "
-                    f"latest_check={latest_check_duration:.3f}s "
+                    f"primary_check={primary_check_duration:.3f}s "
+                    f"primary_terminal={current_primary_count}/{expected_primary_count} "
                     f"duplicate_check={orchestrator_duplicate_check_duration:.3f}s "
                     f"record_event={consensus_event_insert_duration + consensus_event_commit_duration:.3f}s "
                     f"publish={publish_duration:.3f}s"
@@ -2106,13 +2212,16 @@ class BaseWorker:
                     "service_processing_time=None"
                 ),
                 f"total={time.time() - callback_started_at:.3f}s",
-                "status=success",
+                f"service_status={result_status}",
+                "message_status=acked",
             ]
             if upstream_queue_wait is not None:
                 timing.insert(1, f"from_submit={upstream_queue_wait:.3f}s")
             self.logger.info(" ".join(timing))
 
-            self.logger.info(f"Successfully processed {self.service_name} request for image {image_id}")
+            self.logger.info(
+                f"Successfully handled {self.service_name} message for image {image_id}"
+            )
 
         except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
             # Database connection error mid-message — requeue so the job is not lost,
