@@ -216,6 +216,7 @@ services:
       service_type: specialized
       consensus: false
       tier:
+        - basic
         - premium
         - extra
         - cloud
@@ -228,6 +229,7 @@ services:
       service_type: specialized
       consensus: false
       tier:
+        - basic
         - premium
         - extra
         - cloud
