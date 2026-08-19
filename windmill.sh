@@ -187,42 +187,9 @@ stop_all() {
 }
 
 status_all() {
-    echo "📊 Enabled Worker Status:"
-    echo "========================="
+    echo "📊 Worker Status:"
+    echo "================="
 
-    local enabled
-    enabled=$(get_enabled_workers)
-    if [ -z "$enabled" ]; then
-        echo -e "${YELLOW}⚠️  No enabled workers on this machine.${NC}"
-    else
-        for worker in $enabled; do
-            if pgrep -f "workers/${worker}.py" >/dev/null 2>&1; then
-                local pid=$(pgrep -f "workers/${worker}.py")
-                echo -e "${GREEN}✅ $worker${NC} (PID: $pid)"
-            else
-                echo -e "${RED}❌ $worker${NC} (enabled, not running)"
-            fi
-        done
-    fi
-
-    local unexpected_running=0
-    for worker in $(get_all_workers); do
-        if ! is_enabled_worker "$worker" && pgrep -f "workers/${worker}.py" >/dev/null 2>&1; then
-            if [ "$unexpected_running" -eq 0 ]; then
-                echo ""
-                echo "Unexpected running workers:"
-            fi
-            local pid=$(pgrep -f "workers/${worker}.py")
-            echo -e "${YELLOW}⚠️  $worker${NC} (PID: $pid, not enabled)"
-            unexpected_running=$((unexpected_running + 1))
-        fi
-    done
-}
-
-status_full() {
-    echo "📊 All Worker Status:"
-    echo "====================="
-    
     for worker in $(get_all_workers); do
         if pgrep -f "workers/${worker}.py" >/dev/null 2>&1; then
             local pid=$(pgrep -f "workers/${worker}.py")
@@ -239,6 +206,11 @@ status_full() {
             fi
         fi
     done
+}
+
+# Kept as an alias for anyone whose muscle memory or scripts still call status-full.
+status_full() {
+    status_all
 }
 
 stop_worker() {
@@ -493,8 +465,7 @@ case "$ACTION" in
         echo "  $0 stop ollama    # Stop just the ollama worker"
         echo "  $0 restart        # Restart all workers"
         echo "  $0 restart ollama # Restart just the ollama worker"
-        echo "  $0 status         # Show enabled worker status"
-        echo "  $0 status-full    # Show every installed worker"
+        echo "  $0 status         # Show every worker and its state (alias: status-full)"
         echo "  $0 monitor        # Keep enabled workers running"
         echo "  $0 monitor-once   # Start any missing enabled workers once"
         exit 1
