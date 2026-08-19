@@ -90,6 +90,7 @@ services:
       endpoint: /analyze
       service_type: specialized
       tier:
+        - basic
         - premium
         - extra
         - cloud
