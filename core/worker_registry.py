@@ -13,7 +13,7 @@ import socket
 import threading
 from typing import Optional
 
-from core.postgres_connection import close_quietly
+from core.postgres_connection import close_quietly, commit_if_needed
 
 
 class ManagedWorkerRegistry:
@@ -68,6 +68,7 @@ class ManagedWorkerRegistry:
                 """,
                 (self.worker_id, self.service, self.host),
             )
+            commit_if_needed(conn, force=True)
         finally:
             close_quietly(cursor)
 
@@ -88,6 +89,7 @@ class ManagedWorkerRegistry:
                 (self.worker_id, self.stale_threshold),
             )
             rows = cursor.fetchall()
+            commit_if_needed(conn, force=True)
             return rows if return_rows else len(rows)
         finally:
             close_quietly(cursor)
@@ -99,6 +101,7 @@ class ManagedWorkerRegistry:
                 "UPDATE worker_registry SET status = 'offline', offline_at = NOW() WHERE worker_id = %s",
                 (self.worker_id,),
             )
+            commit_if_needed(conn, force=True)
         finally:
             close_quietly(cursor)
 
