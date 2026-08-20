@@ -811,7 +811,63 @@ class BaseWorker:
     def get_service_url(self):
         """Build the complete service URL for processing"""
         return f"http://{self.service_host}:{self.service_port}{self.service_endpoint}"
-    
+
+    def get_health_url(self):
+        """Build the health-check URL for this worker's coupled animal-farm service."""
+        return f"http://{self.service_host}:{self.service_port}/health"
+
+    def has_coupled_service(self):
+        """True for workers that call a local animal-farm service (most of them);
+        False for DB-only admin workers, which don't set service_host at all."""
+        return bool(self.service_host and self.service_port)
+
+    def check_service_health(self, timeout=2):
+        """Hit this worker's own coupled /health endpoint. Returns True/False;
+        never raises -- a failed or timed-out health check just means unhealthy.
+        Local-only call (never over the public internet), so a bad result here
+        means the service process itself is wedged, not network flakiness.
+
+        Trusts the HTTP status code, not the JSON body's `status` field: the
+        animal-farm convention (confirmed 2026-08-20 against a false-positive
+        eviction of a perfectly working nudenet) is 200 for anything still able
+        to serve -- including a "degraded" state like a GPU service that fell
+        back to CPU -- and 503 for genuinely broken. The body's status string
+        varies per service ("healthy"/"degraded"/"unhealthy"/"error"/...) and
+        isn't a reliable thing to pattern-match across independently-written
+        services; the status code is the one convention they actually share.
+        """
+        if not self.has_coupled_service():
+            return True
+        try:
+            resp = requests.get(self.get_health_url(), timeout=timeout)
+            return resp.status_code == 200
+        except Exception as e:
+            self.logger.warning(f"Health check failed for {self.service_name}: {e}")
+            return False
+
+    def _shutdown_marker_path(self):
+        log_name = os.path.splitext(os.path.basename(sys.argv[0]))[0]
+        return os.path.join('logs', f'{log_name}.shutdown_reason')
+
+    def _write_shutdown_marker(self, reason):
+        try:
+            os.makedirs('logs', exist_ok=True)
+            with open(self._shutdown_marker_path(), 'w') as f:
+                json.dump({
+                    'service': self.service_name,
+                    'shutdown_at': datetime.now(timezone.utc).isoformat(),
+                    'reason': reason,
+                    'health_url': self.get_health_url(),
+                }, f)
+        except Exception as e:
+            self.logger.error(f"Failed to write shutdown marker: {e}")
+
+    def _shutdown_unhealthy(self, reason):
+        """Log, mark, and exit so the monitor can decide when it's safe to revive us."""
+        self.logger.error(f"{self.service_name} unhealthy ({reason}) -- shutting down for the monitor to revive")
+        self._write_shutdown_marker(reason)
+        sys.exit(1)
+
     def post_image_bytes(self, image_bytes):
         """POST raw image bytes to service."""
         service_url = self.get_service_url()
@@ -1850,6 +1906,12 @@ class BaseWorker:
                 )
                 self._safe_nack(ch, method.delivery_tag, requeue=True)
                 self.job_failed("No terminal JSON result")
+                # A failed call could be transient/unrelated (bad image, one-off
+                # blip) or a sign the local service itself is wedged -- check
+                # rather than guess. Requeue above already happened either way,
+                # so the job isn't lost regardless of which it turns out to be.
+                if self.has_coupled_service() and not self.check_service_health():
+                    self._shutdown_unhealthy("failed post-job health check")
                 return
 
             result_status = result.get('status', 'success') or 'success'
@@ -2256,6 +2318,13 @@ class BaseWorker:
     def start(self):
         """Start the worker"""
         self.logger.info(f"Starting {self.service_name} worker ({self.worker_id})")
+
+        # Fail fast if our coupled animal-farm service is already unhealthy --
+        # no point standing up DB/queue connections just to accept and fail
+        # jobs. Handles "windmill is up, animal-farm isn't" per-worker, with
+        # no special-cased global check needed.
+        if self.has_coupled_service() and not self.check_service_health():
+            self._shutdown_unhealthy("failed startup health check")
 
         # Connect to services — retry with backoff on transient failures (e.g. DNS not yet
         # available at boot) rather than exiting immediately.

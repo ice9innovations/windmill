@@ -186,6 +186,30 @@ stop_all() {
     echo -e "${GREEN}✅ All workers stopped${NC}"
 }
 
+# Reads a worker's shutdown marker (see base_worker.py's health-check logic)
+# and prints health_url then reason, one per line. Empty health_url means no
+# marker or it couldn't be parsed. python3, not jq -- jq is conda-only on
+# this box and not on a systemd unit's default PATH (caught 2026-08-20).
+read_shutdown_marker() {
+    local marker_path="$1"
+    if [ ! -f "$marker_path" ]; then
+        echo ""
+        echo ""
+        return
+    fi
+    python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    print(d.get('health_url', ''))
+    print(d.get('reason', 'unknown'))
+except Exception:
+    print('')
+    print('unknown')
+" "$marker_path" 2>/dev/null
+}
+
 status_all() {
     echo "📊 Worker Status:"
     echo "================="
@@ -200,7 +224,15 @@ status_all() {
             fi
         else
             if is_enabled_worker "$worker"; then
-                echo -e "${RED}❌ $worker${NC} (enabled, not running)"
+                local marker_path="logs/${worker}.shutdown_reason"
+                if [ -f "$marker_path" ]; then
+                    local parsed reason
+                    parsed=$(read_shutdown_marker "$marker_path")
+                    reason=$(echo "$parsed" | sed -n '2p')
+                    echo -e "${YELLOW}🔻 $worker${NC} (enabled, held down: $reason)"
+                else
+                    echo -e "${RED}❌ $worker${NC} (enabled, not running)"
+                fi
             else
                 echo "· $worker (not enabled)"
             fi
@@ -337,6 +369,7 @@ monitor_once() {
     fi
 
     local restarted=0
+    local held_down=0
     for worker in $enabled; do
         local worker_file=""
         if [ -f "workers/${worker}.py" ]; then
@@ -349,16 +382,47 @@ monitor_once() {
         fi
 
         if ! pgrep -f "$worker_file" >/dev/null 2>&1; then
+            local log_name marker_path
+            log_name=$(basename "$worker_file" ".py")
+            marker_path="logs/${log_name}.shutdown_reason"
+
+            # A worker that self-evicted (see base_worker.py's health-check
+            # logic) leaves a marker recording why and its own /health URL.
+            # Re-check that URL, bounded, before respawning into the same
+            # failure -- each check is capped so one wedged service can't
+            # stall this sweep for every other worker (isolation, not
+            # cluster-wide blocking).
+            if [ -f "$marker_path" ]; then
+                local health_url reason parsed
+                parsed=$(read_shutdown_marker "$marker_path")
+                health_url=$(echo "$parsed" | sed -n '1p')
+                reason=$(echo "$parsed" | sed -n '2p')
+
+                if [ -n "$health_url" ] && curl -s -m 2 -o /dev/null -w '%{http_code}' "$health_url" 2>/dev/null | grep -q '^200$'; then
+                    echo -e "${GREEN}✅ $worker's service is healthy again (was down: $reason); reviving${NC}"
+                    rm -f "$marker_path"
+                else
+                    echo -e "${YELLOW}🔻 $worker still unhealthy ($reason); leaving it down for now${NC}"
+                    held_down=$((held_down + 1))
+                    continue
+                fi
+            fi
+
             echo -e "${YELLOW}⚠️  $worker is not running; starting it...${NC}"
             start_worker "$worker"
             restarted=$((restarted + 1))
         fi
     done
 
-    if [ "$restarted" -eq 0 ]; then
+    if [ "$restarted" -eq 0 ] && [ "$held_down" -eq 0 ]; then
         echo -e "${GREEN}✅ All enabled workers are running${NC}"
     else
-        echo -e "${GREEN}✅ Restarted $restarted missing worker(s)${NC}"
+        if [ "$restarted" -gt 0 ]; then
+            echo -e "${GREEN}✅ Restarted $restarted missing worker(s)${NC}"
+        fi
+        if [ "$held_down" -gt 0 ]; then
+            echo -e "${YELLOW}🔻 $held_down worker(s) intentionally held down (unhealthy service)${NC}"
+        fi
     fi
 }
 
