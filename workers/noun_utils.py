@@ -383,13 +383,36 @@ def _find_groups(all_nouns: Set[str],
     # whose last word it is (e.g. "module" ↔ "ram module", "code" ↔ "qr code").
     # Handles the case where some VLMs extract the full compound and others
     # extract only the head noun — both sets of votes merge into one entry.
+    #
+    # MWE prefix-strip pass: connect two recognized MWEs that differ only by
+    # a leading word (e.g. "on all fours" -> "all fours") -- mwe.txt has
+    # near-duplicate entries for the same concept, and the head-word pass
+    # above only bridges an MWE to a *single-word* noun, so two multi-word
+    # MWEs sharing a head never connect to each other without this.
+    #
+    # Both passes are skipped when the MWE already has its own WordNet sense
+    # (noun_synset_list[mwe] non-empty): a phrase WordNet treats as a
+    # distinct concept (oral_sex.n.01, sodomy.n.01, dirt_track.n.01) must
+    # not be flattened into a same-head-word/prefix-stripped noun just
+    # because they share a trailing or leading word -- that's exactly how
+    # "oral sex" and "anal sex" previously got merged into generic "sex".
+    # This fallback is only trustworthy when WordNet has no opinion at all
+    # about the MWE (true compound-only terms like "ram module", or
+    # near-duplicate list entries like "on all fours").
     single_nouns = {n for n in all_nouns if ' ' not in n}
     mwe_nouns = {n for n in all_nouns if ' ' in n and is_mwe(n)}
     for mwe in mwe_nouns:
-        head = mwe.split()[-1]
+        if noun_synset_list.get(mwe):
+            continue
+        parts = mwe.split()
+        head = parts[-1]
         if head in single_nouns and head not in neighbors[mwe]:
             neighbors[mwe].add(head)
             neighbors[head].add(mwe)
+        stripped = ' '.join(parts[1:])
+        if stripped in all_nouns and stripped != mwe and stripped not in neighbors[mwe]:
+            neighbors[mwe].add(stripped)
+            neighbors[stripped].add(mwe)
 
     # BFS connected components
     visited: Set[str] = set()
