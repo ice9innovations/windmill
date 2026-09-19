@@ -113,6 +113,14 @@ The relay exposes:
 - `GET /metrics`
 - `GET /image/<image_ref>?kind=image`
 
+On the relay host, install its persistent systemd service from the Windmill
+checkout:
+
+```bash
+./install-systemd.sh relay
+curl http://127.0.0.1:8787/healthz
+```
+
 The cache is RAM only. Size and lifetime are controlled by:
 
 - `IMAGE_RELAY_CACHE_TTL_SECONDS` default `15`

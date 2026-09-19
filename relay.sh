@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /home/sd/windmill
-source /home/sd/windmill/windmill_venv/bin/activate
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+cd "$SCRIPT_DIR"
+source "$SCRIPT_DIR/windmill_venv/bin/activate"
 
 export IMAGE_RELAY_BIND_HOST=192.168.0.101
 export IMAGE_RELAY_PORT=8787

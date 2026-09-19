@@ -7,12 +7,13 @@ MODE="${1:-workers}"
 
 if [ "$MODE" = "--help" ] || [ "$MODE" = "-h" ]; then
     cat <<USAGE
-Usage: $0 [workers|api|all]
+Usage: $0 [workers|api|relay|all]
 
 Installs systemd units rendered for this checkout path and user.
 
   workers  Install only the Windmill worker monitor (default)
   api      Install only the Windmill API service
+  relay    Install only the LAN image relay
   all      Install both services
 
 Override WINDMILL_USER if the service should run as a different user.
@@ -21,7 +22,7 @@ USAGE
 fi
 
 case "$MODE" in
-    workers|api|all)
+    workers|api|relay|all)
         ;;
     *)
         echo "ERROR: unknown mode '$MODE'. Use workers, api, or all." >&2
@@ -64,6 +65,10 @@ if [ "$MODE" = "api" ] || [ "$MODE" = "all" ]; then
     install_unit "windmill.service"
 fi
 
+if [ "$MODE" = "relay" ]; then
+    install_unit "windmill-image-relay.service"
+fi
+
 sudo systemctl daemon-reload
 
 if [ "$MODE" = "workers" ] || [ "$MODE" = "all" ]; then
@@ -74,6 +79,11 @@ fi
 if [ "$MODE" = "api" ] || [ "$MODE" = "all" ]; then
     sudo systemctl enable windmill.service
     sudo systemctl restart windmill.service
+fi
+
+if [ "$MODE" = "relay" ]; then
+    sudo systemctl enable windmill-image-relay.service
+    sudo systemctl restart windmill-image-relay.service
 fi
 
 echo "Installed Windmill systemd mode=${MODE} user=${SERVICE_USER} dir=${SCRIPT_DIR}"
