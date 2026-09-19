@@ -11,6 +11,7 @@ This owns one concern only:
 
 import socket
 import threading
+import zlib
 from typing import Optional
 
 from core.postgres_connection import close_quietly, commit_if_needed
@@ -105,45 +106,55 @@ class ManagedWorkerRegistry:
         finally:
             close_quietly(cursor)
 
-    def _heartbeat_loop(self):
+    def _heartbeat_initial_delay(self):
+        """Spread worker heartbeats deterministically across the interval."""
+        interval_ms = max(int(self.heartbeat_interval * 1000), 1)
+        worker_hash = zlib.crc32(self.worker_id.encode('utf-8'))
+        return (worker_hash % interval_ms) / 1000.0
+
+    def _heartbeat_once(self):
+        """Send one heartbeat using a short leased database connection."""
+        conn = None
+        cursor = None
+        try:
+            conn = self.connection_factory(autocommit=True)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE worker_registry SET last_heartbeat = NOW() WHERE worker_id = %s",
+                (self.worker_id,),
+            )
+            self.logger.debug("Heartbeat sent")
+            return True
+        except Exception as e:
+            self.logger.warning(f"Heartbeat failed: {e}")
+            return False
+        finally:
+            close_quietly(cursor)
+            close_quietly(conn)
+
+    def _mark_offline_with_fresh_connection(self):
         conn = None
         try:
             conn = self.connection_factory(autocommit=True)
+            self.mark_offline(conn)
+            self.logger.info("Marked offline in worker registry")
         except Exception as e:
-            self.logger.warning(f"Heartbeat thread failed to connect to DB: {e}")
-            return
+            self.logger.warning(f"Failed to mark offline in worker registry: {e}")
+        finally:
+            close_quietly(conn)
 
+    def _heartbeat_loop(self):
         try:
-            while not self._stop_event.wait(self.heartbeat_interval):
-                try:
-                    if conn is None:
-                        conn = self.connection_factory(autocommit=True)
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "UPDATE worker_registry SET last_heartbeat = NOW() WHERE worker_id = %s",
-                        (self.worker_id,),
-                    )
-                    close_quietly(cursor)
-                    self.logger.debug("Heartbeat sent")
-                except Exception as e:
-                    self.logger.warning(f"Heartbeat failed: {e}. Reconnecting...")
-                    close_quietly(conn)
-                    conn = None
-                    try:
-                        conn = self.connection_factory(autocommit=True)
-                    except Exception as reconnect_e:
-                        self.logger.error(f"Heartbeat reconnect failed: {reconnect_e}")
-
-            if conn is not None:
-                try:
-                    self.mark_offline(conn)
-                    self.logger.info("Marked offline in worker registry")
-                except Exception as e:
-                    self.logger.warning(f"Failed to mark offline in worker registry: {e}")
+            if self._stop_event.wait(self._heartbeat_initial_delay()):
+                return
+            while not self._stop_event.is_set():
+                self._heartbeat_once()
+                if self._stop_event.wait(self.heartbeat_interval):
+                    break
         except Exception as e:
             self.logger.error(f"Heartbeat thread crashed unexpectedly: {e}", exc_info=True)
         finally:
-            close_quietly(conn)
+            self._mark_offline_with_fresh_connection()
 
     def start(self, conn):
         self._stop_event.clear()
