@@ -47,6 +47,7 @@ from core.rabbitmq_connection import (
     RabbitMQConnectionConfig,
 )
 from core.worker_registry import ManagedWorkerRegistry
+from core.worker_identity import create_worker_id
 
 class BaseWorker:
     """Base class for all ML service workers"""
@@ -151,7 +152,8 @@ class BaseWorker:
         )
         
         # Worker configuration
-        self.worker_id = f"worker_{self.service_name}_{int(time.time())}"
+        self.worker_hostname = socket.gethostname()
+        self.worker_id = create_worker_id(self.service_name, host=self.worker_hostname)
         # Optional per-service prefetch override from YAML; fallback to env; default 1
         self.worker_prefetch_count = int(
             service_def.get('prefetch', os.getenv('WORKER_PREFETCH_COUNT', '1'))
@@ -1665,8 +1667,9 @@ class BaseWorker:
             cursor.execute(
                 """
                 INSERT INTO results (
-                    image_id, service, source_trace_id, data, status, http_status, worker_id, processing_time
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    image_id, service, source_trace_id, data, status, http_status,
+                    worker_id, worker_hostname, processing_time
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (image_id, service, source_trace_id)
                 WHERE source_trace_id IS NOT NULL
                 DO NOTHING
@@ -1679,6 +1682,7 @@ class BaseWorker:
                     status,
                     self._extract_http_status(payload),
                     self.worker_id,
+                    self.worker_hostname,
                     processing_time,
                 ),
             )
@@ -2050,9 +2054,10 @@ class BaseWorker:
             cursor.execute("""
                 WITH upserted AS (
                     INSERT INTO results (
-                        image_id, service, source_trace_id, data, status, http_status, worker_id, processing_time
+                        image_id, service, source_trace_id, data, status, http_status,
+                        worker_id, worker_hostname, processing_time
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (image_id, service, source_trace_id)
                     WHERE source_trace_id IS NOT NULL
                     DO NOTHING
@@ -2104,6 +2109,7 @@ class BaseWorker:
                 result_status,
                 self._extract_http_status(result),
                 self.worker_id,
+                self.worker_hostname,
                 processing_time,
                 image_id,
                 source_trace_id,

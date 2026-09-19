@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 
 from core.postgres_connection import PostgresConnectionConfig, create_connection
 from core.worker_registry import ManagedWorkerRegistry
+from core.worker_identity import create_worker_id
 
 
 class DbWorker(ABC):
@@ -41,8 +42,8 @@ class DbWorker(ABC):
         env_file: str = '.env',
     ):
         self.service_name = service_name
-        self.worker_id = f"worker_{service_name}_{int(time.time())}"
         self.host = socket.gethostname()
+        self.worker_id = create_worker_id(service_name, host=self.host)
         self.interval_seconds = interval_seconds
         self.heartbeat_interval = heartbeat_interval or int(os.getenv('WORKER_HEARTBEAT_INTERVAL', '30'))
 

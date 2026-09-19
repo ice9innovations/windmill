@@ -25,10 +25,6 @@ logger = logging.getLogger(__name__)
 class PostprocessingOrchestratorWorker(BaseWorker):
     def __init__(self):
         super().__init__('system.postprocessing_orchestrator')
-        # results.worker_id is varchar(50); the default generated id for this
-        # long service name can exceed that limit and poison-loop the queue.
-        self.worker_id = f"worker_postproc_orch_{int(time.time())}"
-
     def connect_to_database(self):
         try:
             return self._connect_main_database(autocommit=False)
