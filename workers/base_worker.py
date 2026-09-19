@@ -1697,12 +1697,9 @@ class BaseWorker:
         raise KeyboardInterrupt("SIGTERM received")
 
     def _start_registry(self):
-        """Register and start heartbeat thread. Call after DB connection established."""
-        try:
-            self._registry.start(self.db_conn)
-            self.logger.info(f"Registered in worker registry ({self._registry.host})")
-        except Exception as e:
-            self.logger.warning(f"Failed to register in worker registry: {e}")
+        """Register on an isolated connection before queue consumption starts."""
+        self._registry.start()
+        self.logger.info(f"Registered in worker registry ({self._registry.host})")
 
     def _stop_registry(self):
         """Signal heartbeat to stop and wait for offline marker to be written."""

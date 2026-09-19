@@ -30,6 +30,8 @@ class ManagedWorkerRegistry:
         heartbeat_interval: int,
         host: Optional[str] = None,
         stale_threshold: Optional[int] = None,
+        registration_attempts: int = 3,
+        registration_retry_seconds: float = 1.0,
     ):
         self.connection_factory = connection_factory
         self.logger = logger
@@ -38,6 +40,8 @@ class ManagedWorkerRegistry:
         self.host = host or socket.gethostname()
         self.heartbeat_interval = heartbeat_interval
         self.stale_threshold = stale_threshold
+        self.registration_attempts = max(int(registration_attempts), 1)
+        self.registration_retry_seconds = max(float(registration_retry_seconds), 0.0)
         self._stop_event = threading.Event()
         self._thread = None
 
@@ -52,16 +56,6 @@ class ManagedWorkerRegistry:
                 """,
                 (self.service, self.host),
             )
-            if self.stale_threshold:
-                cursor.execute(
-                    """
-                    UPDATE worker_registry
-                    SET status = 'offline', offline_at = last_heartbeat
-                    WHERE status = 'online'
-                      AND last_heartbeat < NOW() - INTERVAL '%s seconds'
-                    """,
-                    (self.stale_threshold,),
-                )
             cursor.execute(
                 """
                 INSERT INTO worker_registry (worker_id, service, host, started_at, last_heartbeat, status)
@@ -72,6 +66,15 @@ class ManagedWorkerRegistry:
             commit_if_needed(conn, force=True)
         finally:
             close_quietly(cursor)
+
+    def _register_with_fresh_connection(self):
+        """Register without sharing or poisoning a worker's main connection."""
+        conn = None
+        try:
+            conn = self.connection_factory(autocommit=True)
+            self.register(conn)
+        finally:
+            close_quietly(conn)
 
     def sweep_stale(self, conn, *, return_rows: bool = False):
         if not self.stale_threshold:
@@ -156,9 +159,21 @@ class ManagedWorkerRegistry:
         finally:
             self._mark_offline_with_fresh_connection()
 
-    def start(self, conn):
+    def start(self):
         self._stop_event.clear()
-        self.register(conn)
+        for attempt in range(1, self.registration_attempts + 1):
+            try:
+                self._register_with_fresh_connection()
+                break
+            except Exception as e:
+                if attempt >= self.registration_attempts:
+                    raise
+                self.logger.warning(
+                    f"Worker registration failed (attempt {attempt}/"
+                    f"{self.registration_attempts}): {e}. Retrying..."
+                )
+                if self._stop_event.wait(self.registration_retry_seconds * attempt):
+                    raise RuntimeError("Worker registration interrupted") from e
         self._thread = threading.Thread(
             target=self._heartbeat_loop,
             daemon=True,

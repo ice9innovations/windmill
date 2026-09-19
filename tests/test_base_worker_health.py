@@ -148,6 +148,21 @@ def test_service_event_types_for_result_failed_mode_skips_success_events():
     assert worker._service_event_types_for_result("failed") == ["failed"]
 
 
+def test_registry_start_failure_is_not_swallowed():
+    worker = _bare_worker()
+
+    class _Registry:
+        host = "test-host"
+
+        def start(self):
+            raise RuntimeError("registration failed")
+
+    worker._registry = _Registry()
+
+    with pytest.raises(RuntimeError, match="registration failed"):
+        worker._start_registry()
+
+
 def test_shutdown_marker_written_with_expected_fields(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", ["/home/sd/windmill/workers/yolov8_worker.py"])

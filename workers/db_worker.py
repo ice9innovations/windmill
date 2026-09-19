@@ -135,20 +135,14 @@ class DbWorker(ABC):
             return
 
         try:
-            self.registry.start(conn)
+            self.registry.start()
             self.logger.info(f"Registered in worker registry ({self.host})")
-        except Exception as e:
-            self.logger.error(f"Failed to register in worker registry: {e}")
-            close_conn = conn
+        except Exception:
             try:
-                close_conn.close()
+                conn.close()
             except Exception:
                 pass
-            conn = self._connect_with_retry()
-            if conn is None:
-                return
-            self.registry.start(conn)
-            self.logger.info(f"Registered in worker registry ({self.host})")
+            raise
 
         try:
             self.on_connected(conn)
