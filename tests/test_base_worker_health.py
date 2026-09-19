@@ -103,6 +103,51 @@ def test_get_health_url_is_always_the_health_path():
     assert worker.get_health_url() == "http://localhost:7772/health"
 
 
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("debug", "debug"),
+        ("all", "debug"),
+        ("terminal", "terminal"),
+        ("failures", "failed"),
+        ("off", "off"),
+        ("unexpected", "debug"),
+        ("", "debug"),
+    ],
+)
+def test_normalize_service_events_mode(raw_value, expected):
+    worker = _bare_worker()
+    assert worker._normalize_service_events_mode(raw_value) == expected
+
+
+@pytest.mark.parametrize(
+    ("mode", "event_type", "expected"),
+    [
+        ("debug", "received", True),
+        ("debug", "completed", True),
+        ("terminal", "received", False),
+        ("terminal", "enqueued", True),
+        ("terminal", "completed", True),
+        ("terminal", "failed", True),
+        ("failed", "completed", False),
+        ("failed", "failed", True),
+        ("off", "failed", False),
+    ],
+)
+def test_should_persist_service_event(mode, event_type, expected):
+    worker = _bare_worker()
+    worker.service_events_mode = mode
+    assert worker._should_persist_service_event(event_type) is expected
+
+
+def test_service_event_types_for_result_failed_mode_skips_success_events():
+    worker = _bare_worker()
+    worker.service_events_mode = "failed"
+
+    assert worker._service_event_types_for_result("success") == []
+    assert worker._service_event_types_for_result("failed") == ["failed"]
+
+
 def test_shutdown_marker_written_with_expected_fields(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", ["/home/sd/windmill/workers/yolov8_worker.py"])

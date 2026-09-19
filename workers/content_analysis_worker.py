@@ -824,7 +824,8 @@ class ContentAnalysisWorker(BaseWorker):
                 INSERT INTO service_events (
                     image_id, service, event_type, source_service, source_stage, data
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
+                SELECT %s, %s, %s, %s, %s, %s
+                WHERE %s
                 """,
                 (
                     image_id,
@@ -840,6 +841,7 @@ class ContentAnalysisWorker(BaseWorker):
                     source_service,
                     'content_analysis_run',
                     json.dumps(event_data),
+                    self._should_persist_service_event(event_type),
                 ),
             )
             commit_if_needed(self.db_conn, force=True)
@@ -878,7 +880,8 @@ class ContentAnalysisWorker(BaseWorker):
                 INSERT INTO service_events (
                     image_id, service, event_type, source_service, source_stage, data
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
+                SELECT %s, %s, %s, %s, %s, %s
+                WHERE %s
                 """,
                 (
                     analysis['image_id'],
@@ -910,6 +913,7 @@ class ContentAnalysisWorker(BaseWorker):
                         'services_present': services_present,
                         'tier': tier,
                     }),
+                    self._should_persist_service_event('completed'),
                 ),
             )
             commit_if_needed(self.db_conn, force=True)

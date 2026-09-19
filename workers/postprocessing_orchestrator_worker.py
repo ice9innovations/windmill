@@ -267,7 +267,8 @@ class PostprocessingOrchestratorWorker(BaseWorker):
                 INSERT INTO service_events (
                     image_id, service, event_type, source_service, source_stage, data
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
+                SELECT %s, %s, %s, %s, %s, %s
+                WHERE %s
                 """,
                 (
                     image_id,
@@ -286,6 +287,7 @@ class PostprocessingOrchestratorWorker(BaseWorker):
                         'task_type': payload.get('task_type'),
                         'triggered_services': payload.get('triggered_services') or [],
                     }),
+                    self._should_persist_service_event('completed'),
                 ),
             )
             commit_if_needed(self.db_conn, force=True)

@@ -570,9 +570,11 @@ class NounConsensusWorker(BaseWorker):
                 INSERT INTO service_events (
                     image_id, service, event_type, source_service, source_stage, data
                 )
-                VALUES
+                SELECT * FROM (VALUES
                     (%s, %s, %s, %s, %s, %s),
                     (%s, %s, %s, %s, %s, %s)
+                ) AS event_rows(image_id, service, event_type, source_service, source_stage, data)
+                WHERE %s
                 """,
                 (
                     image_id, 'noun_consensus', json.dumps(noun_payload), noun_payload.get('status', 'success') or 'success', self._extract_http_status(noun_payload), self.worker_id, processing_time,
@@ -581,6 +583,7 @@ class NounConsensusWorker(BaseWorker):
                     json.dumps({'services_present': noun_payload.get('services_present') or []}),
                     image_id, 'verb_consensus', 'completed', source_service, 'verb_consensus_run',
                     json.dumps({'services_present': verb_payload.get('services_present') or []}),
+                    self._should_persist_service_event('completed'),
                 ),
             )
             commit_if_needed(self.db_conn, force=commit)
@@ -894,7 +897,8 @@ class NounConsensusWorker(BaseWorker):
                 INSERT INTO service_events (
                     image_id, service, event_type, source_service, source_stage, data
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
+                SELECT %s, %s, %s, %s, %s, %s
+                WHERE %s
                 """,
                 (
                     image_id,
@@ -910,6 +914,7 @@ class NounConsensusWorker(BaseWorker):
                     source_service,
                     'noun_consensus_run',
                     json.dumps(event_data),
+                    self._should_persist_service_event('completed'),
                 ),
             )
             commit_if_needed(self.db_conn, force=True)

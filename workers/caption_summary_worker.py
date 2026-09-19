@@ -507,7 +507,8 @@ class CaptionSummaryWorker(BaseWorker):
                 INSERT INTO service_events (
                     image_id, service, event_type, source_service, source_stage, data
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
+                SELECT %s, %s, %s, %s, %s, %s
+                WHERE %s
                 """,
                 (
                     image_id,
@@ -523,6 +524,7 @@ class CaptionSummaryWorker(BaseWorker):
                     'noun_consensus',
                     'caption_summary_run',
                     json.dumps(event_data),
+                    self._should_persist_service_event(event_type),
                 ),
             )
             commit_if_needed(self.db_conn, force=True)
@@ -571,7 +573,8 @@ class CaptionSummaryWorker(BaseWorker):
                 INSERT INTO service_events (
                     image_id, service, event_type, source_service, source_stage, data
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
+                SELECT %s, %s, %s, %s, %s, %s
+                WHERE %s
                 """,
                 (
                     image_id,
@@ -603,6 +606,7 @@ class CaptionSummaryWorker(BaseWorker):
                     'noun_consensus',
                     'caption_summary_run',
                     json.dumps({'services_present': services_present}),
+                    self._should_persist_service_event('completed'),
                 ),
             )
             commit_if_needed(self.db_conn, force=True)

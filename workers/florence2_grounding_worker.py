@@ -387,7 +387,8 @@ class Florence2GroundingWorker(BaseWorker):
                 INSERT INTO service_events (
                     image_id, service, event_type, source_service, source_stage, data
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
+                SELECT %s, %s, %s, %s, %s, %s
+                WHERE %s
                 """,
                 (
                     image_id,
@@ -405,6 +406,7 @@ class Florence2GroundingWorker(BaseWorker):
                     json.dumps({
                         'error_message': result.get('error') or result.get('message'),
                     }),
+                    self._should_persist_service_event('failed'),
                 ),
             )
             commit_if_needed(self.db_conn, force=True)
@@ -448,7 +450,8 @@ class Florence2GroundingWorker(BaseWorker):
                 INSERT INTO service_events (
                     image_id, service, event_type, source_service, source_stage, data
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
+                SELECT %s, %s, %s, %s, %s, %s
+                WHERE %s
                 """,
                 (
                     image_id,
@@ -464,6 +467,7 @@ class Florence2GroundingWorker(BaseWorker):
                     'noun_consensus',
                     source_stage,
                     json.dumps(metadata),
+                    self._should_persist_service_event('completed'),
                 ),
             )
             commit_if_needed(self.db_conn, force=True)
@@ -513,7 +517,8 @@ class Florence2GroundingWorker(BaseWorker):
                 INSERT INTO service_events (
                     image_id, service, event_type, source_service, source_stage, data
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
+                SELECT %s, %s, %s, %s, %s, %s
+                WHERE %s
                 """,
                 (
                     image_id,
@@ -535,6 +540,7 @@ class Florence2GroundingWorker(BaseWorker):
                         'prediction_count': len(result.get('predictions', [])),
                         'nouns_queried': nouns_queried,
                     }),
+                    self._should_persist_service_event('completed'),
                 ),
             )
             commit_if_needed(self.db_conn, force=True)

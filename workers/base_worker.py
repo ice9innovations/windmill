@@ -160,6 +160,9 @@ class BaseWorker:
         self.max_retries = int(os.getenv('MAX_RETRIES', '3'))
         self.retry_delay = int(os.getenv('RETRY_DELAY', '5'))
         self.vlm_final_wait_seconds = float(os.getenv('VLM_FINAL_WAIT_SECONDS', '5'))
+        self.service_events_mode = self._normalize_service_events_mode(
+            os.getenv('SERVICE_EVENTS_MODE', 'failed')
+        )
         
         # Post-processing triggers - use new config loader methods
         self.bbox_services = self.config.get_spatial_services()
@@ -179,6 +182,47 @@ class BaseWorker:
         self.image_store_config = get_image_store_config()
         self._last_image_fetch_stats = None
         self._last_crop_fetch_stats = None
+
+    def _normalize_service_events_mode(self, value):
+        """Normalize service event persistence policy."""
+        mode = (value or 'debug').strip().lower()
+        if mode in {'debug', 'all', 'full'}:
+            return 'debug'
+        if mode in {'terminal', 'terminals'}:
+            return 'terminal'
+        if mode in {'failed', 'failures', 'failure'}:
+            return 'failed'
+        if mode in {'off', 'none', 'disabled'}:
+            return 'off'
+        return 'debug'
+
+    def _should_persist_service_event(self, event_type):
+        mode = getattr(self, 'service_events_mode', 'debug')
+        if mode == 'debug':
+            return True
+        if mode == 'terminal':
+            return event_type in {'enqueued', 'completed', 'failed'}
+        if mode == 'failed':
+            return event_type == 'failed'
+        return False
+
+    def _service_event_types_for_result(self, result_status):
+        if result_status == 'success':
+            terminal_event_type = 'completed'
+        else:
+            terminal_event_type = 'failed'
+        return [
+            event_type
+            for event_type in (
+                'received',
+                'image_resolved',
+                'started',
+                'request_sent',
+                'response_received',
+                terminal_event_type,
+            )
+            if self._should_persist_service_event(event_type)
+        ]
 
     def _service_event_metadata(self):
         """Return worker placement metadata for per-request trace events."""
@@ -1519,6 +1563,8 @@ class BaseWorker:
         commit=False,
     ):
         """Append one image-level service event row. Best-effort and mutation-free."""
+        if not self._should_persist_service_event(event_type):
+            return {'insert': 0.0, 'commit': 0.0}
         try:
             event_data = self._with_service_event_metadata(data)
             cursor = self.db_conn.cursor()
@@ -1555,6 +1601,10 @@ class BaseWorker:
 
     def _record_service_events_batch(self, events, commit=False):
         """Append multiple image-level service event rows in one DB round trip."""
+        events = [
+            event for event in events
+            if self._should_persist_service_event(event.get('event_type'))
+        ]
         if not events:
             return {'insert': 0.0, 'commit': 0.0}
         try:
@@ -1997,6 +2047,7 @@ class BaseWorker:
                 'processing_time_seconds': processing_time,
                 'failed_reason': failed_reason,
             }))
+            service_event_types = self._service_event_types_for_result(result_status)
             persist_started_at = time.time()
             cursor = self.db_conn.cursor()
             cursor.execute("""
@@ -2047,6 +2098,7 @@ class BaseWorker:
                         (%s, %s, %s),
                         (%s, %s, %s)
                 ) AS event_rows(event_type, source_stage, data)
+                WHERE event_rows.event_type = ANY(%s::text[])
             """, (
                 image_id,
                 service_name,
@@ -2081,6 +2133,7 @@ class BaseWorker:
                 'completed' if result_status == 'success' else 'failed',
                 'service_request_finished',
                 terminal_event_data,
+                service_event_types,
             ))
             commit_if_needed(self.db_conn, force=True)
             persist_duration = time.time() - persist_started_at
