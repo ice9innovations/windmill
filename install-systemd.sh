@@ -47,6 +47,18 @@ render_unit() {
         "$template" > "$output"
 }
 
+if [ "$MODE" = "relay" ]; then
+    user_unit_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
+    mkdir -p "$user_unit_dir"
+    render_unit \
+        "${SCRIPT_DIR}/systemd/windmill-image-relay.service.in" \
+        "${user_unit_dir}/windmill-image-relay.service"
+    systemctl --user daemon-reload
+    systemctl --user enable --now windmill-image-relay.service
+    echo "Installed Windmill image relay user service dir=${SCRIPT_DIR}"
+    exit 0
+fi
+
 install_unit() {
     local unit_name="$1"
     local template="${SCRIPT_DIR}/systemd/${unit_name}.in"
@@ -65,10 +77,6 @@ if [ "$MODE" = "api" ] || [ "$MODE" = "all" ]; then
     install_unit "windmill.service"
 fi
 
-if [ "$MODE" = "relay" ]; then
-    install_unit "windmill-image-relay.service"
-fi
-
 sudo systemctl daemon-reload
 
 if [ "$MODE" = "workers" ] || [ "$MODE" = "all" ]; then
@@ -79,11 +87,6 @@ fi
 if [ "$MODE" = "api" ] || [ "$MODE" = "all" ]; then
     sudo systemctl enable windmill.service
     sudo systemctl restart windmill.service
-fi
-
-if [ "$MODE" = "relay" ]; then
-    sudo systemctl enable windmill-image-relay.service
-    sudo systemctl restart windmill-image-relay.service
 fi
 
 echo "Installed Windmill systemd mode=${MODE} user=${SERVICE_USER} dir=${SCRIPT_DIR}"

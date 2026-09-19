@@ -5,7 +5,6 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=__WINDMILL_USER__
 WorkingDirectory=__WINDMILL_DIR__
 ExecStart=__WINDMILL_DIR__/relay.sh
 Restart=always
@@ -13,4 +12,4 @@ RestartSec=5
 EnvironmentFile=__WINDMILL_DIR__/.env
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
