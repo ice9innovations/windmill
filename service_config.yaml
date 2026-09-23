@@ -72,8 +72,8 @@ services:
         - extra
         - cloud
 
-    nsfw-segmentation:
-      queue_name: nsfw-segmentation
+    nsfw_segmentation:
+      queue_name: nsfw_segmentation
       host: localhost
       port: 7806
       endpoint: /analyze
