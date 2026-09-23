@@ -12,7 +12,7 @@ class NSFWSegmentationWorker(BaseWorker):
     """Worker for the NSFW segmentation service."""
 
     def __init__(self):
-        super().__init__('primary.nsfw_segmentation')
+        super().__init__('primary.nsfw-segmentation')
 
 
 if __name__ == "__main__":
