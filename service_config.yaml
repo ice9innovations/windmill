@@ -72,17 +72,6 @@ services:
         - extra
         - cloud
 
-    nsfw-segmentation:
-      queue_name: nsfw-segmentation
-      host: localhost
-      port: 7806
-      endpoint: /analyze
-      service_type: nsfw
-      tier:
-        - premium
-        - extra
-        - cloud
-
     ocr:
       queue_name: ocr
       host: localhost
