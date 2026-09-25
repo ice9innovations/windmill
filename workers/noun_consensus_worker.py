@@ -570,7 +570,9 @@ class NounConsensusWorker(BaseWorker):
                 INSERT INTO service_events (
                     image_id, service, event_type, source_service, source_stage, data
                 )
-                SELECT * FROM (VALUES
+                SELECT image_id, service, event_type, source_service, source_stage,
+                       data::jsonb
+                FROM (VALUES
                     (%s, %s, %s, %s, %s, %s),
                     (%s, %s, %s, %s, %s, %s)
                 ) AS event_rows(image_id, service, event_type, source_service, source_stage, data)
@@ -897,7 +899,7 @@ class NounConsensusWorker(BaseWorker):
                 INSERT INTO service_events (
                     image_id, service, event_type, source_service, source_stage, data
                 )
-                SELECT %s, %s, %s, %s, %s, %s
+                SELECT %s, %s, %s, %s, %s, %s::jsonb
                 WHERE %s
                 """,
                 (
