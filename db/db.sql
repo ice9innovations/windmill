@@ -50,7 +50,7 @@ CREATE TABLE images (
     normalized_image_width  INTEGER,
     normalized_image_height INTEGER,
     -- CLIP image embedding (ViT-L/14, 768-dimensional, normalized)
-    -- Written once on first caption score; used for image similarity search
+    -- Written once by the embedding worker; used for image similarity search
     image_clip_embedding  vector(768),
     -- Customer tier at submission time; gates which downstream services fire
     tier                  VARCHAR(20) DEFAULT 'free'

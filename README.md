@@ -44,22 +44,24 @@ Submit image
 
 | Service | Port | Type | Tiers |
 |---------|------|------|-------|
-| blip | 7777 | semantic, vlm | basic, premium |
-| florence2 | 7803 | semantic, vlm | basic, premium, batch |
-| colors | 7770 | colors | free, basic, premium, batch |
-| metadata | 7781 | metadata | free, basic, premium, batch |
-| nsfw2 | 7774 | nsfw | free, basic, premium, batch |
-| ocr | 7775 | specialized | basic, premium, batch |
-| qr | 7801 | specialized | basic, premium, batch |
-| nudenet | 7789 | specialized | free, basic, premium, batch |
-| moondream | 7795 | semantic, vlm | basic, premium |
-| ollama | 7782 | semantic, vlm | basic, premium |
-| haiku | 7797 | semantic, vlm | premium, batch |
-| gemini | 7767 | semantic, vlm | premium, batch |
-| gpt_nano | 7800 | semantic, vlm | premium, batch |
-| xai | 7805 | semantic, vlm | premium, batch |
-| qwen | 7796 | semantic, vlm | basic, premium |
-| yolo_v8 | 7773 | spatial | free, basic, premium, batch |
+| blip | 7777 | semantic, vlm | premium, extra |
+| florence2 | 7803 | semantic, vlm | premium, extra |
+| colors | 7770 | colors | basic, embedding, premium, extra, cloud |
+| metadata | 7781 | metadata | basic, embedding, premium, extra, cloud |
+| nsfw2 | 7774 | nsfw | basic, embedding, premium, extra, cloud |
+| ocr | 7775 | specialized | premium, extra, cloud |
+| qr | 7801 | specialized | basic, embedding, premium, extra, cloud |
+| nudenet | 7789 | specialized | basic, embedding, premium, extra, cloud |
+| moondream | 7795 | semantic, vlm | premium, extra |
+| joycaption | 7798 | semantic, vlm | premium, extra |
+| ollama | 7782 | semantic, vlm | premium, extra |
+| haiku | 7797 | semantic, vlm | extra, cloud |
+| gemini | 7767 | semantic, vlm | extra, cloud |
+| gpt_nano | 7800 | semantic, vlm | extra, cloud |
+| xai | 7805 | semantic, vlm | extra, cloud |
+| qwen | 7796 | semantic, vlm | premium, extra |
+| yolo_v8 | 7773 | spatial | basic, embedding, premium, extra, cloud |
+| embedding | 7776 | embedding | embedding |
 
 ### Postprocessing Services (run on cropped bbox regions)
 
@@ -91,10 +93,11 @@ Services are gated by tier. The `tier` field is set at image submission time.
 
 | Tier | Included services |
 |------|------------------|
-| free | colors, metadata, nsfw2, nudenet, yolo_v8 |
-| basic | free + blip, florence2, moondream, ollama, ocr, qr, qwen |
-| premium | basic + haiku, gemini, gpt_nano, xai |
-| batch | colors, metadata, nsfw2, ocr, qr, nudenet, florence2, haiku, gemini, gpt_nano, xai, yolo_v8 |
+| basic | colors, face, metadata, nsfw2, nudenet, pose, qr, yolo_v8 |
+| embedding | basic + embedding |
+| premium | basic + blip, florence2, joycaption, moondream, ocr, ollama, qwen |
+| extra | premium + gemini, gpt_nano, haiku, xai |
+| cloud | basic + gemini, gpt_nano, haiku, ocr, xai |
 
 Tiers are defined in `service_config.yaml`. Adding a new tier there automatically makes it valid — no code change required.
 
@@ -195,7 +198,7 @@ curl -X POST \
 
 Form fields:
 - `file` — image file (required)
-- `tier` — free / basic / premium / batch (default: free)
+- `tier` — basic / embedding / premium / extra / cloud
 - `services` — comma-separated override list (default: all services for the tier)
 - `image_group` — group tag (default: api)
 
