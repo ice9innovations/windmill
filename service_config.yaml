@@ -246,7 +246,7 @@ services:
     embedding:
       queue_name: embedding
       host: localhost
-      port: 7776
+      port: 7808
       endpoint: /embed/image
       service_type: embedding
       consensus: false
