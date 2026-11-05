@@ -317,6 +317,3 @@ services:
       port: 7768
       endpoint: /analyze
       tier:
-        - premium
-        - extra
-        - cloud
