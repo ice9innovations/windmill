@@ -131,7 +131,6 @@ services:
       service_type: semantic, vlm
       consensus: true
       tier:
-        - premium
         - extra
 
     ollama:
@@ -317,3 +316,4 @@ services:
       port: 7768
       endpoint: /analyze
       tier:
+        - extra
